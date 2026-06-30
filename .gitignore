@@ -1,0 +1,6 @@
+.cpcache/
+.cljs_node_repl/
+node_modules/
+pkg-web/
+target/
+verify/out/
