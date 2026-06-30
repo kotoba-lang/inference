@@ -534,6 +534,21 @@
                 (rt/transformer "m" {:kotodama/backend :webgl
                                      :kotodama/compute-backend :num/webgl})))))
 
+(deftest forward-token-ids-are-validated
+  (is (empty? (validate/problems (rt/forward-op {:kotodama/session-id "s"} [0 1 2]))))
+  (is (= [:input-ids/empty]
+         (mapv :kotodama/code
+               (validate/problems (rt/forward-op {:kotodama/session-id "s"} [])))))
+  (is (= [:input-ids/token-id]
+         (mapv :kotodama/code
+               (validate/problems (rt/forward-op {:kotodama/session-id "s"} [0 -1])))))
+  (is (= [:input-ids/token-id]
+         (mapv :kotodama/code
+               (validate/problems (rt/forward-op {:kotodama/session-id "s"} [0 1.5])))))
+  (is (= [:input-ids/empty]
+         (mapv :kotodama/code
+               (validate/problems (rt/forward-op {:kotodama/session-id "s"} 1))))))
+
 (deftest core-load-generate-forward
   (let [runtime (mock-runtime)
         session (core/load-model runtime (rt/transformer "tiny"))]

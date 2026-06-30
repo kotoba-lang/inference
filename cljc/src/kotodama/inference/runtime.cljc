@@ -208,7 +208,9 @@
   ([session token-ids opts]
    {:kotodama/op :forward
     :kotodama/session session
-    :kotodama/input-ids (vec token-ids)
+    :kotodama/input-ids (if (sequential? token-ids)
+                           (vec token-ids)
+                           token-ids)
     :kotodama/options opts}))
 
 (defn kototama-infer-op

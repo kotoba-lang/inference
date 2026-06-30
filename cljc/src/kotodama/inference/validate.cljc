@@ -91,12 +91,25 @@
                      ":kotodama/max-new-tokens must be a non-negative integer"
                      {:kotodama/max-new-tokens max-new})))))
 
+(defn input-id-problems [input-ids]
+  (cond-> []
+    (or (not (sequential? input-ids)) (empty? input-ids))
+    (conj (problem :input-ids/empty
+                   ":kotodama/input-ids must be a non-empty sequence of token ids"
+                   {:kotodama/input-ids input-ids}))
+
+    (and (sequential? input-ids)
+         (not-every? #(and (integer? %) (not (neg? %))) input-ids))
+    (conj (problem :input-ids/token-id
+                   ":kotodama/input-ids must contain non-negative integer token ids"
+                   {:kotodama/input-ids input-ids}))))
+
 (defn problems [op]
   (case (:kotodama/op op)
     :load (runtime-problems (:kotodama/runtime-spec op))
     :generate (generation-problems (:kotodama/generation op))
     :llm-infer (generation-problems (:kotodama/generation op))
-    :forward []
+    :forward (input-id-problems (:kotodama/input-ids op))
     [(problem :op/unsupported "unsupported inference op" {:kotodama/op (:kotodama/op op)})]))
 
 (defn valid? [op]
