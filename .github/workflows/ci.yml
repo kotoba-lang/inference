@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: cljc inference
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: inference
+      - uses: actions/checkout@v4
+        with:
+          repository: kotoba-lang/num
+          path: num
+      - uses: actions/checkout@v4
+        with:
+          repository: kotoba-lang/torch
+          path: torch
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: DeLaGuardo/setup-clojure@13.4
+        with:
+          cli: latest
+          bb: latest
+      - name: clojure tests
+        working-directory: inference
+        run: clojure -M:test
+      - name: babashka smoke
+        working-directory: inference
+        run: bb test:cljc

@@ -1,0 +1,4 @@
+{:tasks
+ {test:cljc
+  {:doc "Run the CLJC inference contract tests."
+   :task (shell "clojure" "-M:test")}}}
