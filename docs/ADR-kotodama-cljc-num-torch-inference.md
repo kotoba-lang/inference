@@ -30,7 +30,7 @@ The workspace already has the two reusable CLJC foundations:
 - Transformers.js is not a runtime foundation.
 - Browser WebGPU uses the num WGSL/WebGPU backend contract.
 - Browser WebGL is allowed only if a host supplies a num-compatible WebGL
-  backend. It is not implemented by Rust `wgpu`.
+  backend. It is not implemented by an in-repository native `wgpu` runtime.
 
 ## Consequences
 
@@ -112,7 +112,7 @@ Full 42-layer composition and generation through `torch` to `num` remain the
 next maturity step.
 
 `verify/maturity.edn` is the machine-readable coverage gate for this ADR. It
-tracks required CLJC/Rust/num/torch/WebGPU/gemma4 checks and keeps known gaps
+tracks required CLJC/num/torch/WebGPU/gemma4 checks and keeps known gaps
 explicit until real browser WebGPU token generation lands on `num`.
 `clojure -M:verify-maturity-run` executes the required non-model gates, while
 `clojure -M:verify-maturity-run --include-local-model` also runs `gemma4:e4b`.

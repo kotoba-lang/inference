@@ -7,7 +7,6 @@ This repository owns the portable inference layer:
 - `kotodama.inference.*` CLJC runtime specs and host ports
 - `torch` model graph contracts
 - `num` tensor compute contracts for CPU, WASM, WGSL, and WebGPU hosts
-- Rust `kotoba-kotodama-inference` WebGPU/native runtime experiments
 - real-model verification for local Gemma GGUF artifacts
 
 The core foundation is `kotoba-lang/torch` plus `kotoba-lang/num`. JavaScript
@@ -20,10 +19,8 @@ portable foundations for this repo.
 cljc/src/    portable runtime contracts
 cljc/test/   CLJC contract tests
 verify/      maturity gates and local-model verification
-src/         Rust inference runtime
 browser/     browser worker/client surface
 shaders/     WGSL kernels
-tests/       Rust integration tests
 docs/        ADRs
 ```
 
@@ -42,8 +39,12 @@ clojure -M:verify-gguf
 KOTODAMA_VERIFY_FULL_MLP=1 KOTODAMA_VERIFY_FULL_LAYERS=2 KOTODAMA_VERIFY_FULL_VOCAB=1 clojure -M:verify-gemma-num
 ```
 
-Browser wasm package:
+`kotoba-lang/num` and `kotoba-lang/torch` are sibling local dependencies. A
+standalone checkout should place them next to this repository, or use a monorepo
+layout that preserves `../num` and `../torch`.
 
-```sh
-wasm-pack build --target web --no-default-features --out-dir pkg-web
-```
+## Native Runtime Status
+
+The former Rust WebGPU/native runtime experiment, Cargo metadata, and Rust
+integration tests have been removed from this repository. Runtime backends should
+live in adapter repositories and consume the CLJC contracts here.
