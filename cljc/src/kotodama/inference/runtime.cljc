@@ -6,6 +6,7 @@
   (:require [torch.model :as torch]))
 
 (def supported-backends #{:webgpu :webgl :wasm :native})
+(def supported-adapter-kinds #{:browser :wasm :native :remote :edge})
 (def supported-runtimes #{:torch-transformer
                           :torch-diffusion
                           :torch-audio})
@@ -221,3 +222,18 @@
     :kotodama/model model
     :kotodama/prompt prompt
     :kotodama/generation (generation opts)}))
+
+(defn adapter-spec
+  "Describe a host adapter that consumes the portable CLJC inference contract.
+  Native runtimes are allowed only as adapter-owned implementations outside this
+  repository."
+  [id opts]
+  (merge {:kotodama.adapter/id id
+          :kotodama.adapter/kind (:kotodama.adapter/kind opts :native)
+          :kotodama.adapter/consumes #{:kotodama/runtime-spec
+                                       :kotodama/generation
+                                       :kotodama/forward}
+          :kotodama.adapter/provides #{:kotodama/session
+                                       :kotodama/text
+                                       :kotodama/logits}}
+         opts))

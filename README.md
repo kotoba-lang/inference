@@ -7,6 +7,7 @@ This repository owns the portable inference layer:
 - `kotodama.inference.*` CLJC runtime specs and host ports
 - `torch` model graph contracts
 - `num` tensor compute contracts for CPU, WASM, WGSL, and WebGPU hosts
+- explicit adapter declarations for browser, wasm, native, remote, and edge hosts
 - real-model verification for local Gemma GGUF artifacts
 
 The core foundation is `kotoba-lang/torch` plus `kotoba-lang/num`. JavaScript

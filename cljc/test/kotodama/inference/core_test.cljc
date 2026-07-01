@@ -71,6 +71,25 @@
       (is (empty? (validate/problems (rt/load-op diffusion))))
       (is (empty? (validate/problems (rt/load-op audio)))))))
 
+(deftest native-adapters-are-explicit-data
+  (let [adapter (rt/adapter-spec
+                 :adapter/native-gpu
+                 {:kotodama.adapter/kind :native
+                  :kotodama.adapter/native? true
+                  :kotodama.adapter/repository "kotoba-lang/inference-native-adapter"})]
+    (is (empty? (validate/problems {:kotodama/op :adapter
+                                     :kotodama/adapter adapter}))))
+  (let [problems (validate/problems
+                  {:kotodama/op :adapter
+                   :kotodama/adapter
+                   {:kotodama.adapter/id "native"
+                    :kotodama.adapter/kind :rust
+                    :kotodama.adapter/native? true}})]
+    (is (seq problems))
+    (is (some #(= :adapter/id (:kotodama/code %)) problems))
+    (is (some #(= :adapter/kind (:kotodama/code %)) problems))
+    (is (some #(= :adapter/repository (:kotodama/code %)) problems))))
+
 (deftest gemma4-direct-runtime-spec-is-data
   (let [spec (gemma/runtime-spec)
         graph (:kotodama/model-graph spec)
