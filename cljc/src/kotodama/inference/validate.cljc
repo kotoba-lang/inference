@@ -104,12 +104,40 @@
                    ":kotodama/input-ids must contain non-negative integer token ids"
                    {:kotodama/input-ids input-ids}))))
 
+(defn adapter-problems [adapter]
+  (let [kind (:kotodama.adapter/kind adapter)
+        consumes (:kotodama.adapter/consumes adapter)
+        provides (:kotodama.adapter/provides adapter)]
+    (cond-> []
+      (not (keyword? (:kotodama.adapter/id adapter)))
+      (conj (problem :adapter/id "adapter id must be a keyword"
+                     {:kotodama.adapter/id (:kotodama.adapter/id adapter)}))
+
+      (not (contains? runtime/supported-adapter-kinds kind))
+      (conj (problem :adapter/kind "unsupported adapter kind"
+                     {:kotodama.adapter/kind kind}))
+
+      (not (and (set? consumes) (seq consumes) (every? keyword? consumes)))
+      (conj (problem :adapter/consumes "adapter must consume a non-empty keyword set"
+                     {:kotodama.adapter/consumes consumes}))
+
+      (not (and (set? provides) (seq provides) (every? keyword? provides)))
+      (conj (problem :adapter/provides "adapter must provide a non-empty keyword set"
+                     {:kotodama.adapter/provides provides}))
+
+      (and (:kotodama.adapter/native? adapter)
+           (not (string? (:kotodama.adapter/repository adapter))))
+      (conj (problem :adapter/repository
+                     "native adapters must name an owner repository"
+                     {:kotodama.adapter/native? true})))))
+
 (defn problems [op]
   (case (:kotodama/op op)
     :load (runtime-problems (:kotodama/runtime-spec op))
     :generate (generation-problems (:kotodama/generation op))
     :llm-infer (generation-problems (:kotodama/generation op))
     :forward (input-id-problems (:kotodama/input-ids op))
+    :adapter (adapter-problems (:kotodama/adapter op))
     [(problem :op/unsupported "unsupported inference op" {:kotodama/op (:kotodama/op op)})]))
 
 (defn valid? [op]
