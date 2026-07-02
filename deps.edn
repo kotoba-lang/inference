@@ -1,8 +1,13 @@
 {:paths ["cljc/src"]
- :deps {org.kotoba-lang/num {:local/root "../num"}
-        org.kotoba-lang/torch {:local/root "../torch"}}
+ ;; real git pins (the old org.kotoba-lang/* group + :local/root pair was never
+ ;; resolvable as a git dep — monorepo-layout-only). Workspace-offline dev
+ ;; against sibling checkouts: use the :dev alias.
+ :deps {io.github.kotoba-lang/num {:git/sha "4bd8ba7fa366dc4b5a898c02833fd9da7756470d"}
+        io.github.kotoba-lang/torch {:git/sha "9f78f0c852d6ac5ef7899502aaa82d3d193770a3"}}
  :aliases
- {:test {:extra-paths ["cljc/test"]
+ {:dev {:override-deps {io.github.kotoba-lang/num {:local/root "../num"}
+                        io.github.kotoba-lang/torch {:local/root "../torch"}}}
+  :test {:extra-paths ["cljc/test"]
          :extra-deps {io.github.cognitect-labs/test-runner
                       {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
          :main-opts ["-m" "cognitect.test-runner" "-d" "cljc/test"]
