@@ -186,7 +186,7 @@
                                       :shape dims
                                       :type tensor-type
                                       :offset offset})
-            (when (contains? wanted name)
+            (when (wanted name)   ; set OR predicate — shard verify selects by ownership
               (swap! selected assoc name {:index i
                                           :shape dims
                                           :type tensor-type
