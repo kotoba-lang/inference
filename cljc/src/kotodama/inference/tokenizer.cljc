@@ -33,11 +33,13 @@
     :bos-token-id       int, prepended when `:add-bos-token?` is true
     :eos-token-id       int
     :add-bos-token?     bool
-    :add-space-prefix?  bool (kotodama does not need this for v1: we translate
-                         literal spaces to `space-marker` in-place instead of
-                         prefixing a synthetic leading space)"
-  [{:keys [tokens merges bos-token-id eos-token-id add-bos-token? unknown-token-id]
-    :or {add-bos-token? true unknown-token-id 3}}]
+    :add-space-prefix?  bool — SentencePiece `add_dummy_prefix`: prepend a
+                         leading `space-marker` to the whole text so the first
+                         word is tokenized the same as a mid-sentence word
+                         (Gemma/Llama SPM require this; default false only for
+                         backward compatibility — real GGUF hosts pass true)"
+  [{:keys [tokens merges bos-token-id eos-token-id add-bos-token? add-space-prefix? unknown-token-id]
+    :or {add-bos-token? true add-space-prefix? false unknown-token-id 3}}]
   (let [token->id (into {} (map-indexed (fn [id tok] [tok id])) tokens)
         merge-rank (into {}
                          (map-indexed
@@ -58,6 +60,7 @@
      :kotodama.tokenizer/bos-token-id bos-token-id
      :kotodama.tokenizer/eos-token-id eos-token-id
      :kotodama.tokenizer/add-bos-token? add-bos-token?
+     :kotodama.tokenizer/add-space-prefix? add-space-prefix?
      :kotodama.tokenizer/unknown-token-id unknown-token-id}))
 
 #?(:clj
@@ -79,8 +82,12 @@
                  cc (if (> cp 0xFFFF) 2 1)]
              (recur (+ i cc) (conj! out (js/String.fromCodePoint cp)))))))))
 
-(defn- symbols-of [text]
-  (codepoint-seq (str/replace text " " space-marker)))
+(defn- symbols-of [text add-space-prefix?]
+  ;; SentencePiece translates spaces to the word-boundary marker. With
+  ;; `add_dummy_prefix`, a synthetic leading space is prepended first so the
+  ;; first word carries the marker just like any other word.
+  (codepoint-seq (str/replace (if add-space-prefix? (str " " text) text)
+                              " " space-marker)))
 
 (defn- best-merge [merge-rank symbols]
   (let [pairs (map vector symbols (rest symbols))]
@@ -118,7 +125,8 @@
   "Text -> vector of token ids. Prepends BOS when the tokenizer was built with
   `:add-bos-token? true`. Empty/blank text still yields `[bos]` in that case."
   [tokenizer text]
-  (let [symbols (symbols-of (or text ""))
+  (let [symbols (symbols-of (or text "")
+                            (:kotodama.tokenizer/add-space-prefix? tokenizer))
         merged (bpe-merge (:kotodama.tokenizer/merge-rank tokenizer) symbols)
         ids (into [] (mapcat #(symbol->ids tokenizer %)) merged)]
     (if (:kotodama.tokenizer/add-bos-token? tokenizer)
