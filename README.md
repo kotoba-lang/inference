@@ -40,6 +40,21 @@ clojure -M:verify-gguf
 KOTODAMA_VERIFY_FULL_MLP=1 KOTODAMA_VERIFY_FULL_LAYERS=2 KOTODAMA_VERIFY_FULL_VOCAB=1 clojure -M:verify-gemma-num
 ```
 
+`gemma4-e4b-num-smoke` proves 2 composed transformer blocks against golden
+logits; it does not tokenize, sample, or run the full model. End-to-end
+single-request text generation (real tokenizer, every real transformer block,
+greedy sampling, no KV-cache — recompute-from-scratch) is:
+
+```sh
+clojure -M:verify-gemma-generate
+# optional env: KOTODAMA_VERIFY_MODEL, KOTODAMA_VERIFY_GGUF_PATH,
+# KOTODAMA_VERIFY_PROMPT, KOTODAMA_VERIFY_MAX_TOKENS
+```
+
+This is CPU-bound recompute-from-scratch (no KV-cache — see
+`kotodama.inference.decode`'s docstring) against the model's full real layer
+count, so it is slow (see the PR that introduced it for observed tokens/sec).
+
 `kotoba-lang/num` and `kotoba-lang/torch` are sibling local dependencies. A
 standalone checkout should place them next to this repository, or use a monorepo
 layout that preserves `../num` and `../torch`.
