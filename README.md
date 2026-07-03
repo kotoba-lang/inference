@@ -55,6 +55,53 @@ This is CPU-bound recompute-from-scratch (no KV-cache — see
 `kotodama.inference.decode`'s docstring) against the model's full real layer
 count, so it is slow (see the PR that introduced it for observed tokens/sec).
 
+## Stable JVM production entry point (`kotodama.inference.host.jvm`)
+
+Downstream JVM hosts (e.g. `kotoba-lang/murakumo-studio`) should call the
+promoted host adapter, **not** the `verify/` smoke code:
+
+```clojure
+(require '[kotodama.inference.host.jvm :as gemma])
+
+;; one-shot (loads + closes the GGUF around the call):
+(gemma/generate
+  {:kotodama/model        "gemma4:e4b"   ; local Ollama tag, resolved via `ollama show`
+   ;; :kotodama/model-path "/path/to.gguf" ; or a resolved GGUF path instead of :model
+   :kotodama/prompt       "The capital of France is"
+   :kotodama/max-tokens   16
+   :kotodama/cache-weights? false        ; true keeps dequant weights in RAM (~20GB, faster)
+   :kotodama/use-kv-cache?  true         ; default; pure speed optimisation
+   :kotodama/on-token     (fn [id text nanos] ...)}) ; optional streaming callback
+;; => {:kotodama/text "..." :kotodama/generated-token-ids [...]
+;;     :kotodama/stop-reason :eos|:max-tokens :gemma4/block-count 42 ...}
+
+;; reuse a session across calls (load once, generate many):
+(let [s (gemma/load-model {:kotodama/model "gemma4:e4b" :kotodama/cache-weights? true})]
+  (gemma/generate {:kotodama/session s :kotodama/prompt "..." :kotodama/max-tokens 16})
+  (gemma/close-model s))
+```
+
+`host.jvm` implements the real Gemma4 **per-layer-embedding (PLE)** architecture
+(the `inp_gate` / `proj` / `post_norm` / `per_layer_*` tensors the older
+`stable-block-forward` omits), plus QK/V norms, rotate-half NEOX RoPE (partial
+rotary on global layers), the gated GELU MLP, KV-sharing, and a KV-cache. The
+`.cljc` kernel stays pure (no file IO); all GGUF reading lives in this
+`.clj`-only namespace, per `kotodama.inference.ports`.
+
+Verify:
+
+```sh
+CACHE_WEIGHTS=1 clojure -M:verify-gemma-ple-generate   # end-to-end via host.jvm/generate
+CACHE_WEIGHTS=1 clojure -M:verify-gemma-kvcache         # KV-cache == from-scratch, + tok/s
+```
+
+> Status: the decode loop, tokenizer (SentencePiece `add_dummy_prefix`), GGUF
+> weight decode and output projection are verified correct (a 0-layer forward
+> greedily predicts the input token); the KV-cache is verified to be output-
+> identical to a from-scratch run. The full 42-layer PLE forward is **not yet
+> producing coherent text** — an unresolved deep-layer accumulation remains.
+> See the PR notes for the exact evidence and next steps.
+
 `kotoba-lang/num` and `kotoba-lang/torch` are sibling local dependencies. A
 standalone checkout should place them next to this repository, or use a monorepo
 layout that preserves `../num` and `../torch`.
