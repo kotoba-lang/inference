@@ -30,4 +30,6 @@
   :verify-gemma-num {:extra-paths ["verify"]
                      :main-opts ["-m" "kotodama.verify.gemma4-e4b-num-smoke"]}
   :verify-ollama {:extra-paths ["verify"]
-                  :main-opts ["-m" "kotodama.verify.gemma4-e4b-ollama"]}}}
+                  :main-opts ["-m" "kotodama.verify.gemma4-e4b-ollama"]}
+  :verify-gemma-generate {:extra-paths ["verify"]
+                          :main-opts ["-m" "kotodama.verify.gemma4-e4b-generate-smoke"]}}}
