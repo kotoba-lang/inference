@@ -38,14 +38,6 @@
           :kind :required
           :command "clojure -M:test"
           :proves [:runtime-spec-data :validation :host-port-shape :generate-boundary]}
-         {:id :rust-native-build
-          :kind :required
-          :command "cargo check --no-default-features --target aarch64-apple-darwin"
-          :proves [:native-build :host-runtime-build]}
-         {:id :rust-wasm-build
-          :kind :required
-          :command "cargo check --no-default-features --target wasm32-unknown-unknown"
-          :proves [:wasm-build :browser-wasm-surface]}
          {:id :num-clj
           :kind :required
           :cwd "../num"

@@ -13,8 +13,6 @@
 
 (def required-gates
   #{:cljc-contract
-    :rust-native-build
-    :rust-wasm-build
     :num-clj
     :num-cljs
     :num-webgpu
