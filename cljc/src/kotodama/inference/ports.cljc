@@ -37,7 +37,8 @@
 
 (defn fn-runtime
   "Build an `IModelRuntime` from functions. Useful for tests, SCI, and thin
-  adapters around browser WebGPU, terminal wasm, or Rust kotodama inference."
+  adapters around browser WebGPU, terminal wasm, or hosted inference runtimes
+  (e.g. kotodama.inference.ollama, kotodama.inference.mlx)."
   [{:keys [probe load generate forward dispose]}]
   (reify IModelRuntime
     (probe! [_] (if probe (probe) {:kotodama/backends []}))
