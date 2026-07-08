@@ -40,24 +40,24 @@
        "}"))
 
 (defn- unescape-json-string [s]
-  (loop [xs (seq s), out (StringBuilder.)]
+  (loop [xs (seq s), out []]
     (if-not xs
-      (str out)
+      (apply str out)
       (let [c (first xs)]
         (if (not= c \\)
-          (do (.append out c) (recur (next xs) out))
+          (recur (next xs) (conj out c))
           (let [e (second xs)
                 more (nnext xs)]
             (case e
-              \" (do (.append out \") (recur more out))
-              \\ (do (.append out \\) (recur more out))
-              \/ (do (.append out \/) (recur more out))
-              \b (do (.append out \backspace) (recur more out))
-              \f (do (.append out \formfeed) (recur more out))
-              \n (do (.append out \newline) (recur more out))
-              \r (do (.append out \return) (recur more out))
-              \t (do (.append out \tab) (recur more out))
-              (do (.append out e) (recur more out)))))))))
+              \" (recur more (conj out \"))
+              \\ (recur more (conj out \\))
+              \/ (recur more (conj out \/))
+              \b (recur more (conj out \backspace))
+              \f (recur more (conj out \formfeed))
+              \n (recur more (conj out \newline))
+              \r (recur more (conj out \return))
+              \t (recur more (conj out \tab))
+              (recur more (conj out e)))))))))
 
 (defn- extract-json-string [json field]
   (let [needle (str "\"" field "\":\"")
