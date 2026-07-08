@@ -32,6 +32,9 @@ jobs:
       - name: clojure tests
         working-directory: inference
         run: clojure -M:test
+      - name: Lint
+        working-directory: inference
+        run: clojure -M:lint
       - name: babashka smoke
         working-directory: inference
         run: bb test:cljc

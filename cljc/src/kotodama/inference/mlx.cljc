@@ -63,24 +63,24 @@
 (defn- json-body [m] (json-object m))
 
 (defn- unescape-json-string [s]
-  (loop [xs (seq s), out (StringBuilder.)]
+  (loop [xs (seq s), out []]
     (if-not xs
-      (str out)
+      (apply str out)
       (let [c (first xs)]
         (if (not= c \\)
-          (do (.append out c) (recur (next xs) out))
+          (recur (next xs) (conj out c))
           (let [e (second xs)
                 more (nnext xs)]
             (case e
-              \" (do (.append out \") (recur more out))
-              \\ (do (.append out \\) (recur more out))
-              \/ (do (.append out \/) (recur more out))
-              \b (do (.append out \backspace) (recur more out))
-              \f (do (.append out \formfeed) (recur more out))
-              \n (do (.append out \newline) (recur more out))
-              \r (do (.append out \return) (recur more out))
-              \t (do (.append out \tab) (recur more out))
-              (do (.append out e) (recur more out)))))))))
+              \" (recur more (conj out \"))
+              \\ (recur more (conj out \\))
+              \/ (recur more (conj out \/))
+              \b (recur more (conj out \backspace))
+              \f (recur more (conj out \formfeed))
+              \n (recur more (conj out \newline))
+              \r (recur more (conj out \return))
+              \t (recur more (conj out \tab))
+              (recur more (conj out e)))))))))
 
 (defn- field-value-start
   "Index just past `\"field\"` + optional whitespace + `:` + optional
@@ -89,11 +89,13 @@
    `\"field\":value`, Python's json.dumps (mlx_lm.server / mlx-moe, both
    OpenAI-shaped Python servers) emits `\"field\": value` with a space."
   [json field]
-  (let [m (re-matcher (re-pattern (str "\"" #?(:clj (java.util.regex.Pattern/quote field)
-                                              :cljs field)
-                                       "\"\\s*:\\s*"))
-                      json)]
-    (when (.find m) (.end m))))
+  #?(:clj
+     (let [m (re-matcher (re-pattern (str "\"" (java.util.regex.Pattern/quote field) "\"\\s*:\\s*")) json)]
+       (when (.find m) (.end m)))
+     :cljs
+     (let [re (js/RegExp. (str "\"" field "\"\\s*:\\s*"))
+           m (.exec re json)]
+       (when m (+ (.-index m) (.-length (aget m 0)))))))
 
 (defn- extract-json-string
   "First `\"field\": \"...\"` occurrence in `json` → its unescaped value, or
@@ -116,10 +118,14 @@
   "First `\"field\": <number>` occurrence in `json` → a double, or nil."
   [json field]
   (when-let [from (field-value-start json field)]
-    (let [m (re-matcher #"-?\d+(\.\d+)?" json)]
-      (when (.find m from)
-        (when (= (.start m) from)
-          (parse-double (.group m)))))))
+    #?(:clj
+       (let [m (re-matcher #"-?\d+(\.\d+)?" json)]
+         (when (.find m from)
+           (when (= (.start m) from)
+             (parse-double (.group m)))))
+       :cljs
+       (when-let [m (re-find #"^-?\d+(\.\d+)?" (subs json from))]
+         (parse-double (if (vector? m) (first m) m))))))
 
 #?(:clj
    (defn- post-json [base-url path body timeout-ms]
