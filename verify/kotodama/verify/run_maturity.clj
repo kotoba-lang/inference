@@ -10,7 +10,11 @@
             [kotodama.verify.maturity :as maturity]))
 
 (defn- read-maturity []
-  (edn/read-string (slurp (io/file "verify/maturity.edn"))))
+  ;; verify/maturity.edn is Datomic/Datascript tx-data (a single-entity
+  ;; vector); reconstitute the plain map kotodama.verify.maturity/read-maturity
+  ;; would produce so downstream key lookups (:gates, :scope, :known-gaps, ...)
+  ;; keep working unchanged.
+  (maturity/reconstitute-entity (edn/read-string (slurp (io/file "verify/maturity.edn")))))
 
 (defn- shell-command [command]
   (let [os (System/getProperty "os.name")]
