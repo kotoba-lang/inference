@@ -154,10 +154,15 @@ KOTODAMA_METAL_K_DOT=1 KOTODAMA_VERIFY_MAX_TOKENS=2 \
   clojure -M:verify-gemma-ple-generate
 ```
 
-On Apple M4 it preserves `" Paris."` generation, measures roughly 15–20 ms for
-one `[10240,2560]` Q4_K projection, and reduces warm second-token time to
-11.2 s. Projection-by-projection GPU readback and JVM-side layer operations are
-now the dominant cost; full-layer GPU residency/fusion is required next.
+On Apple M4 it preserves `" Paris."` generation and measures roughly 15–20 ms
+for one `[10240,2560]` Q4_K projection. The binary protocol now groups Q/K/V
+and MLP gate/up projections that share an activation: each group performs one
+Q8_K quantization/upload, command submission, and combined readback while each
+K-dot retains official ggml reduction order. This reduced the fixed probe from
+about 17.1 to 15.1 s for the first token and from 11.2 to 8.4 s for the warm
+second token on Apple M4. Readbacks between attention, MLP, and PLE stages plus
+JVM-side normalization/elementwise work remain dominant; full-layer GPU
+residency/fusion is still required.
 
 ## Ollama-compatible HTTP server
 
