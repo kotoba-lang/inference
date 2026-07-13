@@ -23,7 +23,8 @@
     :gemma4-e4b-gguf
     :gemma4-e4b-live
     :gemma4-e4b-native-parity
-    :gemma4-metal-kdot})
+    :gemma4-metal-kdot
+    :ollama-http-api})
 
 (def banned-foundation-patterns
   [{:id :transformers-js

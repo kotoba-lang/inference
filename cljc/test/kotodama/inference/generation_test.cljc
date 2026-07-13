@@ -50,8 +50,16 @@
   (is (= 2 (sample/sample [0.0 0.1 9.0 8.9]
                           {:kotodama/temperature 1.0 :kotodama/top-k 2 :kotodama/rand01 0.0}))))
 
+(deftest sample-accepts-a-stateful-random-source
+  (let [calls (atom 0)]
+    (sample/sample [0.0 1.0]
+                   {:kotodama/temperature 1.0
+                    :kotodama/rand01 (fn [] (swap! calls inc) 0.0)})
+    (is (= 1 @calls))))
+
 (deftest decode-generate-stops-on-eos
   (let [tok (tokenizer/build fixture-vocab)
+        streamed (atom [])
         ;; forward-fn: after 1 generated token, always route to eos-token-id (1).
         forward-fn (fn [ids]
                      (if (< (count ids) (inc (count (tokenizer/encode tok "The"))))
@@ -60,9 +68,12 @@
         result (decode/generate {:kotodama/tokenizer tok
                                   :kotodama/forward-fn forward-fn
                                   :kotodama/prompt "The"
-                                  :kotodama/max-tokens 10})]
+                                  :kotodama/max-tokens 10
+                                  :kotodama/on-token (fn [id text _nanos]
+                                                       (swap! streamed conj [id text]))})]
     (is (= :eos (:kotodama/stop-reason result)))
-    (is (= [10] (:kotodama/generated-token-ids result)))))
+    (is (= [10] (:kotodama/generated-token-ids result)))
+    (is (= [[10 "The"]] @streamed) "EOS is not exposed as a generated stream chunk")))
 
 (deftest decode-generate-stops-on-max-tokens
   (let [tok (tokenizer/build fixture-vocab)

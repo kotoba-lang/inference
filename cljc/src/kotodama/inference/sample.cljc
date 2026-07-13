@@ -50,7 +50,8 @@
 
 (defn sample
   "Temperature + top-k + top-p sampling. `rand01` is a caller-supplied random
-  double in `[0,1)` so callers can inject deterministic RNGs in tests.
+  double in `[0,1)`, or a zero-argument function returning one. The function
+  form lets a decode session carry a seeded stateful RNG across token steps.
 
   opts:
     :kotodama/temperature (default 1.0, <=0 means greedy)
@@ -68,5 +69,6 @@
                            :else (vec (range (count scaled))))
           candidate-logits (mapv #(nth scaled %) candidate-idxs)
           probabilities (softmax-probabilities candidate-logits)
-          pick (weighted-pick probabilities rand01)]
+          random-value (if (fn? rand01) (rand01) rand01)
+          pick (weighted-pick probabilities random-value)]
       (nth candidate-idxs pick))))

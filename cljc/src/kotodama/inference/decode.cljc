@@ -57,11 +57,12 @@
                         (sample/sample logits sample-opts)
                         (sample/greedy logits))
               elapsed #?(:clj (- (System/nanoTime) t0) :cljs (- (js/Date.now) t0))]
-          (when on-token
-            (on-token next-id (tokenizer/decode tokenizer [next-id]) elapsed))
           (if (contains? eos-ids next-id)
             {:kotodama/prompt-token-ids prompt-ids
              :kotodama/generated-token-ids generated
              :kotodama/text (tokenizer/decode tokenizer generated)
              :kotodama/stop-reason :eos}
-            (recur (conj ids next-id) (conj generated next-id) (inc step))))))))
+            (do
+              (when on-token
+                (on-token next-id (tokenizer/decode tokenizer [next-id]) elapsed))
+              (recur (conj ids next-id) (conj generated next-id) (inc step)))))))))

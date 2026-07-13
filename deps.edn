@@ -2,7 +2,8 @@
  ;; real git pins (the old org.kotoba-lang/* group + :local/root pair was never
  ;; resolvable as a git dep — monorepo-layout-only). Workspace-offline dev
  ;; against sibling checkouts: use the :dev alias.
- :deps {io.github.kotoba-lang/num {:git/sha "0561213834f144c7c9f912217e63225ec589467a"}
+ :deps {org.clojure/data.json {:mvn/version "2.5.1"}
+        io.github.kotoba-lang/num {:git/sha "0561213834f144c7c9f912217e63225ec589467a"}
         io.github.kotoba-lang/torch {:git/sha "e986ef3047375cd9d657018b6377a08c28745a30"}}
  :aliases
  {:dev {:override-deps {io.github.kotoba-lang/num {:local/root "../num"}
@@ -47,6 +48,7 @@
                                :main-opts ["-m" "kotodama.verify.native-gemma4-parity"]}
   :verify-metal-kdot-worker {:extra-paths ["verify"]
                              :main-opts ["-m" "kotodama.verify.metal-kdot-worker"]}
+  :serve-ollama {:main-opts ["-m" "kotodama.inference.host.ollama-server"]}
   :verify-gemma-kvcache {:extra-paths ["verify"]
                          :main-opts ["-m" "kotodama.verify.gemma4-kvcache-smoke"]}
   ;; clj-kondo as a Clojars lib (no Homebrew/system install needed).

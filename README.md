@@ -159,6 +159,30 @@ one `[10240,2560]` Q4_K projection, and reduces warm second-token time to
 11.2 s. Projection-by-projection GPU readback and JVM-side layer operations are
 now the dominant cost; full-layer GPU residency/fusion is required next.
 
+## Ollama-compatible HTTP server
+
+The JVM host can run behind Ollama's local HTTP wire contract. Model sessions
+are loaded lazily and retained across requests, so the GGUF mmap, KV/weight
+caches, and persistent Metal worker are reused instead of recreated:
+
+```sh
+# defaults to 127.0.0.1:11434; an optional first argument overrides the port
+KOTODAMA_METAL_K_DOT=1 clojure -M:serve-ollama 11434
+
+curl http://127.0.0.1:11434/api/tags
+curl http://127.0.0.1:11434/api/generate \
+  -d '{"model":"gemma4:e4b","prompt":"The capital of France is"}'
+```
+
+Implemented endpoints are `GET /api/version`, `GET /api/tags`,
+`POST /api/show`, `GET /api/ps`, and `POST /api/generate`. Generate supports
+Ollama's default newline-delimited streaming and `"stream": false`, plus
+`num_predict`, `temperature`, `top_k`, `top_p`, and `seed`. The transport has
+real loopback HTTP tests for response shape, streaming chunks, lazy loading,
+session reuse, model-not-found errors, and disposal. Model pull/push/copy/delete,
+chat, embeddings, blobs, scheduling across multiple models, and exact behavior
+for every Ollama option remain future compatibility work.
+
 ## Local MLX host adapter (`kotodama.inference.mlx`, Apple Silicon)
 
 A thin `IModelRuntime` host adapter (same shape as `kotodama.inference.ollama`)
