@@ -143,6 +143,22 @@ warm Ollama/Metal run (`prompt_eval_duration` 0.141 s). Output parity is real;
 throughput parity is not. Metal K-dot, persistent GPU buffers, and fused decode
 remain required.
 
+The experimental persistent Metal path uses the same GGUF bytes and K-dot
+contract through a binary JVM↔Deno worker. Weights are uploaded once and cached
+as WebGPU buffers:
+
+```sh
+deno run --unstable-webgpu --allow-read verify/metal_kdot.js
+clojure -M:verify-metal-kdot-worker
+KOTODAMA_METAL_K_DOT=1 KOTODAMA_VERIFY_MAX_TOKENS=2 \
+  clojure -M:verify-gemma-ple-generate
+```
+
+On Apple M4 it preserves `" Paris."` generation, measures roughly 15–20 ms for
+one `[10240,2560]` Q4_K projection, and reduces warm second-token time to
+11.2 s. Projection-by-projection GPU readback and JVM-side layer operations are
+now the dominant cost; full-layer GPU residency/fusion is required next.
+
 ## Local MLX host adapter (`kotodama.inference.mlx`, Apple Silicon)
 
 A thin `IModelRuntime` host adapter (same shape as `kotodama.inference.ollama`)

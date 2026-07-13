@@ -370,6 +370,8 @@
                          (#{12 14} (long (:type tensor))))
         native-k-dot? (and (boolean (get-in session [:dbg :native-k-dot?]))
                            (#{12 14} (long (:type tensor))))
+        metal-k-dot? (and (boolean (get-in session [:dbg :metal-k-dot?]))
+                          (#{12 14} (long (:type tensor))))
         [row-width num-rows] (:shape tensor)
         row-width (long row-width)
         num-rows (long num-rows)
@@ -378,6 +380,13 @@
         ^objects in-arr (into-array (map double-array inputs))
         ^objects outputs (into-array (repeatedly n-pos #(double-array num-rows)))]
     (cond
+      metal-k-dot?
+      (let [metal-matvec (requiring-resolve 'kotodama.inference.host.metal-kdot/matvec)
+            tensor-bytes (* num-rows (row-byte-count row-width tensor-type))]
+        (metal-matvec (:metal-worker session) tensor-type (:model-path session)
+                      (+ (long tensor-data-start) (long (:offset tensor))) tensor-bytes
+                      tensor-name num-rows row-width inputs))
+
       native-k-dot?
       (let [matvec-mapped (requiring-resolve 'kotodama.inference.host.native-kdot/matvec-mapped)
             tensor-bytes (* num-rows (row-byte-count row-width tensor-type))]
@@ -886,17 +895,22 @@
                               :unknown-token-id (long (get metadata "tokenizer.ggml.unknown_token_id" 3))})
         eos-ids (into #{(:kotodama.tokenizer/eos-token-id tok)}
                       (some-> (get metadata "tokenizer.ggml.eot_token_id") long vector))
-        file (RandomAccessFile. path "r")]
+        file (RandomAccessFile. path "r")
+        metal-worker (when (get-in opts [:kotodama/dbg :metal-k-dot?])
+                       ((requiring-resolve 'kotodama.inference.host.metal-kdot/start-worker)))]
     ;; startup self-check that the fast array decode matches the portable decode
     (when-not (and (decode-row-matches-portable? file tensor-data-start
                                                  (get tensors "blk.0.attn_q.weight") hidden 0)
                    (decode-row-matches-portable? file tensor-data-start
                                                  (get tensors "token_embd.weight") hidden
                                                  (:kotodama.tokenizer/bos-token-id tok)))
+      (when metal-worker
+        ((requiring-resolve 'kotodama.inference.host.metal-kdot/close-worker!) metal-worker))
       (.close file)
       (throw (ex-info "fast array row decode diverged from portable kotodama.inference.gguf decode" {})))
     {:file file
      :model-path path
+     :metal-worker metal-worker
      :gguf/metadata metadata
      :gguf/tensors tensors
      :gguf/tensor-data-start tensor-data-start
@@ -915,6 +929,8 @@
      :kv-cache (atom {:len 0})}))
 
 (defn close-model [session]
+  (when-let [worker (:metal-worker session)]
+    ((requiring-resolve 'kotodama.inference.host.metal-kdot/close-worker!) worker))
   (when-let [^RandomAccessFile f (:file session)] (.close f))
   (reset! (:kv-cache session) {:len 0})
   (reset! (:weight-cache session) {})

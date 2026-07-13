@@ -22,7 +22,8 @@
     :cljs-wasm-smoke
     :gemma4-e4b-gguf
     :gemma4-e4b-live
-    :gemma4-e4b-native-parity})
+    :gemma4-e4b-native-parity
+    :gemma4-metal-kdot})
 
 (def banned-foundation-patterns
   [{:id :transformers-js

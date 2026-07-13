@@ -45,6 +45,8 @@
   :verify-native-gemma-parity {:extra-paths ["verify"]
                                :jvm-opts ["-Xmx4g" "--enable-native-access=ALL-UNNAMED"]
                                :main-opts ["-m" "kotodama.verify.native-gemma4-parity"]}
+  :verify-metal-kdot-worker {:extra-paths ["verify"]
+                             :main-opts ["-m" "kotodama.verify.metal-kdot-worker"]}
   :verify-gemma-kvcache {:extra-paths ["verify"]
                          :main-opts ["-m" "kotodama.verify.gemma4-kvcache-smoke"]}
   ;; clj-kondo as a Clojars lib (no Homebrew/system install needed).
