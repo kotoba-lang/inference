@@ -112,6 +112,34 @@ reference implementation materializes roughly 20 GiB of dequantized weights:
 CACHE_WEIGHTS=1 KOTODAMA_VERIFY_MAX_TOKENS=1 clojure -M:verify-gemma-ple-generate
 ```
 
+## Local MLX host adapter (`kotodama.inference.mlx`, Apple Silicon)
+
+A thin `IModelRuntime` host adapter (same shape as `kotodama.inference.ollama`)
+for a local, already-running OpenAI-compatible MLX server — either Apple's
+own `mlx_lm.server` or mu-hashmi/mlx-moe's `serve` (single-node MoE, SSD-paged
+experts; the fleet planner that launches it lives in `kotoba-lang/murakumo`'s
+`murakumo.infer.moe`). Both speak the same `/v1/chat/completions` wire shape,
+so one client covers both — `:backend` only labels which process convention
+the caller launched:
+
+```clojure
+(require '[kotodama.inference.mlx :as mlx]
+         '[kotodama.inference.ports :as ports])
+
+(def rt (mlx/mlx-runtime {:base-url "http://127.0.0.1:8080"
+                          :model "mlx-community/Qwen3.6-35B-A3B-4bit"
+                          :backend :mlx-lm}))    ; or :mlx-moe
+(def session (ports/load! rt {}))
+(ports/generate! rt session "..." {:kotodama/max-new-tokens 64 :kotodama/temperature 0.2})
+```
+
+`generate!` is the only method that talks over HTTP; `forward!` throws (no
+raw-tensor endpoint on either server), matching the Ollama adapter's own
+limitation. See `cljc/test/kotodama/inference/mlx_test.cljc` for the pure
+(no-I/O) coverage — the HTTP path is verified by hand against a running
+`mlx_lm.server`/`mlx-moe serve`, the same standard the Ollama adapter holds
+itself to.
+
 `kotoba-lang/num` and `kotoba-lang/torch` are sibling local dependencies. A
 standalone checkout should place them next to this repository, or use a monorepo
 layout that preserves `../num` and `../torch`.

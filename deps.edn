@@ -40,4 +40,8 @@
                               :jvm-opts ["-Xmx24g"]
                               :main-opts ["-m" "kotodama.verify.gemma4-e4b-ple-generate-smoke"]}
   :verify-gemma-kvcache {:extra-paths ["verify"]
-                         :main-opts ["-m" "kotodama.verify.gemma4-kvcache-smoke"]}}}
+                         :main-opts ["-m" "kotodama.verify.gemma4-kvcache-smoke"]}
+  ;; clj-kondo as a Clojars lib (no Homebrew/system install needed).
+  :lint {:replace-deps {clj-kondo/clj-kondo {:mvn/version "2024.11.14"}}
+         :main-opts ["-m" "clj-kondo.main" "--lint" "cljc/src" "cljc/test"
+                     "--fail-level" "error"]}}}

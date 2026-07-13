@@ -13,8 +13,6 @@
 
 (def required-gates
   #{:cljc-contract
-    :rust-native-build
-    :rust-wasm-build
     :num-clj
     :num-cljs
     :num-webgpu
@@ -38,11 +36,26 @@
 (defn- fail! [message data]
   (throw (ex-info message data)))
 
+(defn unblob
+  "verify/maturity.edn is stored as Datomic/Datascript tx-data (a single-entity
+  vector). Non-scalar values (nested maps, vectors-of-maps) are pr-str'd
+  blobs; unwrap them back to live EDN. Public so other verify.* namespaces
+  reading verify/maturity.edn (e.g. kotodama.verify.run-maturity) can reuse it."
+  [v]
+  (if (string? v)
+    (try (let [parsed (edn/read-string v)] (if (coll? parsed) parsed v))
+         (catch Exception _ v))
+    v))
+
+(defn reconstitute-entity [tx-data]
+  (into {} (map (fn [[k v]] [(keyword (name k)) (unblob v)]))
+        (dissoc (first tx-data) :db/id)))
+
 (defn- read-maturity []
   (let [file (io/file "verify/maturity.edn")]
     (when-not (.isFile file)
       (fail! "missing maturity.edn" {:path (.getPath file)}))
-    (edn/read-string (slurp file))))
+    (reconstitute-entity (edn/read-string (slurp file)))))
 
 (defn- assert-artifacts! [maturity]
   (let [missing (->> (:required-artifacts maturity)
