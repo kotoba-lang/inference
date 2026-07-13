@@ -8,6 +8,8 @@
   murakumo-studio calls: `kotodama.inference.host.jvm/generate`.
 
   Env: KOTODAMA_VERIFY_PROMPT, KOTODAMA_VERIFY_MAX_TOKENS,
+       KOTODAMA_TRACE_EDN (optional activation-fingerprint output path),
+       KOTODAMA_FLOAT32=1 (ggml-like float32 projection accumulation probe),
        CACHE_WEIGHTS=1 (keep dequantized weights in RAM, ~20GB, much faster)."
   (:require [kotodama.inference.host.jvm :as host]))
 
@@ -15,16 +17,25 @@
   (let [prompt (or (System/getenv "KOTODAMA_VERIFY_PROMPT") "The capital of France is")
         max-tokens (Long/parseLong (or (System/getenv "KOTODAMA_VERIFY_MAX_TOKENS") "16"))
         cache-weights? (= "1" (System/getenv "CACHE_WEIGHTS"))
+        trace-path (System/getenv "KOTODAMA_TRACE_EDN")
+        float32? (= "1" (System/getenv "KOTODAMA_FLOAT32"))
+        trace-events (atom [])
         t0 (System/nanoTime)
         result (host/generate {:kotodama/model "gemma4:e4b"
                                :kotodama/prompt prompt
                                :kotodama/max-tokens max-tokens
                                :kotodama/cache-weights? cache-weights?
+                               :kotodama/dbg (cond-> {:float32-matmul? float32?}
+                                               trace-path
+                                               (assoc :trace-fn #(swap! trace-events conj %)))
                                :kotodama/on-token
                                (fn [id text nanos]
                                  (println (format "  [+%.1fs] %d %s" (/ nanos 1.0e9) id (pr-str text)))
                                  (flush))})
         secs (/ (- (System/nanoTime) t0) 1.0e9)]
+    (when trace-path
+      (spit trace-path (str (pr-str @trace-events) "\n"))
+      (println "trace:     " trace-path "(" (count @trace-events) "events)"))
     (println "prompt:    " (pr-str prompt))
     (println "generated: " (pr-str (:kotodama/text result)))
     (println "stop:      " (:kotodama/stop-reason result))

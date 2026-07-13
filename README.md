@@ -112,6 +112,20 @@ reference implementation materializes roughly 20 GiB of dequantized weights:
 CACHE_WEIGHTS=1 KOTODAMA_VERIFY_MAX_TOKENS=1 clojure -M:verify-gemma-ple-generate
 ```
 
+For numerical parity work, emit compact activation fingerprints for every
+attention, MLP, PLE, and output stage without retaining full activations:
+
+```sh
+CACHE_WEIGHTS=1 \
+KOTODAMA_VERIFY_MAX_TOKENS=1 \
+KOTODAMA_TRACE_EDN=/tmp/gemma4-trace.edn \
+clojure -M:verify-gemma-ple-generate
+```
+
+`KOTODAMA_FLOAT32=1` additionally uses explicit float32 projection
+accumulation for comparison with ggml. It is a diagnostic bridge; exact Ollama
+parity still requires native Q4_K/Q6_K block-dot reduction order.
+
 ## Local MLX host adapter (`kotodama.inference.mlx`, Apple Silicon)
 
 A thin `IModelRuntime` host adapter (same shape as `kotodama.inference.ollama`)
