@@ -98,19 +98,66 @@ CACHE_WEIGHTS=1 clojure -M:verify-gemma-kvcache         # KV-cache == from-scrat
 > Status: the decode loop, tokenizer (SentencePiece `add_dummy_prefix`), GGUF
 > weight decode and output projection are verified correct (a 0-layer forward
 > greedily predicts the input token); the KV-cache is verified to be output-
-> identical to a from-scratch run. The full 42-layer PLE forward is still
-> **numerically different from Ollama**. Reference-correct zero-based RoPE,
-> attention scale `1.0`, and checkpoint layer-output scales removed the former
-> repeated multilingual garbage, but the fixed one-token probe currently gives
-> `" hopefully"` where Ollama raw completion gives `" Paris"`. This is improved
-> but not a quality pass.
+> identical to a from-scratch run. The native Q8_K × Q4_K/Q6_K path now matches
+> Ollama on the fixed full-42-layer raw-completion probe: both produce token
+> `9079`, `" Paris"`. The former dequantize-then-double-matmul reference path
+> produces `" hopefully"`; this proved that ggml's activation quantization and
+> reduction order are model semantics for parity, not merely an optimization.
 
-The weight-cached verifier has a 24 GiB JVM heap contract because the current
-reference implementation materializes roughly 20 GiB of dequantized weights:
+The legacy weight-cached verifier retains its 24 GiB JVM heap contract. The
+native path mmaps quantized tensor windows, requires no whole-tensor
+dequantization, passed with a 4 GiB heap, and measured 1.94 GiB maximum RSS on
+Apple M4:
 
 ```sh
 CACHE_WEIGHTS=1 KOTODAMA_VERIFY_MAX_TOKENS=1 clojure -M:verify-gemma-ple-generate
+scripts/build-native-kdot.sh
+clojure -M:verify-native-kdot
+clojure -M:verify-native-gemma-parity
 ```
+
+For numerical parity work, emit compact activation fingerprints for every
+attention, MLP, PLE, and output stage without retaining full activations:
+
+```sh
+CACHE_WEIGHTS=1 \
+KOTODAMA_VERIFY_MAX_TOKENS=1 \
+KOTODAMA_TRACE_EDN=/tmp/gemma4-trace.edn \
+clojure -M:verify-gemma-ple-generate
+```
+
+`KOTODAMA_FLOAT32=1` additionally uses explicit float32 projection
+accumulation for comparison with ggml. It is a diagnostic bridge; exact Ollama
+parity still requires the same quantized reduction order. Set
+`KOTODAMA_GGML_K_DOT=1` to use the scalar reference implementation of ggml's
+Q8_K activation quantization and Q4_K/Q6_K block-dot directly from GGUF bytes.
+This avoids whole-tensor dequantization and is correctness-oriented; native
+SIMD/Metal kernels are still required for production throughput. After running
+`scripts/build-native-kdot.sh`, set `KOTODAMA_NATIVE_K_DOT=1` to mmap each
+quantized tensor and execute the same contract through JDK FFM without copying
+or materializing its weights.
+
+Current Apple M4 fixed-probe measurements (one six-token prompt plus one output
+token) are 19.4 s for the pthread CPU K-dot path versus 0.566 s wall time for a
+warm Ollama/Metal run (`prompt_eval_duration` 0.141 s). Output parity is real;
+throughput parity is not. Metal K-dot, persistent GPU buffers, and fused decode
+remain required.
+
+The experimental persistent Metal path uses the same GGUF bytes and K-dot
+contract through a binary JVM↔Deno worker. Weights are uploaded once and cached
+as WebGPU buffers:
+
+```sh
+deno run --unstable-webgpu --allow-read verify/metal_kdot.js
+clojure -M:verify-metal-kdot-worker
+KOTODAMA_METAL_K_DOT=1 KOTODAMA_VERIFY_MAX_TOKENS=2 \
+  clojure -M:verify-gemma-ple-generate
+```
+
+On Apple M4 it preserves `" Paris."` generation, measures roughly 15–20 ms for
+one `[10240,2560]` Q4_K projection, and reduces warm second-token time to
+11.2 s. Projection-by-projection GPU readback and JVM-side layer operations are
+now the dominant cost; full-layer GPU residency/fusion is required next.
 
 ## Local MLX host adapter (`kotodama.inference.mlx`, Apple Silicon)
 

@@ -48,6 +48,7 @@
   token ids (asserted by `verify/kotodama/verify/gemma4_e4b_ple_generate_smoke`)."
   (:require [clojure.string :as str]
             [kotodama.inference.gguf :as gguf]
+            [kotodama.inference.ggml-kdot :as kdot]
             [kotodama.inference.ops :as ops]
             [kotodama.inference.tokenizer :as tokenizer]
             [kotodama.inference.decode :as decode])
@@ -319,12 +320,58 @@
     (swap! weight-cache assoc tensor-name {:data out :row-width row-width :num-rows num-rows})
     (get @weight-cache tensor-name)))
 
+(defn dot-f32
+  "Dot product with an explicit float32 multiply/accumulate boundary.
+
+  This is a diagnostic bridge to ggml's float accumulation. It is not yet a
+  substitute for the final Q4_K/Q6_K block-dot kernels, whose reduction order
+  also matters for bit-level parity."
+  [a b]
+  (when-not (= (count a) (count b))
+    (throw (ex-info "dot input lengths differ" {:a-count (count a) :b-count (count b)})))
+  (let [^floats af (float-array a)
+        ^floats bf (float-array b)
+        n (alength af)]
+    (double
+     (loop [i (int 0) s (float 0.0)]
+       (if (< i n)
+         (recur (unchecked-inc-int i)
+                (float (+ s (float (* (aget af i) (aget bf i))))))
+         s)))))
+
+(defn- dot-f32-cached
+  [^floats weights weight-base ^doubles input n]
+  (double
+   (loop [i (long 0) s (float 0.0)]
+     (if (< i n)
+       (recur (unchecked-inc i)
+              (float (+ s (float (* (aget weights (+ weight-base i))
+                                    (float (aget input i)))))))
+       s))))
+
+(defn- dot-f32-row
+  [^doubles weights ^doubles input n]
+  (double
+   (loop [i (long 0) s (float 0.0)]
+     (if (< i n)
+       (recur (unchecked-inc i)
+              (float (+ s (float (* (float (aget weights i))
+                                    (float (aget input i)))))))
+       s))))
+
 (defn- project-batch
   "tensor: {:shape [row-width num-rows]}. inputs: vector of double vectors, each
   length row-width. Returns a vector of double-arrays, one per input, each
   length num-rows: out[p][r] = sum_i W[r][i] * inputs[p][i]."
   [session tensor-name tensor inputs]
   (let [{:keys [^RandomAccessFile file gguf/tensor-data-start weight-cache cache-weights?]} session
+        float32? (boolean (get-in session [:dbg :float32-matmul?]))
+        ggml-k-dot? (and (boolean (get-in session [:dbg :ggml-k-dot?]))
+                         (#{12 14} (long (:type tensor))))
+        native-k-dot? (and (boolean (get-in session [:dbg :native-k-dot?]))
+                           (#{12 14} (long (:type tensor))))
+        metal-k-dot? (and (boolean (get-in session [:dbg :metal-k-dot?]))
+                          (#{12 14} (long (:type tensor))))
         [row-width num-rows] (:shape tensor)
         row-width (long row-width)
         num-rows (long num-rows)
@@ -332,7 +379,38 @@
         n-pos (long (count inputs))
         ^objects in-arr (into-array (map double-array inputs))
         ^objects outputs (into-array (repeatedly n-pos #(double-array num-rows)))]
-    (if cache-weights?
+    (cond
+      metal-k-dot?
+      (let [metal-matvec (requiring-resolve 'kotodama.inference.host.metal-kdot/matvec)
+            tensor-bytes (* num-rows (row-byte-count row-width tensor-type))]
+        (metal-matvec (:metal-worker session) tensor-type (:model-path session)
+                      (+ (long tensor-data-start) (long (:offset tensor))) tensor-bytes
+                      tensor-name num-rows row-width inputs))
+
+      native-k-dot?
+      (let [matvec-mapped (requiring-resolve 'kotodama.inference.host.native-kdot/matvec-mapped)
+            tensor-bytes (* num-rows (row-byte-count row-width tensor-type))]
+        (matvec-mapped tensor-type
+                       (:model-path session)
+                       (+ (long tensor-data-start) (long (:offset tensor)))
+                       tensor-bytes num-rows row-width inputs))
+
+      ggml-k-dot?
+      (let [q8-inputs (mapv kdot/quantize-q8-k inputs)
+            row-bytes-n (long (row-byte-count row-width tensor-type))
+            row-buf (byte-array row-bytes-n)
+            dot-row (case (int tensor-type)
+                      12 kdot/dot-q4-k-q8-k
+                      14 kdot/dot-q6-k-q8-k)]
+        (.seek file (+ (long tensor-data-start) (long (:offset tensor))))
+        (dotimes [r num-rows]
+          (.readFully file row-buf)
+          (dotimes [p n-pos]
+            (let [^doubles out (aget outputs p)]
+              (aset out r (double (dot-row row-buf (nth q8-inputs p)))))))
+        (vec outputs))
+
+      cache-weights?
       (let [cached (or (get @weight-cache tensor-name) (cache-tensor! session tensor-name tensor))
             ^floats data (:data cached)]
         (dotimes [r num-rows]
@@ -340,12 +418,17 @@
             (dotimes [p n-pos]
               (let [^doubles in (aget in-arr p)
                     ^doubles out (aget outputs p)]
-                (aset out r (double (loop [i (long 0) s 0.0]
-                                      (if (< i row-width)
-                                        (recur (unchecked-inc i)
-                                               (+ s (* (double (aget data (+ wbase i))) (aget in i))))
-                                        s))))))))
+                (aset out r
+                      (if float32?
+                        (dot-f32-cached data wbase in row-width)
+                        (double (loop [i (long 0) s 0.0]
+                                  (if (< i row-width)
+                                    (recur (unchecked-inc i)
+                                           (+ s (* (double (aget data (+ wbase i))) (aget in i))))
+                                    s)))))))))
         (vec outputs))
+
+      :else
       (let [row-bytes-n (long (row-byte-count row-width tensor-type))
             row-buf (byte-array row-bytes-n)
             row-d (double-array row-width)]
@@ -356,10 +439,13 @@
           (dotimes [p n-pos]
             (let [^doubles in (aget in-arr p)
                   ^doubles out (aget outputs p)]
-              (aset out r (double (loop [i (long 0) s 0.0]
-                                    (if (< i row-width)
-                                      (recur (unchecked-inc i) (+ s (* (aget row-d i) (aget in i))))
-                                      s)))))))
+              (aset out r
+                    (if float32?
+                      (dot-f32-row row-d in row-width)
+                      (double (loop [i (long 0) s 0.0]
+                                (if (< i row-width)
+                                  (recur (unchecked-inc i) (+ s (* (aget row-d i) (aget in i))))
+                                  s))))))))
         (vec outputs)))))
 
 ;; ---------------------------------------------------------------------------
@@ -472,6 +558,49 @@
   (let [start (int (* (long h) (long dim)))
         end (int (* (long (inc h)) (long dim)))]
     (vec (java.util.Arrays/copyOfRange arr start end))))
+
+(defn vector-summary
+  "Return a deterministic, compact numerical fingerprint for `values`.
+
+  The summary is deliberately backend-neutral so traces from this JVM host can
+  be compared with Ollama/llama.cpp layer probes without retaining multi-GB
+  activation tensors. `:first` and `:last` contain at most three values."
+  [values]
+  (let [xs (mapv double values)
+        n (count xs)]
+    (if (zero? n)
+      {:count 0 :sum 0.0 :rms 0.0 :min nil :max nil :first [] :last []}
+      (let [{:keys [sum square-sum min-value max-value]}
+            (reduce (fn [{:keys [sum square-sum min-value max-value]} x]
+                      (let [x (double x)]
+                        {:sum (+ sum x)
+                         :square-sum (+ square-sum (* x x))
+                         :min-value (Math/min min-value x)
+                         :max-value (Math/max max-value x)}))
+                    {:sum 0.0
+                     :square-sum 0.0
+                     :min-value Double/POSITIVE_INFINITY
+                     :max-value Double/NEGATIVE_INFINITY}
+                    xs)
+            edge-count (min 3 n)]
+        {:count n
+         :sum sum
+         :rms (Math/sqrt (/ square-sum n))
+         :min min-value
+         :max max-value
+         :first (subvec xs 0 edge-count)
+         :last (subvec xs (- n edge-count) n)}))))
+
+(defn- trace-batch!
+  [session layer-index stage base-pos batch]
+  (when-let [trace-fn (get-in session [:dbg :trace-fn])]
+    (when (seq batch)
+      (let [position (+ (long base-pos) (dec (count batch)))
+            values (peek (vec batch))]
+        (trace-fn (assoc (vector-summary values)
+                         :layer layer-index
+                         :stage stage
+                         :position position))))))
 
 (defn gemma4-block-forward
   "Run one Gemma4 decoder layer over `new-hidden` (the NEW positions, a vector
@@ -616,9 +745,36 @@
         ple-normed (mapv #(rmsn (vec %) post-norm-w) ple-proj)
         residual3 (if (:disable-ple? dbg)
                     residual2
-                    (mapv ops/add-values residual2 ple-normed))]
+                    (mapv ops/add-values residual2 ple-normed))
+        output (mapv (fn [h] (mapv #(* (double %) (double layer-scalar)) h)) residual3)]
+    (trace-batch! session layer-index :input base-pos new-hidden)
+    (trace-batch! session layer-index :attention/norm base-pos normed)
+    (trace-batch! session layer-index :attention/q base-pos
+                  (mapv #(vec (mapcat identity %)) new-q-heads))
+    (when-not donor
+      (trace-batch! session layer-index :attention/k base-pos
+                    (mapv #(vec (mapcat identity %)) (take-last n-new k)))
+      (trace-batch! session layer-index :attention/v base-pos
+                    (mapv #(vec (mapcat identity %)) (take-last n-new v))))
+    (trace-batch! session layer-index :attention/context base-pos attn-concat)
+    (trace-batch! session layer-index :attention/project base-pos attn-out)
+    (trace-batch! session layer-index :attention/post-norm base-pos post-attn)
+    (trace-batch! session layer-index :attention/residual base-pos residual1)
+    (trace-batch! session layer-index :mlp/norm base-pos ffn-normed)
+    (trace-batch! session layer-index :mlp/gate base-pos (mapv vec gate-all))
+    (trace-batch! session layer-index :mlp/up base-pos (mapv vec up-all))
+    (trace-batch! session layer-index :mlp/activation base-pos activation)
+    (trace-batch! session layer-index :mlp/down base-pos (mapv vec down-all))
+    (trace-batch! session layer-index :mlp/post-norm base-pos post-ffn)
+    (trace-batch! session layer-index :mlp/residual base-pos residual2)
+    (trace-batch! session layer-index :ple/gate base-pos (mapv vec gate-proj))
+    (trace-batch! session layer-index :ple/gated-input base-pos gated)
+    (trace-batch! session layer-index :ple/project base-pos (mapv vec ple-proj))
+    (trace-batch! session layer-index :ple/post-norm base-pos ple-normed)
+    (trace-batch! session layer-index :ple/residual base-pos residual3)
+    (trace-batch! session layer-index :output base-pos output)
     ;; --- layer output scale ---
-    (mapv (fn [h] (mapv #(* (double %) (double layer-scalar)) h)) residual3)))
+    output))
 
 ;; ---------------------------------------------------------------------------
 ;; full forward: embed new positions, build PLE inputs, run all layers,
@@ -654,6 +810,13 @@
                          (mapv #(* (double %) embed-scale) row)))
                      new-ids)
         pli (per-layer-inputs session new-ids embeds)
+        _ (trace-batch! session -1 :embedding base-pos embeds)
+        _ (when-let [trace-fn (get-in session [:dbg :trace-fn])]
+            (doseq [layer-index (range block-count)]
+              (trace-fn (assoc (vector-summary (nth (peek pli) layer-index))
+                               :layer layer-index
+                               :stage :ple/input
+                               :position (+ base-pos (dec (count pli)))))))
         trace? (:trace-rms? dbg)
         rms (fn [v] (Math/sqrt (/ (reduce + (map #(* (double %) (double %)) v)) (count v))))
         _ (when trace?
@@ -671,8 +834,12 @@
         _ (swap! kv-cache assoc :len n)
         last-hidden (rmsn (peek final-new) output-norm-w)
         [logits] (project-batch session "token_embd.weight" embd-tensor [last-hidden])
-        cap (:gemma4/final-logit-softcapping expected)]
-    (mapv #(softcap % cap) logits)))
+        cap (:gemma4/final-logit-softcapping expected)
+        capped-logits (mapv #(softcap % cap) logits)]
+    (trace-batch! session block-count :output/norm base-pos [last-hidden])
+    (trace-batch! session block-count :output/logits base-pos [logits])
+    (trace-batch! session block-count :output/softcapped-logits base-pos [capped-logits])
+    capped-logits))
 
 ;; ---------------------------------------------------------------------------
 ;; stable public entry point
@@ -728,16 +895,22 @@
                               :unknown-token-id (long (get metadata "tokenizer.ggml.unknown_token_id" 3))})
         eos-ids (into #{(:kotodama.tokenizer/eos-token-id tok)}
                       (some-> (get metadata "tokenizer.ggml.eot_token_id") long vector))
-        file (RandomAccessFile. path "r")]
+        file (RandomAccessFile. path "r")
+        metal-worker (when (get-in opts [:kotodama/dbg :metal-k-dot?])
+                       ((requiring-resolve 'kotodama.inference.host.metal-kdot/start-worker)))]
     ;; startup self-check that the fast array decode matches the portable decode
     (when-not (and (decode-row-matches-portable? file tensor-data-start
                                                  (get tensors "blk.0.attn_q.weight") hidden 0)
                    (decode-row-matches-portable? file tensor-data-start
                                                  (get tensors "token_embd.weight") hidden
                                                  (:kotodama.tokenizer/bos-token-id tok)))
+      (when metal-worker
+        ((requiring-resolve 'kotodama.inference.host.metal-kdot/close-worker!) metal-worker))
       (.close file)
       (throw (ex-info "fast array row decode diverged from portable kotodama.inference.gguf decode" {})))
     {:file file
+     :model-path path
+     :metal-worker metal-worker
      :gguf/metadata metadata
      :gguf/tensors tensors
      :gguf/tensor-data-start tensor-data-start
@@ -756,6 +929,8 @@
      :kv-cache (atom {:len 0})}))
 
 (defn close-model [session]
+  (when-let [worker (:metal-worker session)]
+    ((requiring-resolve 'kotodama.inference.host.metal-kdot/close-worker!) worker))
   (when-let [^RandomAccessFile f (:file session)] (.close f))
   (reset! (:kv-cache session) {:len 0})
   (reset! (:weight-cache session) {})

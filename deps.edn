@@ -37,8 +37,16 @@
                               ;; CACHE_WEIGHTS=1 materializes roughly 20 GiB of
                               ;; dequantized weights; the default JVM heap dies
                               ;; before the first real-model token.
-                              :jvm-opts ["-Xmx24g"]
+                              :jvm-opts ["-Xmx24g" "--enable-native-access=ALL-UNNAMED"]
                               :main-opts ["-m" "kotodama.verify.gemma4-e4b-ple-generate-smoke"]}
+  :verify-native-kdot {:extra-paths ["verify"]
+                       :jvm-opts ["--enable-native-access=ALL-UNNAMED"]
+                       :main-opts ["-m" "kotodama.verify.native-kdot"]}
+  :verify-native-gemma-parity {:extra-paths ["verify"]
+                               :jvm-opts ["-Xmx4g" "--enable-native-access=ALL-UNNAMED"]
+                               :main-opts ["-m" "kotodama.verify.native-gemma4-parity"]}
+  :verify-metal-kdot-worker {:extra-paths ["verify"]
+                             :main-opts ["-m" "kotodama.verify.metal-kdot-worker"]}
   :verify-gemma-kvcache {:extra-paths ["verify"]
                          :main-opts ["-m" "kotodama.verify.gemma4-kvcache-smoke"]}
   ;; clj-kondo as a Clojars lib (no Homebrew/system install needed).
