@@ -1,5 +1,5 @@
 {:schema 1
- :updated "2026-06-30"
+ :updated "2026-07-13"
  :scope :kotodama.inference/cljc-num-torch
  :foundation {:portable-runtime :torch-transformer
               :model-graph :torch-clj
@@ -278,7 +278,7 @@
           :proves [:real-model-identity :real-model-generate :imodelruntime-live-generate]}]
  :known-gaps [{:id :gemma4-num-native
                :status :not-yet
-               :reason "gemma4:e4b GGUF metadata including RoPE frequency/dimension facts, tensor directory, tensor byte windows, F32 payload samples, Q4_K attention/output/MLP block dequantization, Q6_K attention/MLP/token embedding block dequantization, upload of decoded real-model blocks into num-clj tensors, BOS token embedding row lookup, blk.0 attention RMSNorm, partial blk.0 Q/K/V num/dot projections, partial Q/K RoPE, head-0 Q/K/V materialization, all-head single-token GQA attention with 8 Q heads over 2 KV heads, two-token causal GQA attention over the KV visible-token boundary, full-width head0-only and all-head attention output projection, blk.0 FFN RMSNorm, full blk.0 gated MLP gate/up/down projection with SiLU gating, composed blk.0 attention residual, FFN norm, full MLP, block residual, output norm, block-output candidate logits, composed blk.1 attention/MLP block after blk.0 output, output_norm RMSNorm, tied token embedding candidate logits, full-vocabulary tied embedding logits, and greedy/top-k sampling are verified directly. Full 42-layer composition and generation through torch-clj to num-clj are not yet implemented."}
+               :reason "The real 42-layer PLE host path, KV cache, tokenizer, and dense output projection execute. Zero-based RoPE positions, Gemma4 attention scale 1.0, and trained layer_output_scale now match the current Hugging Face, Ollama v0.30.10, and llama.cpp reference implementations. The fixed raw-completion probe improved from repeated multilingual garbage to a coherent token, but still returns ` hopefully` instead of Ollama's ` Paris`; numerical parity is therefore not achieved. The current weight-cached JVM path also needs a 24 GiB heap and measured only 0.0023 tok/s including first materialization. Full reference-parity generation through torch-clj/num-clj remains incomplete."}
               {:id :distributed-llm-vllm-like
                :status :contract-only
                :reason "Distributed transformer specs now carry tensor/pipeline parallelism, shard strategy, and paged KV cache as EDN, but no vLLM-like scheduler, admission control, continuous batching, or remote worker execution has been implemented yet."}

@@ -98,9 +98,19 @@ CACHE_WEIGHTS=1 clojure -M:verify-gemma-kvcache         # KV-cache == from-scrat
 > Status: the decode loop, tokenizer (SentencePiece `add_dummy_prefix`), GGUF
 > weight decode and output projection are verified correct (a 0-layer forward
 > greedily predicts the input token); the KV-cache is verified to be output-
-> identical to a from-scratch run. The full 42-layer PLE forward is **not yet
-> producing coherent text** — an unresolved deep-layer accumulation remains.
-> See the PR notes for the exact evidence and next steps.
+> identical to a from-scratch run. The full 42-layer PLE forward is still
+> **numerically different from Ollama**. Reference-correct zero-based RoPE,
+> attention scale `1.0`, and checkpoint layer-output scales removed the former
+> repeated multilingual garbage, but the fixed one-token probe currently gives
+> `" hopefully"` where Ollama raw completion gives `" Paris"`. This is improved
+> but not a quality pass.
+
+The weight-cached verifier has a 24 GiB JVM heap contract because the current
+reference implementation materializes roughly 20 GiB of dequantized weights:
+
+```sh
+CACHE_WEIGHTS=1 KOTODAMA_VERIFY_MAX_TOKENS=1 clojure -M:verify-gemma-ple-generate
+```
 
 `kotoba-lang/num` and `kotoba-lang/torch` are sibling local dependencies. A
 standalone checkout should place them next to this repository, or use a monorepo
