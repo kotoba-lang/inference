@@ -368,6 +368,8 @@
         float32? (boolean (get-in session [:dbg :float32-matmul?]))
         ggml-k-dot? (and (boolean (get-in session [:dbg :ggml-k-dot?]))
                          (#{12 14} (long (:type tensor))))
+        native-k-dot? (and (boolean (get-in session [:dbg :native-k-dot?]))
+                           (#{12 14} (long (:type tensor))))
         [row-width num-rows] (:shape tensor)
         row-width (long row-width)
         num-rows (long num-rows)
@@ -376,6 +378,14 @@
         ^objects in-arr (into-array (map double-array inputs))
         ^objects outputs (into-array (repeatedly n-pos #(double-array num-rows)))]
     (cond
+      native-k-dot?
+      (let [matvec-mapped (requiring-resolve 'kotodama.inference.host.native-kdot/matvec-mapped)
+            tensor-bytes (* num-rows (row-byte-count row-width tensor-type))]
+        (matvec-mapped tensor-type
+                       (:model-path session)
+                       (+ (long tensor-data-start) (long (:offset tensor)))
+                       tensor-bytes num-rows row-width inputs))
+
       ggml-k-dot?
       (let [q8-inputs (mapv kdot/quantize-q8-k inputs)
             row-bytes-n (long (row-byte-count row-width tensor-type))
@@ -886,6 +896,7 @@
       (.close file)
       (throw (ex-info "fast array row decode diverged from portable kotodama.inference.gguf decode" {})))
     {:file file
+     :model-path path
      :gguf/metadata metadata
      :gguf/tensors tensors
      :gguf/tensor-data-start tensor-data-start

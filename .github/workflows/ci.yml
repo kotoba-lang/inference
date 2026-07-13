@@ -47,3 +47,20 @@ jobs:
             find . \( -name Cargo.toml -o -name Cargo.lock -o -name '*.rs' -o -name 'rust-toolchain*' -o -path './.cargo/*' \) -print
             exit 1
           fi
+
+  native-kdot:
+    name: native ggml K-dot parity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "24"
+      - uses: DeLaGuardo/setup-clojure@13.4
+        with:
+          cli: latest
+      - name: Build native K-dot
+        run: scripts/build-native-kdot.sh
+      - name: Verify official ggml parity
+        run: clojure -M:verify-native-kdot

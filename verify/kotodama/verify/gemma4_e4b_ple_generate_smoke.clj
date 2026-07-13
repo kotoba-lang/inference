@@ -11,6 +11,7 @@
        KOTODAMA_TRACE_EDN (optional activation-fingerprint output path),
        KOTODAMA_FLOAT32=1 (ggml-like float32 projection accumulation probe),
        KOTODAMA_GGML_K_DOT=1 (Q8_K activation + Q4_K/Q6_K direct block-dot),
+       KOTODAMA_NATIVE_K_DOT=1 (mmap + native C K-dot through JDK FFM),
        CACHE_WEIGHTS=1 (keep dequantized weights in RAM, ~20GB, much faster)."
   (:require [kotodama.inference.host.jvm :as host]))
 
@@ -21,6 +22,7 @@
         trace-path (System/getenv "KOTODAMA_TRACE_EDN")
         float32? (= "1" (System/getenv "KOTODAMA_FLOAT32"))
         ggml-k-dot? (= "1" (System/getenv "KOTODAMA_GGML_K_DOT"))
+        native-k-dot? (= "1" (System/getenv "KOTODAMA_NATIVE_K_DOT"))
         trace-events (atom [])
         t0 (System/nanoTime)
         result (host/generate {:kotodama/model "gemma4:e4b"
@@ -28,7 +30,8 @@
                                :kotodama/max-tokens max-tokens
                                :kotodama/cache-weights? cache-weights?
                                :kotodama/dbg (cond-> {:float32-matmul? float32?
-                                                     :ggml-k-dot? ggml-k-dot?}
+                                                     :ggml-k-dot? ggml-k-dot?
+                                                     :native-k-dot? native-k-dot?}
                                                trace-path
                                                (assoc :trace-fn #(swap! trace-events conj %)))
                                :kotodama/on-token
