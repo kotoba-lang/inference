@@ -48,6 +48,7 @@
   token ids (asserted by `verify/kotodama/verify/gemma4_e4b_ple_generate_smoke`)."
   (:require [clojure.string :as str]
             [kotodama.inference.gguf :as gguf]
+            [kotodama.inference.ggml-kdot :as kdot]
             [kotodama.inference.ops :as ops]
             [kotodama.inference.tokenizer :as tokenizer]
             [kotodama.inference.decode :as decode])
@@ -365,6 +366,8 @@
   [session tensor-name tensor inputs]
   (let [{:keys [^RandomAccessFile file gguf/tensor-data-start weight-cache cache-weights?]} session
         float32? (boolean (get-in session [:dbg :float32-matmul?]))
+        ggml-k-dot? (and (boolean (get-in session [:dbg :ggml-k-dot?]))
+                         (#{12 14} (long (:type tensor))))
         [row-width num-rows] (:shape tensor)
         row-width (long row-width)
         num-rows (long num-rows)
@@ -372,7 +375,23 @@
         n-pos (long (count inputs))
         ^objects in-arr (into-array (map double-array inputs))
         ^objects outputs (into-array (repeatedly n-pos #(double-array num-rows)))]
-    (if cache-weights?
+    (cond
+      ggml-k-dot?
+      (let [q8-inputs (mapv kdot/quantize-q8-k inputs)
+            row-bytes-n (long (row-byte-count row-width tensor-type))
+            row-buf (byte-array row-bytes-n)
+            dot-row (case (int tensor-type)
+                      12 kdot/dot-q4-k-q8-k
+                      14 kdot/dot-q6-k-q8-k)]
+        (.seek file (+ (long tensor-data-start) (long (:offset tensor))))
+        (dotimes [r num-rows]
+          (.readFully file row-buf)
+          (dotimes [p n-pos]
+            (let [^doubles out (aget outputs p)]
+              (aset out r (double (dot-row row-buf (nth q8-inputs p)))))))
+        (vec outputs))
+
+      cache-weights?
       (let [cached (or (get @weight-cache tensor-name) (cache-tensor! session tensor-name tensor))
             ^floats data (:data cached)]
         (dotimes [r num-rows]
@@ -389,6 +408,8 @@
                                            (+ s (* (double (aget data (+ wbase i))) (aget in i))))
                                     s)))))))))
         (vec outputs))
+
+      :else
       (let [row-bytes-n (long (row-byte-count row-width tensor-type))
             row-buf (byte-array row-bytes-n)
             row-d (double-array row-width)]

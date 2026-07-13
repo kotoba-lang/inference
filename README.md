@@ -124,7 +124,11 @@ clojure -M:verify-gemma-ple-generate
 
 `KOTODAMA_FLOAT32=1` additionally uses explicit float32 projection
 accumulation for comparison with ggml. It is a diagnostic bridge; exact Ollama
-parity still requires native Q4_K/Q6_K block-dot reduction order.
+parity still requires the same quantized reduction order. Set
+`KOTODAMA_GGML_K_DOT=1` to use the scalar reference implementation of ggml's
+Q8_K activation quantization and Q4_K/Q6_K block-dot directly from GGUF bytes.
+This avoids whole-tensor dequantization and is correctness-oriented; native
+SIMD/Metal kernels are still required for production throughput.
 
 ## Local MLX host adapter (`kotodama.inference.mlx`, Apple Silicon)
 
