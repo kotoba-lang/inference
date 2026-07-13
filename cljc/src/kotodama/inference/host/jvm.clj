@@ -525,30 +525,24 @@
                   (:rope-interleaved? dbg) (ops/rope-interleaved-values v pos rope-dim theta)
                   rope-divisors (ops/rope-neox-divisors-values v pos rope-dim rope-divisors)
                   :else (ops/rope-neox-values v pos rope-dim theta)))
-        ;; softmax scale: the llama.cpp GGUF runtime for this model uses
-        ;; 1/sqrt(head_dim) (empirically the only scale that makes even a single
-        ;; layer preserve induction; the MLX `x/` reference uses 1.0 with a
-        ;; different norm treatment). :attn-scale-one? forces the 1.0 variant.
+        ;; Gemma4 normalizes Q and K per head and defines attention scaling as
+        ;; 1.0 (HF Gemma4TextAttention.scaling and Ollama's model both do this).
+        ;; Keep the old sqrt scaling only as an explicit diagnostic switch.
         attn-scale (cond
-                     (:attn-scale-one? dbg) 1.0
+                     (:attn-scale-sqrt? dbg) (/ 1.0 (Math/sqrt (double q-head-dim)))
                      (and global? (:global-scale-256? dbg)) (/ 1.0 (Math/sqrt 256.0))
-                     :else (/ 1.0 (Math/sqrt (double q-head-dim))))
+                     :else 1.0)
         attnf (fn [q ks vs] (ops/causal-attention-values-scaled q ks vs attn-scale))
         mlp-act (if (:mlp-silu? dbg)
                   ops/gated-mlp-activation-values
                   ops/gelu-gated-mlp-activation-values)
         vnormf (fn [v] (if (:disable-vnorm? dbg) v (ops/rms-normalize-values v eps)))
         gate-act (if (:mlp-silu? dbg) ops/silu-value ops/gelu-tanh-value)
-        ;; layer_output_scale: HF (`hidden_states *= layer_scalar`) and llama.cpp
-        ;; (`cur = cur * out_scale`) multiply the whole layer output by this
-        ;; per-layer scalar. EMPIRICALLY, applying the stored values (~0.06 for
-        ;; sliding layers) here collapses induction within ~2 layers, while
-        ;; treating it as a no-op keeps the correct token on top for ~4 layers —
-        ;; so it is OFF by default (opt in with :apply-layer-scalar?). This is an
-        ;; unresolved discrepancy (the HF `layer_scalar` buffer is initialised to
-        ;; ones and may never be trained; the stored GGUF value may need a
-        ;; transform). See the PR notes.
-        layer-scalar (if (:apply-layer-scalar? dbg) layer-scalar 1.0)
+        ;; The stored layer_output_scale is part of the trained checkpoint.
+        ;; Reference implementations multiply the complete decoder-layer output
+        ;; by it. It must therefore be active by default; the bypass is retained
+        ;; solely for controlled regression comparisons.
+        layer-scalar (if (:disable-layer-scalar? dbg) 1.0 layer-scalar)
         ;; --- attention branch ---
         normed (mapv #(rmsn % attn-norm-w) new-hidden)
         q-all (project-batch session (tensor-name layer-index "attn_q") q-tensor normed)
@@ -559,7 +553,7 @@
                               (mapv (fn [h]
                                       (-> (slice-head q-arr h q-head-dim)
                                           (rmsn q-norm-w)
-                                          (ropef (inc pos))))
+                                          (ropef pos)))
                                     (range head-count))))
                           (range) q-all)
         ;; K/V: donor layers reuse an earlier layer's cached K/V; otherwise
@@ -575,7 +569,7 @@
                                       (mapv (fn [h]
                                               (-> (slice-head k-arr h kv-head-dim)
                                                   (rmsn k-norm-w)
-                                                  (ropef (inc pos))))
+                                                  (ropef pos)))
                                             (range kv-head-count))))
                                   (range) k-all)
                 new-v-heads (mapv (fn [^doubles v-arr]

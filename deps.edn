@@ -2,8 +2,8 @@
  ;; real git pins (the old org.kotoba-lang/* group + :local/root pair was never
  ;; resolvable as a git dep — monorepo-layout-only). Workspace-offline dev
  ;; against sibling checkouts: use the :dev alias.
- :deps {io.github.kotoba-lang/num {:git/sha "4bd8ba7fa366dc4b5a898c02833fd9da7756470d"}
-        io.github.kotoba-lang/torch {:git/sha "9f78f0c852d6ac5ef7899502aaa82d3d193770a3"}}
+ :deps {io.github.kotoba-lang/num {:git/sha "0561213834f144c7c9f912217e63225ec589467a"}
+        io.github.kotoba-lang/torch {:git/sha "e986ef3047375cd9d657018b6377a08c28745a30"}}
  :aliases
  {:dev {:override-deps {io.github.kotoba-lang/num {:local/root "../num"}
                         io.github.kotoba-lang/torch {:local/root "../torch"}}}
@@ -34,6 +34,10 @@
   :verify-gemma-generate {:extra-paths ["verify"]
                           :main-opts ["-m" "kotodama.verify.gemma4-e4b-generate-smoke"]}
   :verify-gemma-ple-generate {:extra-paths ["verify"]
+                              ;; CACHE_WEIGHTS=1 materializes roughly 20 GiB of
+                              ;; dequantized weights; the default JVM heap dies
+                              ;; before the first real-model token.
+                              :jvm-opts ["-Xmx24g"]
                               :main-opts ["-m" "kotodama.verify.gemma4-e4b-ple-generate-smoke"]}
   :verify-gemma-kvcache {:extra-paths ["verify"]
                          :main-opts ["-m" "kotodama.verify.gemma4-kvcache-smoke"]}
