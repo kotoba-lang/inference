@@ -448,6 +448,34 @@
                                   s))))))))
         (vec outputs)))))
 
+(defn- project-batches
+  "Project one activation batch through multiple tensors. On Metal, tensors
+  with a shared input width use one Q8_K quantization/upload/submission/readback
+  transaction. Other backends retain the established independent path."
+  [session tensor-specs inputs]
+  (let [metal? (and (boolean (get-in session [:dbg :metal-k-dot?]))
+                    (every? (fn [[_ tensor]] (#{12 14} (long (:type tensor))))
+                            tensor-specs))
+        widths (mapv #(long (first (:shape (second %)))) tensor-specs)]
+    (if (and metal? (seq tensor-specs) (apply = widths))
+      (let [matvec-many (requiring-resolve 'kotodama.inference.host.metal-kdot/matvec-many)
+            tensor-data-start (long (:gguf/tensor-data-start session))
+            requests
+            (mapv (fn [[tensor-name tensor]]
+                    (let [[cols rows] (:shape tensor)
+                          tensor-type (long (:type tensor))]
+                      {:tensor-type tensor-type
+                       :rows (long rows)
+                       :cols (long cols)
+                       :tensor-offset (+ tensor-data-start (long (:offset tensor)))
+                       :tensor-bytes (* (long rows) (row-byte-count (long cols) tensor-type))
+                       :cache-key tensor-name}))
+                  tensor-specs)]
+        (matvec-many (:metal-worker session) (:model-path session) requests inputs))
+      (mapv (fn [[tensor-name tensor]]
+              (project-batch session tensor-name tensor inputs))
+            tensor-specs))))
+
 ;; ---------------------------------------------------------------------------
 ;; model metadata + PLE per-layer-input construction
 ;; ---------------------------------------------------------------------------
@@ -674,7 +702,13 @@
         layer-scalar (if (:disable-layer-scalar? dbg) 1.0 layer-scalar)
         ;; --- attention branch ---
         normed (mapv #(rmsn % attn-norm-w) new-hidden)
-        q-all (project-batch session (tensor-name layer-index "attn_q") q-tensor normed)
+        [q-all k-all v-all]
+        (project-batches session
+                         (cond-> [[(tensor-name layer-index "attn_q") q-tensor]]
+                           (nil? donor)
+                           (into [[(tensor-name layer-index "attn_k") k-tensor]
+                                  [(tensor-name layer-index "attn_v") v-tensor]]))
+                         normed)
         n-new (count new-hidden)
         ;; per new position: q heads (norm+rope) — always computed from this layer
         new-q-heads (mapv (fn [i ^doubles q-arr]
@@ -691,9 +725,7 @@
         {:keys [k v]}
         (if donor
           (get @kv-cache donor)
-          (let [k-all (project-batch session (tensor-name layer-index "attn_k") k-tensor normed)
-                v-all (project-batch session (tensor-name layer-index "attn_v") v-tensor normed)
-                new-k-heads (mapv (fn [i ^doubles k-arr]
+          (let [new-k-heads (mapv (fn [i ^doubles k-arr]
                                     (let [pos (+ base-pos i)]
                                       (mapv (fn [h]
                                               (-> (slice-head k-arr h kv-head-dim)
@@ -728,8 +760,11 @@
         residual1 (mapv ops/add-values new-hidden post-attn)
         ;; --- MLP branch ---
         ffn-normed (mapv #(rmsn % ffn-norm-w) residual1)
-        gate-all (project-batch session (tensor-name layer-index "ffn_gate") (t* "ffn_gate") ffn-normed)
-        up-all (project-batch session (tensor-name layer-index "ffn_up") (t* "ffn_up") ffn-normed)
+        [gate-all up-all]
+        (project-batches session
+                         [[(tensor-name layer-index "ffn_gate") (t* "ffn_gate")]
+                          [(tensor-name layer-index "ffn_up") (t* "ffn_up")]]
+                         ffn-normed)
         activation (mapv (fn [^doubles g ^doubles u]
                            (mlp-act (vec g) (vec u))) gate-all up-all)
         down-all (project-batch session (tensor-name layer-index "ffn_down") (t* "ffn_down") activation)
