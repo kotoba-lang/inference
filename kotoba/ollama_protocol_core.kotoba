@@ -9,7 +9,7 @@
 ;; (kotodama.inference.host.ollama-server). Kotoba is the authority; the host
 ;; owns transport only — sockets, JSON, threads, GGUF bytes.
 ;;
-;; Scope rule (ADR-2608130700): what moves here is the DECISION — which route a
+;; Scope rule (ADR-2608138800): what moves here is the DECISION — which route a
 ;; (method, path) pair is, whether that route reads a body, what a stop reason
 ;; is called on the wire, what HTTP status an error kind maps to. What stays in
 ;; the host is every effect and every collection walk.

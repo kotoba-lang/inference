@@ -14,13 +14,22 @@
 ;; Word-typed (i64/:bool) at both the export boundary and in the bodies — see
 ;; ollama_protocol_core.kotoba for what those two mean and where each is checked.
 ;;
-;; NOT here: temperature and top_p. `+` and `<` have no admitted f64 lowering at
-;; compiler pin e78241d (measured 2026-08-13: `(< v 0.0)` rejects with
-;; "expected i64, got f64", `f64+` with "operation has no admitted lowering"),
-;; so they stay host-side pass-through. That is a backend gap, not a design
-;; boundary — application-language.edn's :backend-qualification rule says an
-;; unavailable backend is an implementation gap, not a reason to remove a safe
-;; feature. When f64 arithmetic lands, clamping moves here too.
+;; NOT here: temperature and top_p, and the reason first recorded here was
+;; wrong. It said f64 arithmetic had no admitted lowering, citing `(< v 0.0)`
+;; rejecting with "expected i64, got f64" and `f64+` with "operation has no
+;; admitted lowering".
+;;
+;; Both measurements are real; neither name exists. `<` is the i64 comparison
+;; and there is no `f64+`. The float operations are `f64-lt`, `f64-add`,
+;; `f64-min`, `f64-max` — amu's frontend carries a full `f64-operations` table,
+;; and measured 2026-08-13 on amu e8864273 they compile and execute correctly.
+;;
+;; The real reason these two stay out: `kotoba.kir/
+;; only-native-word-typed-features?` rejects f64, so putting the clamps here
+;; would drop this whole core out of the native-boundary gate for the sake of
+;; two `f64-min`/`f64-max` calls. Clamping lives in kernel_math_core.kotoba
+;; instead, which is float-typed by nature and does not claim native
+;; qualification. See ADR-2608138800's amendment.
 ;;
 ;; Parity: cljc/test/kotodama/inference/ollama_kotoba_parity_test.clj
 
@@ -29,7 +38,7 @@
 ;; CPU at seconds per token; an unbounded default is a hung request. Documented
 ;; in README "Status".
 ;;
-;; Behaviour change vs the pre-Kotoba host (ADR-2608130700): a non-positive
+;; Behaviour change vs the pre-Kotoba host (ADR-2608138800): a non-positive
 ;; num_predict used to fall straight through as the token budget, so
 ;; `num_predict: 0` and `num_predict: -1` both meant "generate nothing" — the
 ;; second silently, since -1 means "no limit" to every Ollama client. Both now

@@ -1,7 +1,7 @@
 (ns kotodama.inference.host.oracle
   "Execute the precompiled Kotoba decision cores that this repo ships.
 
-  Dual-source authority (ADR-2608130700):
+  Dual-source authority (ADR-2608138800):
 
     1. authority : kotoba/*_core.kotoba              (the source of truth)
     2. artifact  : resources/kotodama/oracle/*.kir.edn (compiled, shipped)
@@ -29,7 +29,10 @@
   "Logical oracle id → classpath resource path."
   {:ollama-protocol "kotodama/oracle/ollama_protocol_core.kir.edn"
    :ollama-options "kotodama/oracle/ollama_options_core.kir.edn"
-   :ollama-session "kotodama/oracle/ollama_session_core.kir.edn"})
+   :ollama-session "kotodama/oracle/ollama_session_core.kir.edn"
+   ;; Engine arithmetic rather than surface policy, and float-typed rather
+   ;; than word-typed — see kotoba/kernel_math_core.kotoba.
+   :kernel-math "kotodama/oracle/kernel_math_core.kir.edn"})
 
 (def ^:private cache (atom {}))
 

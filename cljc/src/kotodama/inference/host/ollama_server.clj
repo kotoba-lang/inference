@@ -8,7 +8,7 @@
   The POLICY of this surface is not written here. Route admission, request
   option defaults, session expiry and duration accounting live in
   `kotoba/*_core.kotoba` and are executed through
-  `kotodama.inference.host.oracle` (ADR-2608130700). What is here is transport:
+  `kotodama.inference.host.oracle` (ADR-2608138800). What is here is transport:
   sockets, JSON, threads, locks, and the clock."
   (:require [clojure.data.json :as json]
             [clojure.string :as str]
