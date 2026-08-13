@@ -300,3 +300,81 @@
                            {:role "user" :content "U"}]})
       (is (= "<s>S</><u>U</><a>" @seen))
       (finally (server/stop-server! running)))))
+
+;; ── /v1 (openai-chat-core) ───────────────────────────────────────────
+
+(deftest openai-completion-envelope
+  (let [{:keys [running]} (fixture)
+        port (:port running)]
+    (try
+      (let [response (request port :post "/v1/chat/completions"
+                              {:model "fixture:latest"
+                               :messages [{:role "user" :content "capital of France?"}]})
+            body (parsed response)
+            choice (first (:choices body))]
+        (is (= 200 (:status response)))
+        (is (= "application/json; charset=utf-8" (:content-type response))
+            "absent stream means ONE json object, not SSE")
+        (is (= "chat.completion" (:object body)))
+        (is (str/starts-with? (:id body) "chatcmpl-"))
+        (is (= 0 (:index choice)))
+        (is (= "assistant" (get-in choice [:message :role])))
+        (is (= " Paris." (get-in choice [:message :content])))
+        (is (= "length" (:finish_reason choice)))
+        (is (= {:prompt_tokens 3 :completion_tokens 2 :total_tokens 5} (:usage body))))
+      (finally (server/stop-server! running)))))
+
+(deftest openai-streams-sse-only-when-asked
+  (let [{:keys [running]} (fixture)
+        port (:port running)]
+    (try
+      (let [response (request port :post "/v1/chat/completions"
+                              {:model "fixture:latest" :stream true
+                               :messages [{:role "user" :content "x"}]})
+            frames (->> (str/split (:body response) #"\n\n")
+                        (remove str/blank?)
+                        (mapv str/trim))
+            payloads (mapv #(str/replace-first % "data: " "") frames)]
+        (is (str/starts-with? (:content-type response) "text/event-stream"))
+        (is (= "[DONE]" (last payloads))
+            "without [DONE] a client cannot tell finished from dropped")
+        (let [events (mapv #(json/read-str % :key-fn keyword) (butlast payloads))]
+          (is (every? #(= "chat.completion.chunk" (:object %)) events))
+          (is (= [" Paris" "." nil]
+                 (mapv #(get-in % [:choices 0 :delta :content]) events)))
+          (is (= [nil nil "length"]
+                 (mapv #(get-in % [:choices 0 :finish_reason]) events)))
+          (is (apply = (mapv :id events)) "every chunk shares one completion id")))
+      (finally (server/stop-server! running)))))
+
+(deftest openai-rejects-multiple-choices
+  (let [{:keys [running]} (fixture)]
+    (try
+      (let [response (request (:port running) :post "/v1/chat/completions"
+                              {:model "fixture:latest" :n 3
+                               :messages [{:role "user" :content "x"}]})]
+        (is (= 400 (:status response)))
+        (is (= "only n=1 is supported" (:error (parsed response)))))
+      (finally (server/stop-server! running)))))
+
+(deftest openai-shares-the-conversation-rules
+  ;; Same core as /api/chat: the admissible final role is not re-decided.
+  (let [{:keys [running]} (fixture)]
+    (try
+      (let [response (request (:port running) :post "/v1/chat/completions"
+                              {:model "fixture:latest"
+                               :messages [{:role "user" :content "a"}
+                                          {:role "assistant" :content "b"}]})]
+        (is (= 400 (:status response)))
+        (is (= "the last message must be from user or tool" (:error (parsed response)))))
+      (finally (server/stop-server! running)))))
+
+(deftest openai-lists-models
+  (let [{:keys [running]} (fixture)]
+    (try
+      (let [body (parsed (request (:port running) :get "/v1/models" nil))
+            ids (mapv :id (:data body))]
+        (is (= "list" (:object body)))
+        (is (= ["fixture:latest" "no-template:latest"] ids))
+        (is (every? #(= "model" (:object %)) (:data body))))
+      (finally (server/stop-server! running)))))

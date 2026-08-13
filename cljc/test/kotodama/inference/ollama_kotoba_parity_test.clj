@@ -42,14 +42,15 @@
   ["kotoba/ollama_protocol_core.kotoba"
    "kotoba/ollama_options_core.kotoba"
    "kotoba/ollama_session_core.kotoba"
-   "kotoba/ollama_chat_core.kotoba"])
+   "kotoba/ollama_chat_core.kotoba"
+   "kotoba/openai_chat_core.kotoba"])
 
 (deftest shipped-artifacts-match-their-source
   (let [artifacts (gen/discover-artifacts)]
     ;; Evidence floor: discovery returning nothing must not read as "every
     ;; artifact is current" (CLAUDE.md, ADR-2608136000 Q1).
-    (is (= 5 (count artifacts))
-        "expected four ollama decision cores plus kernel-math; adjust deliberately")
+    (is (= 6 (count artifacts))
+        "expected five decision cores plus kernel-math; adjust deliberately")
     (doseq [{:keys [source out]} artifacts]
       (testing (str out " is a current compile of " source)
         (is (.exists (io/file out))
@@ -61,7 +62,8 @@
   (is (= (set (map #(.getName (io/file (:out %))) (gen/discover-artifacts)))
          (set (map #(.getName (io/file %)) (vals oracle/catalog))))
       "a core with no catalog entry is shipped but unreachable")
-  (is (= [:kernel-math :ollama-chat :ollama-options :ollama-protocol :ollama-session]
+  (is (= [:kernel-math :ollama-chat :ollama-options :ollama-protocol :ollama-session
+          :openai-chat]
          (oracle/preload!))))
 
 (deftest a-missing-artifact-fails-closed
@@ -78,12 +80,17 @@
     (is (= (call :ollama-protocol :route-ps) (call :ollama-protocol :route-code "GET" "/api/ps")))
     (is (= (call :ollama-protocol :route-show) (call :ollama-protocol :route-code "POST" "/api/show")))
     (is (= (call :ollama-protocol :route-generate) (call :ollama-protocol :route-code "POST" "/api/generate")))
-    (is (= (call :ollama-protocol :route-chat) (call :ollama-protocol :route-code "POST" "/api/chat"))))
+    (is (= (call :ollama-protocol :route-chat) (call :ollama-protocol :route-code "POST" "/api/chat")))
+    (is (= (call :ollama-protocol :route-openai-chat)
+           (call :ollama-protocol :route-code "POST" "/v1/chat/completions")))
+    (is (= (call :ollama-protocol :route-openai-models)
+           (call :ollama-protocol :route-code "GET" "/v1/models"))))
   (testing "route codes are distinct, so the host dispatch cannot collapse two routes"
     (let [codes (mapv #(call :ollama-protocol %)
                       [:route-version :route-tags :route-ps :route-show
-                       :route-generate :route-chat])]
-      (is (= 6 (count (set codes))))
+                       :route-generate :route-chat :route-openai-chat
+                       :route-openai-models])]
+      (is (= 8 (count (set codes))))
       (is (not (contains? (set codes) (call :ollama-protocol :route-not-found))))))
   (testing "method and path both matter"
     (is (= (call :ollama-protocol :route-not-found) (call :ollama-protocol :route-code "POST" "/api/tags")))
@@ -95,7 +102,48 @@
     (is (false? (call :ollama-protocol :route-reads-body? (call :ollama-protocol :route-not-found))))
     (is (true? (call :ollama-protocol :route-reads-body? (call :ollama-protocol :route-show))))
     (is (true? (call :ollama-protocol :route-reads-body? (call :ollama-protocol :route-generate))))
-    (is (true? (call :ollama-protocol :route-reads-body? (call :ollama-protocol :route-chat))))))
+    (is (true? (call :ollama-protocol :route-reads-body? (call :ollama-protocol :route-chat))))
+    (is (true? (call :ollama-protocol :route-reads-body? (call :ollama-protocol :route-openai-chat))))
+    (is (false? (call :ollama-protocol :route-reads-body? (call :ollama-protocol :route-openai-models)))
+        "/v1/models is a GET — reading a body that never arrives blocks")))
+
+(deftest the-two-surfaces-disagree-about-streaming-on-purpose
+  ;; The single most breakable difference between them. An OpenAI client
+  ;; receiving unrequested SSE reports a parse error, not a server error.
+  (testing "absent stream key"
+    (is (true? (call :ollama-options :stream? false false)) "Ollama streams")
+    (is (false? (call :openai-chat :stream? false false)) "OpenAI does not"))
+  (testing "explicit values are honoured by both"
+    (is (true? (call :ollama-options :stream? true true)))
+    (is (true? (call :openai-chat :stream? true true)))
+    (is (false? (call :ollama-options :stream? true false)))
+    (is (false? (call :openai-chat :stream? true false)))))
+
+(deftest openai-envelope-decisions
+  (testing "n is not silently narrowed to the one completion we produce"
+    (is (= 1 (call :openai-chat :choices-produced)))
+    (is (true? (call :openai-chat :n-admissible? 1)))
+    (is (false? (call :openai-chat :n-admissible? 3)))
+    (is (false? (call :openai-chat :n-admissible? 0))))
+  (testing "max_tokens follows the same engine cap as num_predict"
+    (is (= 32 (call :openai-chat :max-tokens false 0)))
+    (is (= 32 (call :openai-chat :max-tokens true -1)))
+    (is (= 7 (call :openai-chat :max-tokens true 7)))
+    (is (= (call :ollama-options :default-max-tokens)
+           (call :openai-chat :max-tokens false 0))
+        "the cap is a property of this engine, so both wires inherit it"))
+  (testing "finish_reason and done_reason coincide today, and the pin says so"
+    (doseq [code [(call :ollama-protocol :stop-eos)
+                  (call :ollama-protocol :stop-max-tokens)
+                  (call :ollama-protocol :stop-unknown)]]
+      (is (= (call :ollama-protocol :done-reason code)
+             (call :openai-chat :finish-reason code)))))
+  (testing "SSE framing"
+    (is (= "data: " (call :openai-chat :sse-data-prefix)))
+    (is (= "\n\n" (call :openai-chat :sse-frame-suffix)))
+    (is (= "data: [DONE]\n\n" (call :openai-chat :sse-terminator))))
+  (is (= "chat.completion" (call :openai-chat :object-completion)))
+  (is (= "chat.completion.chunk" (call :openai-chat :object-chunk))))
 
 (deftest conversation-rules
   (testing "role names map to codes and back"
@@ -216,7 +264,7 @@
   (let [artifacts (filter (fn [{:keys [source]}] (some #{source} ollama-cores))
                           (gen/discover-artifacts))
         checked (atom 0)]
-    (is (= 4 (count artifacts)) "an ollama core stopped being discovered")
+    (is (= 5 (count artifacts)) "a decision core stopped being discovered")
     (doseq [{:keys [out]} artifacts]
       (let [kir (edn/read-string (slurp out))
             exported (set (:exports kir))]

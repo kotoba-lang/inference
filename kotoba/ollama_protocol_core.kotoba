@@ -1,6 +1,7 @@
 (ns ollama-protocol-core
   (:export [route-not-found route-version route-tags route-ps route-show
-            route-generate route-chat route-code route-reads-body?
+            route-generate route-chat route-openai-chat route-openai-models
+            route-code route-reads-body?
             stop-eos stop-max-tokens stop-unknown done-reason
             error-not-found error-bad-request error-internal error-status
             api-version]))
@@ -38,6 +39,10 @@
 (defn route-show [] :i64 4)
 (defn route-generate [] :i64 5)
 (defn route-chat [] :i64 6)
+;; The OpenAI-compatible surface. Same engine, different envelope
+;; (openai_chat_core), and notably the opposite streaming default.
+(defn route-openai-chat [] :i64 7)
+(defn route-openai-models [] :i64 8)
 
 (defn route-code [method :string path :string] :i64
   (if (string=? method "GET")
@@ -45,19 +50,26 @@
       1
       (if (string=? path "/api/tags")
         2
-        (if (string=? path "/api/ps") 3 0)))
+        (if (string=? path "/api/ps")
+          3
+          (if (string=? path "/v1/models") 8 0))))
     (if (string=? method "POST")
       (if (string=? path "/api/show")
         4
         (if (string=? path "/api/generate")
           5
-          (if (string=? path "/api/chat") 6 0)))
+          (if (string=? path "/api/chat")
+            6
+            (if (string=? path "/v1/chat/completions") 7 0))))
       0)))
 
 (defn route-reads-body? [code :i64] :bool
   ;; Only the POST routes consume a request body. The host must not read the
   ;; body of a route that does not have one: java.net.httpserver blocks.
-  (>= code 4))
+  ;;
+  ;; No longer a simple `>= 4`: /v1/models is a GET and carries code 8, so a
+  ;; threshold would make the host block reading a body that never arrives.
+  (and (>= code 4) (< code 8)))
 
 ;; ── stop reason → Ollama `done_reason` ───────────────────────────────
 ;; The kotodama generate result carries :kotodama/stop-reason; the host maps it

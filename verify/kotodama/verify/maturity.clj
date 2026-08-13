@@ -30,7 +30,8 @@
     ;; (ADR-2608138800).
     :kotoba-decision-cores
     :kotoba-engine-kernel
-    :ollama-chat-endpoint})
+    :ollama-chat-endpoint
+    :openai-compatible-surface})
 
 (def banned-foundation-patterns
   [{:id :transformers-js

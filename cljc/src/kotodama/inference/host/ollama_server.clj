@@ -39,6 +39,7 @@
 (defn- options* [export & args] (oracle/call :ollama-options export args))
 (defn- session* [export & args] (oracle/call :ollama-session export args))
 (defn- chat* [export & args] (oracle/call :ollama-chat export args))
+(defn- openai* [export & args] (oracle/call :openai-chat export args))
 
 (defn- json-bytes [value]
   (.getBytes (json/write-str value) StandardCharsets/UTF_8))
@@ -402,6 +403,104 @@
           (catch Throwable e
             (write! {:error (.getMessage e) :done true})))))))
 
+
+;; ── /v1 (OpenAI-compatible) ──────────────────────────────────────────
+;;
+;; The same conversation rules and the same generation as /api/chat; only
+;; the envelope differs. The differences that matter are in
+;; openai_chat_core — above all that this surface does NOT stream by
+;; default, where the Ollama one does.
+
+(defn- openai-generation-options [body]
+  ;; OpenAI spells the budget `max_tokens`; everything else this engine
+  ;; honours is shared with the Ollama path.
+  (let [options {:num_predict (:max_tokens body)
+                 :temperature (:temperature body)
+                 :top_p (:top_p body)
+                 :seed (:seed body)}]
+    (generation-options {:options (into {} (remove (comp nil? val) options))})))
+
+(defn- openai-id []
+  (str (openai* :id-prefix) (Long/toUnsignedString (.nextLong (Random.)) 16)))
+
+(defn- openai-usage [result]
+  (let [prompt (count (:kotodama/prompt-token-ids result []))
+        completion (count (:kotodama/generated-token-ids result []))]
+    {:prompt_tokens prompt
+     :completion_tokens completion
+     :total_tokens (+ prompt completion)}))
+
+(defn- openai-envelope [id model created object choices]
+  {:id id :object object :created created :model model :choices choices})
+
+(defn- openai-json! [service exchange body]
+  (let [{:keys [model prompt]} (validate-chat! service body)
+        n (long (or (:n body) 1))]
+    (when-not (openai* :n-admissible? n)
+      ;; Answering `n: 3` with one choice would look like the sample the
+      ;; client asked for.
+      (throw (ex-info (str "only n=" (openai* :choices-produced) " is supported")
+                      {:kind (protocol* :error-bad-request)})))
+    (let [{:keys [result]} (run-generate!
+                            service
+                            (merge (assoc body :prompt prompt)
+                                   (openai-generation-options body))
+                            nil)]
+      (send-json! exchange 200
+                  (assoc (openai-envelope (openai-id) model (quot (now-ms) 1000)
+                                          (openai* :object-completion)
+                                          [{:index 0
+                                            :message (chat-message (:kotodama/text result ""))
+                                            :finish_reason (openai* :finish-reason
+                                                                    (stop-code result))}])
+                         :usage (openai-usage result)))
+      (settle-session! service model))))
+
+(defn- openai-stream! [service ^HttpExchange exchange body]
+  (let [{:keys [model prompt]} (validate-chat! service body)
+        id (openai-id)
+        created (quot (now-ms) 1000)]
+    (doto (.getResponseHeaders exchange)
+      (.set "content-type" "text/event-stream; charset=utf-8")
+      (.set "cache-control" "no-cache"))
+    (.sendResponseHeaders exchange 200 0)
+    (with-open [out (.getResponseBody exchange)]
+      (letfn [(frame! [text]
+                (.write out (.getBytes ^String text StandardCharsets/UTF_8))
+                (.flush out))
+              (event! [value]
+                (frame! (str (openai* :sse-data-prefix)
+                             (json/write-str value)
+                             (openai* :sse-frame-suffix))))
+              (chunk [delta finish]
+                (openai-envelope id model created (openai* :object-chunk)
+                                 [{:index 0 :delta delta :finish_reason finish}]))]
+        (try
+          (let [{:keys [result]}
+                (run-generate!
+                 service
+                 (merge (assoc body :prompt prompt) (openai-generation-options body))
+                 (fn [_token-id token-text _step-nanos]
+                   (event! (chunk {:content token-text} nil))))]
+            (event! (chunk {} (openai* :finish-reason (stop-code result))))
+            ;; Without [DONE] a client cannot tell a finished stream from a
+            ;; dropped connection.
+            (frame! (openai* :sse-terminator))
+            (settle-session! service model))
+          (catch Throwable e
+            (event! {:error {:message (.getMessage e)}})
+            (frame! (openai* :sse-terminator))))))))
+
+(defn- openai-models-response [service]
+  {:object (openai* :object-list)
+   :data (mapv (fn [[name spec]]
+                 {:id name
+                  :object (openai* :object-model)
+                  :created (quot (now-ms) 1000)
+                  :owned_by (openai* :owned-by)
+                  :size (or (:size spec) 0)})
+               (sort-by key (:models service)))})
+
 (defn- tags-response [service]
   {:models (->> (:models service)
                 vals
@@ -462,6 +561,14 @@
         (if (request-stream? body)
           (chat-stream! service exchange body)
           (chat-json! service exchange body))
+
+        (protocol* :route-openai-chat)
+        (if (openai* :stream? (some? (:stream body)) (true? (:stream body)))
+          (openai-stream! service exchange body)
+          (openai-json! service exchange body))
+
+        (protocol* :route-openai-models)
+        (send-json! exchange 200 (openai-models-response service))
 
         (error-kind! exchange (protocol* :error-not-found) "not found")))
     (catch clojure.lang.ExceptionInfo e
