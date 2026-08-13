@@ -133,7 +133,7 @@
 
 ;; ── session lifecycle (ollama-session-core) ──────────────────────────
 ;; Before these, a loaded session lived until process exit: a 20 GiB
-;; dequantised Gemma4 was never given back. See ADR-2608130700.
+;; dequantised Gemma4 was never given back. See ADR-2608138800.
 
 (deftest keep-alive-zero-unloads-when-the-request-is-answered
   (let [{:keys [running loads closes]} (fixture)

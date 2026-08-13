@@ -11,7 +11,7 @@
 ;; Before this core the host had no lifecycle policy at all: a loaded session
 ;; lived until process exit, and /api/ps reported `expires_at` = last-used,
 ;; which reads to an Ollama client as "expired the moment it was used". A
-;; 20 GiB dequantised Gemma4 never came back. See ADR-2608130700.
+;; 20 GiB dequantised Gemma4 never came back. See ADR-2608138800.
 ;;
 ;; Word-typed (i64/:bool) at both the export boundary and in the bodies — see
 ;; ollama_protocol_core.kotoba for what those two mean and where each is checked.

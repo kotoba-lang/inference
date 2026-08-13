@@ -198,7 +198,7 @@ compatibility work.
 
 Route admission, request-option defaults, session expiry, and duration
 accounting are **not** written in Clojure. They live in `kotoba/*_core.kotoba`
-and are executed from precompiled KIR (ADR-2608130700):
+and are executed from precompiled KIR (ADR-2608138800):
 
 | core | decides |
 |---|---|
@@ -222,7 +222,7 @@ clojure -M:test        # includes the parity gate: shipped artifact == fresh
 
 Editing a core without regenerating is caught by the parity gate, not by the
 semantics tests — those run against the shipped artifact and would keep
-passing. Both failure modes are demonstrated in ADR-2608130700.
+passing. Both failure modes are demonstrated in ADR-2608138800.
 
 ## Local MLX host adapter (`kotodama.inference.mlx`, Apple Silicon)
 

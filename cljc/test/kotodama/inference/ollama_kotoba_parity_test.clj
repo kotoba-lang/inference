@@ -1,5 +1,5 @@
 ;; The Kotoba decision cores of the Ollama-compatible surface, checked three
-;; ways (ADR-2608130700):
+;; ways (ADR-2608138800):
 ;;
 ;;   1. authority  — the shipped resources/kotodama/oracle/*.kir.edn is what
 ;;                   kotoba/*_core.kotoba compiles to right now. Without this a
@@ -9,9 +9,12 @@
 ;;                   as literals. The oracle here is the protocol, not a second
 ;;                   Clojure implementation of it; a mirror implementation
 ;;                   would just be the thing this migration removes.
-;;   3. admission  — every core stays inside the native word-typed boundary, so
-;;                   "qualifies on the native backend" is measured rather than
-;;                   asserted in a comment.
+;;   3. admission  — every DECISION core stays inside the native word-typed
+;;                   boundary, so "qualifies on the native backend" is measured
+;;                   rather than asserted in a comment. kernel_math_core is
+;;                   float-typed and deliberately outside it (ADR-2608139000);
+;;                   kernel_math_parity_test owns that split and asserts both
+;;                   sides of it.
 ;;
 ;; Requires the compiler, which is :test-only. Production never compiles.
 
@@ -32,12 +35,20 @@
 
 ;; ── 1. authority ─────────────────────────────────────────────────────
 
+(def ^:private ollama-cores
+  "The decision cores. kernel_math_core is engine arithmetic, not surface
+  policy, and is float-typed — it is checked by kernel_math_parity_test and is
+  deliberately outside the native-admission gates below."
+  ["kotoba/ollama_protocol_core.kotoba"
+   "kotoba/ollama_options_core.kotoba"
+   "kotoba/ollama_session_core.kotoba"])
+
 (deftest shipped-artifacts-match-their-source
   (let [artifacts (gen/discover-artifacts)]
-    ;; Evidence floor: discovery returning nothing must not read as "all three
-    ;; artifacts are current" (CLAUDE.md, ADR-2608136000 Q1).
-    (is (= 3 (count artifacts))
-        "expected exactly the three ollama decision cores; adjust this count deliberately")
+    ;; Evidence floor: discovery returning nothing must not read as "every
+    ;; artifact is current" (CLAUDE.md, ADR-2608136000 Q1).
+    (is (= 4 (count artifacts))
+        "expected three ollama decision cores plus kernel-math; adjust deliberately")
     (doseq [{:keys [source out]} artifacts]
       (testing (str out " is a current compile of " source)
         (is (.exists (io/file out))
@@ -49,7 +60,8 @@
   (is (= (set (map #(.getName (io/file (:out %))) (gen/discover-artifacts)))
          (set (map #(.getName (io/file %)) (vals oracle/catalog))))
       "a core with no catalog entry is shipped but unreachable")
-  (is (= [:ollama-options :ollama-protocol :ollama-session] (oracle/preload!))))
+  (is (= [:kernel-math :ollama-options :ollama-protocol :ollama-session]
+         (oracle/preload!))))
 
 (deftest a-missing-artifact-fails-closed
   ;; There is no Clojure fallback, on purpose: a fallback answers with an
@@ -172,15 +184,16 @@
   #{:i64 :bool :string})
 
 (deftest core-bodies-use-only-native-admitted-features
-  (let [artifacts (gen/discover-artifacts)]
-    (is (seq artifacts))
-    (doseq [{:keys [source]} artifacts]
-      (is (true? (ir/only-native-word-typed-features? (:hir (compiled source))))
-          (str source " uses an expression the native backend does not admit")))))
+  (is (seq ollama-cores))
+  (doseq [source ollama-cores]
+    (is (true? (ir/only-native-word-typed-features? (:hir (compiled source))))
+        (str source " uses an expression the native backend does not admit"))))
 
 (deftest every-export-signature-crosses-the-native-boundary
-  (let [artifacts (gen/discover-artifacts)
+  (let [artifacts (filter (fn [{:keys [source]}] (some #{source} ollama-cores))
+                          (gen/discover-artifacts))
         checked (atom 0)]
+    (is (= 3 (count artifacts)) "an ollama core stopped being discovered")
     (doseq [{:keys [out]} artifacts]
       (let [kir (edn/read-string (slurp out))
             exported (set (:exports kir))]
