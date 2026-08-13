@@ -182,7 +182,16 @@ curl http://127.0.0.1:11434/api/generate \
 ```
 
 Implemented endpoints are `GET /api/version`, `GET /api/tags`,
-`POST /api/show`, `GET /api/ps`, `POST /api/generate`, and `POST /api/chat`. Generate supports
+`POST /api/show`, `GET /api/ps`, `POST /api/generate`, and `POST /api/chat`,
+plus an OpenAI-compatible `POST /v1/chat/completions` and `GET /v1/models`.
+
+**The two surfaces disagree about streaming, on purpose.** `/api/*` streams
+NDJSON unless a request says `"stream": false`; `/v1/chat/completions` returns
+one JSON object unless a request says `"stream": true`, and streams SSE
+(`data: ` frames terminated by `data: [DONE]`) when it does. That is the
+upstream behaviour of each wire — a shared default would be wrong for exactly
+one of them, and wrong in a way that reads as a client bug. `n` above 1 is a
+400 rather than one choice presented as the sample that was requested. Generate supports
 Ollama's default newline-delimited streaming and `"stream": false`, plus
 `num_predict`, `temperature`, `top_k`, `top_p`, `seed`, and `keep_alive`
 (seconds or a duration string such as `"5m"`; `0` unloads once the request is
@@ -225,6 +234,7 @@ and are executed from precompiled KIR (ADR-2608138800):
 | `ollama_options_core.kotoba` | `num_predict` / `stream` / `keep_alive` / `top_k` defaults and normalisation |
 | `ollama_session_core.kotoba` | expiry, `expires_at`, eviction under a budget, reaper cadence, `*_duration` accounting |
 | `ollama_chat_core.kotoba` | which roles exist, which name them, and which role a conversation may end on |
+| `openai_chat_core.kotoba` | the `/v1` envelope: streaming default (off), `max_tokens`, `n`, object tags, `finish_reason`, SSE framing |
 | `kernel_math_core.kotoba` | engine arithmetic — dot, RMS scale, softmax, SiLU (float-typed, outside the native gate) |
 
 `kotodama.inference.host.ollama-server` owns transport only — sockets, JSON,

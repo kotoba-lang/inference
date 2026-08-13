@@ -31,6 +31,9 @@
    :ollama-options "kotodama/oracle/ollama_options_core.kir.edn"
    :ollama-session "kotodama/oracle/ollama_session_core.kir.edn"
    :ollama-chat "kotodama/oracle/ollama_chat_core.kir.edn"
+   ;; Same conversation, different envelope — and the opposite streaming
+   ;; default, which is why it is its own core.
+   :openai-chat "kotodama/oracle/openai_chat_core.kir.edn"
    ;; Engine arithmetic rather than surface policy, and float-typed rather
    ;; than word-typed — see kotoba/kernel_math_core.kotoba.
    :kernel-math "kotodama/oracle/kernel_math_core.kir.edn"})
