@@ -378,3 +378,92 @@
         (is (= ["fixture:latest" "no-template:latest"] ids))
         (is (every? #(= "model" (:object %)) (:data body))))
       (finally (server/stop-server! running)))))
+
+;; ── memory budget (ollama-session-core) ──────────────────────────────
+;; The budget existed as a rule with no input: the host never measured
+;; anything and always passed 0, so evict-for-load? could not fire.
+
+(defn- sized-fixture [budget]
+  (let [loads (atom 0) closes (atom [])
+        spec (fn [n size] {:name n :model n :size size
+                           :details {:format "gguf" :family "gemma4"}})
+        running (server/start-server!
+                 {:port 0
+                  :service-opts
+                  {:memory-budget-bytes budget
+                   :models {"small" (spec "small" 100)
+                            "also-small" (spec "also-small" 100)
+                            "third-small" (spec "third-small" 100)
+                            "huge" (spec "huge" 10000)}
+                   :load-fn (fn [opts] (swap! loads inc) {:m (:kotodama/model opts)})
+                   :generate-fn (fn [_] {:kotodama/text "x"
+                                         :kotodama/prompt-token-ids []
+                                         :kotodama/generated-token-ids []
+                                         :kotodama/stop-reason :eos})
+                   :close-fn (fn [session] (swap! closes conj (:m session)))}})]
+    {:running running :loads loads :closes closes}))
+
+(defn- generate! [port model]
+  (request port :post "/api/generate"
+           {:model model :prompt "x" :stream false :keep_alive 3600}))
+
+(deftest a-load-that-would-exceed-the-budget-evicts-the-least-recently-used
+  (let [{:keys [running closes]} (sized-fixture 250)
+        port (:port running)]
+    (try
+      (is (= 200 (:status (generate! port "small"))))
+      (is (= 200 (:status (generate! port "also-small"))))
+      (is (= [] @closes) "200 of 250 fits; nothing should have been unloaded")
+      ;; A third 100 would make 300 > 250, so the least recently used goes.
+      (is (= 200 (:status (generate! port "third-small"))))
+      (is (= ["small"] @closes) "the oldest, not an arbitrary one")
+      (is (= #{"also-small" "third-small"}
+             (set (mapv :name (:models (parsed (request port :get "/api/ps" nil)))))))
+      (finally (server/stop-server! running)))))
+
+(deftest a-model-larger-than-the-budget-is-refused-without-evicting-anything
+  ;; Unloading every working session to serve a request that was always going
+  ;; to fail is worse than the failure.
+  (let [{:keys [running closes loads]} (sized-fixture 250)
+        port (:port running)]
+    (try
+      (is (= 200 (:status (generate! port "small"))))
+      (let [response (generate! port "huge")]
+        (is (= 500 (:status response)))
+        (is (= "model exceeds the configured memory budget" (:error (parsed response)))))
+      (is (= [] @closes) "the resident session must survive a refused load")
+      (is (= 1 @loads))
+      (is (= ["small"] (mapv :name (:models (parsed (request port :get "/api/ps" nil))))))
+      (finally (server/stop-server! running)))))
+
+(deftest an-unset-budget-admits-everything
+  ;; 0 is "not measured", not "no memory".
+  (let [{:keys [running closes]} (sized-fixture 0)
+        port (:port running)]
+    (try
+      (doseq [m ["small" "also-small" "third-small" "huge"]]
+        (is (= 200 (:status (generate! port m)))))
+      (is (= [] @closes))
+      (is (= 4 (count (:models (parsed (request port :get "/api/ps" nil))))))
+      (finally (server/stop-server! running)))))
+
+(deftest keep-alive-accepts-compound-durations
+  ;; Go's ParseDuration concatenates components, which is what Ollama
+  ;; accepts. Reading only the first made "1h30m" mean one hour.
+  (let [{:keys [running]} (fixture)
+        port (:port running)
+        expiry-seconds (fn [keep-alive]
+                         (request port :post "/api/generate"
+                                  {:model "fixture:latest" :prompt "x" :stream false
+                                   :keep_alive keep-alive})
+                         (let [entry (first (:models (parsed (request port :get "/api/ps" nil))))]
+                           (.between java.time.temporal.ChronoUnit/SECONDS
+                                     (Instant/parse (:loaded_at entry))
+                                     (Instant/parse (:expires_at entry)))))]
+    (try
+      (is (<= 5399 (expiry-seconds "1h30m") 5401))
+      (is (<= 5429 (expiry-seconds "90m30s") 5431))
+      (is (<= 59 (expiry-seconds "1m") 61))
+      (is (<= 299 (expiry-seconds "not-a-duration") 301)
+          "unparseable takes the default rather than a partial reading")
+      (finally (server/stop-server! running)))))

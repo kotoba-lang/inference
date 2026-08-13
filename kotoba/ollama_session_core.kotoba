@@ -1,6 +1,7 @@
 (ns ollama-session-core
   (:export [never-expires expires-at-ms expired?
-            evict-for-load? reap-interval-ms
+            evict-for-load? exceeds-budget-alone? declared-bytes
+            reap-interval-ms
             load-duration-nanos eval-duration-nanos total-duration-nanos]))
 
 ;; Model-session lifecycle policy: when a loaded model may stay resident, when
@@ -45,6 +46,32 @@
   (if (<= budget-bytes 0)
     false
     (> (+ resident-bytes incoming-bytes) budget-bytes)))
+
+;; A model that does not fit the budget on its own cannot be made to fit by
+;; unloading anything, so the host must stop rather than evict every resident
+;; session and then fail anyway — which would take working models down to
+;; serve a request that was always going to be refused.
+;;
+;; Note the asymmetry with `evict-for-load?`: an unset budget (0) admits
+;; everything here too. "Not measured" must not become "nothing fits".
+
+(defn exceeds-budget-alone? [incoming-bytes :i64 budget-bytes :i64] :bool
+  (if (<= budget-bytes 0)
+    false
+    (> incoming-bytes budget-bytes)))
+
+;; What the budget is counted in: DECLARED size, from the model's own
+;; metadata, not measured residency. The JVM cannot see how many bytes a
+;; dequantised GGUF actually occupies, and a budget derived from a guess
+;; would evict live sessions on invented numbers. Declared bytes are wrong in
+;; a knowable direction — they undercount the dequantised working set — so
+;; the operator sets the budget against the same units the catalogue reports.
+;;
+;; A model whose spec declares no size counts as zero: unknown size must not
+;; silently mean "enormous" and refuse every load, nor be invented.
+
+(defn declared-bytes [size :i64] :i64
+  (if (< size 0) 0 size))
 
 ;; ── reaper cadence ───────────────────────────────────────────────────
 ;; Bounded on both ends: never busier than 1 s, never lazier than 60 s, so a

@@ -86,14 +86,18 @@
   host functions. `:models` maps model names to Ollama metadata plus optional
   `:kotodama/load-opts`."
   ([] (service {}))
-  ([{:keys [models load-fn generate-fn close-fn]
+  ([{:keys [models load-fn generate-fn close-fn memory-budget-bytes]
      :or {load-fn host/load-model
           generate-fn host/generate
-          close-fn host/close-model}}]
+          close-fn host/close-model
+          ;; 0 = not measured, which admits every load. See the session
+          ;; core: "not measured" must not become "nothing fits".
+          memory-budget-bytes 0}}]
    (let [models (or models {host/default-model (default-model-spec host/default-model)})]
      {:models models
       :sessions (atom {})
       :lifecycle-lock (Object.)
+      :memory-budget-bytes (long memory-budget-bytes)
       :load-fn load-fn
       :generate-fn generate-fn
       :close-fn close-fn})))
@@ -101,11 +105,59 @@
 (defn- model-spec [service model]
   (get (:models service) model))
 
+;; Defined below: session admission needs them, and they need the session
+;; map, so one of the two directions has to be a forward declaration.
+(declare detach-sessions! close-entries!)
+
+(defn- declared-bytes [service model]
+  (session* :declared-bytes (long (or (:size (model-spec service model)) 0))))
+
+(defn- resident-bytes [service exclude]
+  (reduce + 0 (map #(declared-bytes service %)
+                   (remove exclude (keys @(:sessions service))))))
+
+(defn- evict-until-it-fits!
+  "Unload least-recently-used sessions until `model` is admissible.
+
+  Which sessions exist and which was used least recently are observations;
+  whether the total still exceeds the budget is the session core's rule. The
+  loop stops when nothing is left to unload, and the caller has already
+  established that the model fits on its own — so this cannot spin."
+  [service model]
+  ;; Runs inside the lifecycle lock, so an eviction's close happens in a
+  ;; critical section — one that already contains a whole model load, since
+  ;; `ensure-session!` calls load-fn under the same lock. Admission has to be
+  ;; atomic or two concurrent loads each evict for the other.
+  (let [budget (:memory-budget-bytes service)
+        incoming (declared-bytes service model)]
+    (loop [evicted []]
+      (if-not (session* :evict-for-load?
+                        (resident-bytes service #{model}) incoming budget)
+        evicted
+        (let [victim (->> @(:sessions service)
+                          (remove (fn [[name _]] (= name model)))
+                          (sort-by (fn [[_ entry]] @(:last-used-ms entry)))
+                          ffirst)]
+          (if-not victim
+            evicted
+            (do (close-entries! service (detach-sessions! service [victim]))
+                (recur (conj evicted victim)))))))))
+
 (defn- ensure-session! [service model keep-alive-ms]
   (locking (:lifecycle-lock service)
     (if-let [entry (get @(:sessions service) model)]
       (do (reset! (:keep-alive-ms entry) keep-alive-ms) entry)
-      (let [spec (or (model-spec service model)
+      (let [_ (when (session* :exceeds-budget-alone?
+                              (declared-bytes service model)
+                              (:memory-budget-bytes service))
+                ;; Refuse BEFORE evicting: unloading every working session to
+                ;; serve a request that was always going to fail is worse
+                ;; than the failure.
+                (throw (ex-info "model exceeds the configured memory budget"
+                                {:model model
+                                 :kind (protocol* :error-internal)})))
+            _ (evict-until-it-fits! service model)
+            spec (or (model-spec service model)
                      (throw (ex-info "model not found"
                                      {:model model
                                       :kind (protocol* :error-not-found)})))
@@ -172,20 +224,36 @@
   Returns nil for absent/unparseable — an unparseable duration must not read
   as an explicit request (it takes the default, like absence)."
   [value]
-  (cond
-    (number? value) (long value)
-    (string? value)
-    (let [[_ n unit] (re-matches #"(?i)\s*(-?\d+)\s*(ns|us|ms|s|m|h)?\s*" value)]
-      (when n
-        (let [n (parse-long n)]
-          (case (some-> unit str/lower-case)
-            "ns" (quot n 1000000000)
-            "us" (quot n 1000000)
-            "ms" (quot n 1000)
-            ("s" nil) n
-            "m" (* n 60)
-            "h" (* n 3600)))))
-    :else nil))
+  (letfn [(unit-seconds [n unit]
+            (case (some-> unit str/lower-case)
+              "ns" (quot n 1000000000)
+              "us" (quot n 1000000)
+              "ms" (quot n 1000)
+              ("s" nil) n
+              "m" (* n 60)
+              "h" (* n 3600)
+              nil))]
+    (cond
+      (number? value) (long value)
+      (string? value)
+      ;; Go's ParseDuration, which is what Ollama accepts, concatenates
+      ;; components: "1h30m" is 5400s, not 1 and then 30. Reading only the
+      ;; first component made "1h30m" mean one hour and "90m30s" mean ninety
+      ;; minutes — a silent truncation of the request rather than a refusal.
+      (let [trimmed (str/trim value)
+            negative? (str/starts-with? trimmed "-")
+            components (re-seq #"(\d+)\s*(ns|us|ms|h|m|s)?" trimmed)
+            parsed (keep (fn [[matched n unit]]
+                           (when-not (str/blank? matched)
+                             (unit-seconds (parse-long n) unit)))
+                         components)]
+        (when (and (seq parsed) (every? some? parsed)
+                   ;; Every character must belong to a component; trailing
+                   ;; junk means the client meant something we did not read.
+                   (= (str/replace trimmed #"^-" "")
+                      (str/join (map first (remove #(str/blank? (first %)) components)))))
+          (cond-> (reduce + parsed) negative? -)))
+      :else nil)))
 
 (defn- request-keep-alive-ms [body]
   (let [seconds (keep-alive-seconds (:keep_alive body))]

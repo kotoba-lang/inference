@@ -40,6 +40,19 @@
     false
     (> (+ resident-bytes incoming-bytes) budget-bytes)),
    :param-types [:i64 :i64 :i64]}
+  {:name exceeds-budget-alone?,
+   :params [incoming-bytes budget-bytes],
+   :result :bool,
+   :effects #{},
+   :body
+   (if (<= budget-bytes 0) false (> incoming-bytes budget-bytes)),
+   :param-types [:i64 :i64]}
+  {:name declared-bytes,
+   :params [size],
+   :result :i64,
+   :effects #{},
+   :body (if (< size 0) 0 size),
+   :param-types [:i64]}
   {:name reap-interval-ms,
    :params [keep-alive-ms],
    :result :i64,
@@ -78,6 +91,8 @@
   expires-at-ms
   expired?
   evict-for-load?
+  exceeds-budget-alone?
+  declared-bytes
   reap-interval-ms
   load-duration-nanos
   eval-duration-nanos
