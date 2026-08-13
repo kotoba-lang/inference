@@ -41,14 +41,15 @@
   deliberately outside the native-admission gates below."
   ["kotoba/ollama_protocol_core.kotoba"
    "kotoba/ollama_options_core.kotoba"
-   "kotoba/ollama_session_core.kotoba"])
+   "kotoba/ollama_session_core.kotoba"
+   "kotoba/ollama_chat_core.kotoba"])
 
 (deftest shipped-artifacts-match-their-source
   (let [artifacts (gen/discover-artifacts)]
     ;; Evidence floor: discovery returning nothing must not read as "every
     ;; artifact is current" (CLAUDE.md, ADR-2608136000 Q1).
-    (is (= 4 (count artifacts))
-        "expected three ollama decision cores plus kernel-math; adjust deliberately")
+    (is (= 5 (count artifacts))
+        "expected four ollama decision cores plus kernel-math; adjust deliberately")
     (doseq [{:keys [source out]} artifacts]
       (testing (str out " is a current compile of " source)
         (is (.exists (io/file out))
@@ -60,7 +61,7 @@
   (is (= (set (map #(.getName (io/file (:out %))) (gen/discover-artifacts)))
          (set (map #(.getName (io/file %)) (vals oracle/catalog))))
       "a core with no catalog entry is shipped but unreachable")
-  (is (= [:kernel-math :ollama-options :ollama-protocol :ollama-session]
+  (is (= [:kernel-math :ollama-chat :ollama-options :ollama-protocol :ollama-session]
          (oracle/preload!))))
 
 (deftest a-missing-artifact-fails-closed
@@ -76,11 +77,13 @@
     (is (= (call :ollama-protocol :route-tags) (call :ollama-protocol :route-code "GET" "/api/tags")))
     (is (= (call :ollama-protocol :route-ps) (call :ollama-protocol :route-code "GET" "/api/ps")))
     (is (= (call :ollama-protocol :route-show) (call :ollama-protocol :route-code "POST" "/api/show")))
-    (is (= (call :ollama-protocol :route-generate) (call :ollama-protocol :route-code "POST" "/api/generate"))))
+    (is (= (call :ollama-protocol :route-generate) (call :ollama-protocol :route-code "POST" "/api/generate")))
+    (is (= (call :ollama-protocol :route-chat) (call :ollama-protocol :route-code "POST" "/api/chat"))))
   (testing "route codes are distinct, so the host dispatch cannot collapse two routes"
     (let [codes (mapv #(call :ollama-protocol %)
-                      [:route-version :route-tags :route-ps :route-show :route-generate])]
-      (is (= 5 (count (set codes))))
+                      [:route-version :route-tags :route-ps :route-show
+                       :route-generate :route-chat])]
+      (is (= 6 (count (set codes))))
       (is (not (contains? (set codes) (call :ollama-protocol :route-not-found))))))
   (testing "method and path both matter"
     (is (= (call :ollama-protocol :route-not-found) (call :ollama-protocol :route-code "POST" "/api/tags")))
@@ -91,7 +94,27 @@
     (is (false? (call :ollama-protocol :route-reads-body? (call :ollama-protocol :route-tags))))
     (is (false? (call :ollama-protocol :route-reads-body? (call :ollama-protocol :route-not-found))))
     (is (true? (call :ollama-protocol :route-reads-body? (call :ollama-protocol :route-show))))
-    (is (true? (call :ollama-protocol :route-reads-body? (call :ollama-protocol :route-generate))))))
+    (is (true? (call :ollama-protocol :route-reads-body? (call :ollama-protocol :route-generate))))
+    (is (true? (call :ollama-protocol :route-reads-body? (call :ollama-protocol :route-chat))))))
+
+(deftest conversation-rules
+  (testing "role names map to codes and back"
+    (doseq [name ["system" "user" "assistant" "tool"]]
+      (let [code (call :ollama-chat :role-code name)]
+        (is (true? (call :ollama-chat :role-valid? code)))
+        (is (= name (call :ollama-chat :role-wire-name code))))))
+  (testing "an unknown role is not silently a user turn"
+    (is (= (call :ollama-chat :role-unknown) (call :ollama-chat :role-code "moderator")))
+    (is (= (call :ollama-chat :role-unknown) (call :ollama-chat :role-code "")))
+    (is (false? (call :ollama-chat :role-valid? (call :ollama-chat :role-unknown)))))
+  (testing "only a turn the model would answer may end the conversation"
+    (is (true? (call :ollama-chat :admissible-final-role? (call :ollama-chat :role-user))))
+    (is (true? (call :ollama-chat :admissible-final-role? (call :ollama-chat :role-tool))))
+    (is (false? (call :ollama-chat :admissible-final-role? (call :ollama-chat :role-assistant)))
+        "ending on assistant asks the model to continue its own turn")
+    (is (false? (call :ollama-chat :admissible-final-role? (call :ollama-chat :role-system)))
+        "ending on system has no question in it"))
+  (is (= "assistant" (call :ollama-chat :assistant-wire-role))))
 
 (deftest wire-names-and-statuses
   (is (= "length" (call :ollama-protocol :done-reason (call :ollama-protocol :stop-max-tokens))))
@@ -193,7 +216,7 @@
   (let [artifacts (filter (fn [{:keys [source]}] (some #{source} ollama-cores))
                           (gen/discover-artifacts))
         checked (atom 0)]
-    (is (= 3 (count artifacts)) "an ollama core stopped being discovered")
+    (is (= 4 (count artifacts)) "an ollama core stopped being discovered")
     (doseq [{:keys [out]} artifacts]
       (let [kir (edn/read-string (slurp out))
             exported (set (:exports kir))]

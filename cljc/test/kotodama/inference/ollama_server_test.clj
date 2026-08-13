@@ -38,7 +38,18 @@
                  :digest "sha256:fixture"
                  :details {:format "gguf" :family "gemma4"
                            :parameter_size "8.0B"
-                           :quantization_level "Q4_K_M"}}}
+                           :quantization_level "Q4_K_M"}
+                 ;; Explicit delimiters rather than a Go template: this
+                 ;; runtime does not implement Go templates and will not
+                 ;; invent markers for a model whose real ones it has not
+                 ;; read. Role codes come from ollama-chat-core.
+                 :kotodama/chat {:turn-open {2 "<u>" 3 "<a>" 1 "<s>" 4 "<t>"}
+                                 :turn-close "</>"
+                                 :generation-open "<a>"}}
+                "no-template:latest"
+                {:name "no-template:latest"
+                 :model "no-template:latest"
+                 :details {:format "gguf" :family "gemma4"}}}
         running
         (server/start-server!
          {:port 0
@@ -194,3 +205,98 @@
              (:expires_at (first (:models (parsed (request port :get "/api/ps" nil)))))))
       (finally
         (server/stop-server! running)))))
+
+;; ── /api/chat (ollama-chat-core) ─────────────────────────────────────
+
+(deftest chat-renders-the-conversation-and-answers-with-a-message
+  (let [{:keys [running]} (fixture)
+        port (:port running)]
+    (try
+      (let [response (request port :post "/api/chat"
+                              {:model "fixture:latest" :stream false
+                               :messages [{:role "system" :content "be brief"}
+                                          {:role "user" :content "capital of France?"}]})
+            body (parsed response)]
+        (is (= 200 (:status response)))
+        (is (= "assistant" (get-in body [:message :role])))
+        (is (= " Paris." (get-in body [:message :content])))
+        (is (true? (:done body)))
+        (is (nil? (:response body)) "/api/chat carries message, not response")
+        (is (nil? (:context body)) "context is a /api/generate field"))
+      (finally (server/stop-server! running)))))
+
+(deftest chat-streams-message-deltas
+  (let [{:keys [running]} (fixture)
+        port (:port running)]
+    (try
+      (let [response (request port :post "/api/chat"
+                              {:model "fixture:latest"
+                               :messages [{:role "user" :content "x"}]})
+            chunks (mapv #(json/read-str % :key-fn keyword)
+                         (remove str/blank? (str/split-lines (:body response))))]
+        (is (= "application/x-ndjson; charset=utf-8" (:content-type response)))
+        (is (= [" Paris" "." ""] (mapv #(get-in % [:message :content]) chunks)))
+        (is (= [false false true] (mapv :done chunks))))
+      (finally (server/stop-server! running)))))
+
+(deftest chat-rejects-conversations-the-model-cannot-answer
+  (let [{:keys [running]} (fixture)
+        port (:port running)]
+    (try
+      (doseq [[label body expected]
+              [["empty messages"
+                {:model "fixture:latest" :messages [] :stream false}
+                "messages must not be empty"]
+               ["ends on assistant"
+                {:model "fixture:latest" :stream false
+                 :messages [{:role "user" :content "a"} {:role "assistant" :content "b"}]}
+                "the last message must be from user or tool"]
+               ["unknown role"
+                {:model "fixture:latest" :stream false
+                 :messages [{:role "moderator" :content "a"}]}
+                "unknown message role: \"moderator\""]]]
+        (testing label
+          (let [response (request port :post "/api/chat" body)]
+            (is (= 400 (:status response)))
+            (is (= expected (:error (parsed response)))))))
+      (finally (server/stop-server! running)))))
+
+(deftest chat-refuses-a-model-with-no-delimiters
+  ;; Rather than assembling a prompt from invented markers.
+  (let [{:keys [running loads]} (fixture)
+        port (:port running)]
+    (try
+      (let [response (request port :post "/api/chat"
+                              {:model "no-template:latest" :stream false
+                               :messages [{:role "user" :content "x"}]})]
+        (is (= 400 (:status response)))
+        (is (= "model has no chat template configured" (:error (parsed response))))
+        (is (zero? @loads) "a model that cannot be rendered must not be loaded"))
+      (finally (server/stop-server! running)))))
+
+(deftest chat-prompt-is-the-rendered-conversation
+  ;; The generate-fn records what it was asked to complete, so the rendering
+  ;; is asserted rather than inferred from the reply.
+  (let [seen (atom nil)
+        running (server/start-server!
+                 {:port 0
+                  :service-opts
+                  {:models {"m" {:name "m" :model "m"
+                                 :kotodama/chat {:turn-open {1 "<s>" 2 "<u>" 3 "<a>" 4 "<t>"}
+                                                 :turn-close "</>"
+                                                 :generation-open "<a>"}}}
+                   :load-fn (fn [_] {:id 1})
+                   :generate-fn (fn [opts]
+                                  (reset! seen (:kotodama/prompt opts))
+                                  {:kotodama/text "ok"
+                                   :kotodama/prompt-token-ids []
+                                   :kotodama/generated-token-ids []
+                                   :kotodama/stop-reason :eos})
+                   :close-fn (fn [_] nil)}})]
+    (try
+      (request (:port running) :post "/api/chat"
+               {:model "m" :stream false
+                :messages [{:role "system" :content "S"}
+                           {:role "user" :content "U"}]})
+      (is (= "<s>S</><u>U</><a>" @seen))
+      (finally (server/stop-server! running)))))
