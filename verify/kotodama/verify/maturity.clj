@@ -31,7 +31,8 @@
     :kotoba-decision-cores
     :kotoba-engine-kernel
     :ollama-chat-endpoint
-    :openai-compatible-surface})
+    :openai-compatible-surface
+    :session-memory-budget})
 
 (def banned-foundation-patterns
   [{:id :transformers-js

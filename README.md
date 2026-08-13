@@ -196,7 +196,18 @@ Ollama's default newline-delimited streaming and `"stream": false`, plus
 `num_predict`, `temperature`, `top_k`, `top_p`, `seed`, and `keep_alive`
 (seconds or a duration string such as `"5m"`; `0` unloads once the request is
 answered, a negative value holds the model indefinitely). Idle sessions are
-unloaded by a reaper, and `/api/ps` reports the real future `expires_at`. The
+unloaded by a reaper, and `/api/ps` reports the real future `expires_at`.
+`keep_alive` accepts Go-style compound durations (`"1h30m"`), because reading
+only the first component would silently truncate the request.
+
+`:memory-budget-bytes` on the service bounds how much may stay resident,
+counted in **declared** model size from the catalogue rather than measured
+residency — the JVM cannot see a dequantised GGUF's real footprint, and a
+budget from a guess would evict live sessions on invented numbers. Exceeding
+it unloads least-recently-used sessions; a model too large on its own is
+refused **without** evicting anything, since taking working models down to
+serve a request that was always going to fail is worse than the failure. The
+default, `0`, means "not measured" and admits every load. The
 transport has real loopback HTTP tests for response shape, streaming chunks,
 lazy loading, session reuse, expiry, model-not-found errors, and disposal.
 Model pull/push/copy/delete, embeddings, blobs, scheduling across multiple
