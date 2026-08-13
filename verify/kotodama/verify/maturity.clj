@@ -24,7 +24,11 @@
     :gemma4-e4b-live
     :gemma4-e4b-native-parity
     :gemma4-metal-kdot
-    :ollama-http-api})
+    :ollama-http-api
+    ;; The Ollama surface's policy is Kotoba source; this gate is what keeps
+    ;; the shipped KIR, the wire semantics, and native admission honest
+    ;; (ADR-2608130700).
+    :kotoba-decision-cores})
 
 (def banned-foundation-patterns
   [{:id :transformers-js
