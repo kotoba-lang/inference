@@ -19,6 +19,8 @@ portable foundations for this repo.
 ```text
 cljc/src/    portable runtime contracts
 cljc/test/   CLJC contract tests
+kotoba/      Kotoba decision cores (authority for host policy)
+resources/   precompiled KIR artifacts for those cores
 verify/      maturity gates and local-model verification
 browser/     browser worker/client surface
 shaders/     WGSL kernels
@@ -182,11 +184,45 @@ curl http://127.0.0.1:11434/api/generate \
 Implemented endpoints are `GET /api/version`, `GET /api/tags`,
 `POST /api/show`, `GET /api/ps`, and `POST /api/generate`. Generate supports
 Ollama's default newline-delimited streaming and `"stream": false`, plus
-`num_predict`, `temperature`, `top_k`, `top_p`, and `seed`. The transport has
-real loopback HTTP tests for response shape, streaming chunks, lazy loading,
-session reuse, model-not-found errors, and disposal. Model pull/push/copy/delete,
-chat, embeddings, blobs, scheduling across multiple models, and exact behavior
-for every Ollama option remain future compatibility work.
+`num_predict`, `temperature`, `top_k`, `top_p`, `seed`, and `keep_alive`
+(seconds or a duration string such as `"5m"`; `0` unloads once the request is
+answered, a negative value holds the model indefinitely). Idle sessions are
+unloaded by a reaper, and `/api/ps` reports the real future `expires_at`. The
+transport has real loopback HTTP tests for response shape, streaming chunks,
+lazy loading, session reuse, expiry, model-not-found errors, and disposal.
+Model pull/push/copy/delete, chat, embeddings, blobs, scheduling across
+multiple models, and exact behavior for every Ollama option remain future
+compatibility work.
+
+### The policy of this surface is written in Kotoba
+
+Route admission, request-option defaults, session expiry, and duration
+accounting are **not** written in Clojure. They live in `kotoba/*_core.kotoba`
+and are executed from precompiled KIR (ADR-2608130700):
+
+| core | decides |
+|---|---|
+| `ollama_protocol_core.kotoba` | which route a (method, path) is, whether it reads a body, wire `done_reason`, error kind → HTTP status |
+| `ollama_options_core.kotoba` | `num_predict` / `stream` / `keep_alive` / `top_k` defaults and normalisation |
+| `ollama_session_core.kotoba` | expiry, `expires_at`, eviction under a budget, reaper cadence, `*_duration` accounting |
+
+`kotodama.inference.host.ollama-server` owns transport only — sockets, JSON,
+threads, locks, and the clock. The compiler is a **test-time** dependency:
+production loads `resources/kotodama/oracle/*.kir.edn` through
+`kotodama.inference.host.oracle` and interprets it, and a missing artifact
+fails the server at start rather than falling back to a second, unreviewed
+copy of the policy in Clojure.
+
+```sh
+clojure -M:test:gen    # recompile kotoba/*_core.kotoba → resources/kotodama/oracle/
+clojure -M:test        # includes the parity gate: shipped artifact == fresh
+                       # compile, semantics vs the Ollama wire contract, and
+                       # native-boundary admission
+```
+
+Editing a core without regenerating is caught by the parity gate, not by the
+semantics tests — those run against the shipped artifact and would keep
+passing. Both failure modes are demonstrated in ADR-2608130700.
 
 ## Local MLX host adapter (`kotodama.inference.mlx`, Apple Silicon)
 

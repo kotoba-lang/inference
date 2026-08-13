@@ -5,7 +5,8 @@
             [kotodama.inference.host.ollama-server :as server])
   (:import [java.net URI]
            [java.net.http HttpClient HttpRequest HttpRequest$BodyPublishers
-            HttpResponse$BodyHandlers]))
+            HttpResponse$BodyHandlers]
+           [java.time Instant]))
 
 (defn- request [port method path body]
   (let [builder (-> (HttpRequest/newBuilder
@@ -127,5 +128,69 @@
                               {:model "missing" :prompt "x" :stream false})]
         (is (= 404 (:status response)))
         (is (= "model not found" (:error (parsed response)))))
+      (finally
+        (server/stop-server! running)))))
+
+;; ── session lifecycle (ollama-session-core) ──────────────────────────
+;; Before these, a loaded session lived until process exit: a 20 GiB
+;; dequantised Gemma4 was never given back. See ADR-2608130700.
+
+(deftest keep-alive-zero-unloads-when-the-request-is-answered
+  (let [{:keys [running loads closes]} (fixture)
+        port (:port running)]
+    (try
+      (let [response (request port :post "/api/generate"
+                              {:model "fixture:latest" :prompt "x" :stream false
+                               :keep_alive 0})]
+        (is (= 200 (:status response)))
+        (is (= 1 @loads))
+        (is (= 1 @closes) "keep_alive 0 means unload now, not at shutdown")
+        (is (empty? (:models (parsed (request port :get "/api/ps" nil))))))
+      (finally
+        (server/stop-server! running)))))
+
+(deftest the-reaper-unloads-only-what-has-gone-idle
+  (let [{:keys [running closes]} (fixture)
+        port (:port running)
+        service (:service running)]
+    (try
+      (request port :post "/api/generate"
+               {:model "fixture:latest" :prompt "x" :stream false :keep_alive 60})
+      (is (= [] (server/reap-expired! service (System/currentTimeMillis)))
+          "a session inside its keep-alive is left alone")
+      (is (zero? @closes))
+      (is (= ["fixture:latest"]
+             (server/reap-expired! service (+ (System/currentTimeMillis) 60001))))
+      (is (= 1 @closes))
+      (is (empty? (:models (parsed (request port :get "/api/ps" nil)))))
+      (finally
+        (server/stop-server! running)))))
+
+(deftest ps-reports-a-future-expiry-not-the-last-use
+  (let [{:keys [running]} (fixture)
+        port (:port running)]
+    (try
+      (request port :post "/api/generate"
+               {:model "fixture:latest" :prompt "x" :stream false :keep_alive "1m"})
+      (let [entry (first (:models (parsed (request port :get "/api/ps" nil))))
+            loaded (Instant/parse (:loaded_at entry))
+            expires (Instant/parse (:expires_at entry))]
+        (is (.isAfter expires loaded))
+        (is (<= 59 (.between java.time.temporal.ChronoUnit/SECONDS loaded expires) 61)
+            "keep_alive accepts Ollama duration strings, not only seconds"))
+      (finally
+        (server/stop-server! running)))))
+
+(deftest keep-alive-forever-never-expires
+  (let [{:keys [running closes]} (fixture)
+        port (:port running)
+        service (:service running)]
+    (try
+      (request port :post "/api/generate"
+               {:model "fixture:latest" :prompt "x" :stream false :keep_alive -1})
+      (is (= [] (server/reap-expired! service Long/MAX_VALUE)))
+      (is (zero? @closes))
+      (is (= "9999-12-31T23:59:59Z"
+             (:expires_at (first (:models (parsed (request port :get "/api/ps" nil)))))))
       (finally
         (server/stop-server! running)))))
