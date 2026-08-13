@@ -182,7 +182,7 @@ curl http://127.0.0.1:11434/api/generate \
 ```
 
 Implemented endpoints are `GET /api/version`, `GET /api/tags`,
-`POST /api/show`, `GET /api/ps`, and `POST /api/generate`. Generate supports
+`POST /api/show`, `GET /api/ps`, `POST /api/generate`, and `POST /api/chat`. Generate supports
 Ollama's default newline-delimited streaming and `"stream": false`, plus
 `num_predict`, `temperature`, `top_k`, `top_p`, `seed`, and `keep_alive`
 (seconds or a duration string such as `"5m"`; `0` unloads once the request is
@@ -190,9 +190,28 @@ answered, a negative value holds the model indefinitely). Idle sessions are
 unloaded by a reaper, and `/api/ps` reports the real future `expires_at`. The
 transport has real loopback HTTP tests for response shape, streaming chunks,
 lazy loading, session reuse, expiry, model-not-found errors, and disposal.
-Model pull/push/copy/delete, chat, embeddings, blobs, scheduling across
-multiple models, and exact behavior for every Ollama option remain future
-compatibility work.
+Model pull/push/copy/delete, embeddings, blobs, scheduling across multiple
+models, and exact behavior for every Ollama option remain future compatibility
+work. There is still no model-acquisition path on this surface.
+
+`/api/chat` needs delimiters on the model spec, because this runtime does not
+implement Go templates and will not guess markers for a model whose real ones
+it has not read:
+
+```clojure
+{"gemma4:e4b"
+ {:name "gemma4:e4b"
+  :kotodama/chat {:turn-open {1 "<start_of_turn>system\n"   ; role codes from
+                              2 "<start_of_turn>user\n"     ; ollama-chat-core
+                              3 "<start_of_turn>model\n"
+                              4 "<start_of_turn>tool\n"}
+                  :turn-close "<end_of_turn>\n"
+                  :generation-open "<start_of_turn>model\n"}}}
+```
+
+A model without them answers **400**, and is not loaded. A conversation that
+is empty, contains an unknown role, or ends on `assistant`/`system` is also a
+400 — the last message must be one the model would answer.
 
 ### The policy of this surface is written in Kotoba
 
@@ -205,6 +224,8 @@ and are executed from precompiled KIR (ADR-2608138800):
 | `ollama_protocol_core.kotoba` | which route a (method, path) is, whether it reads a body, wire `done_reason`, error kind → HTTP status |
 | `ollama_options_core.kotoba` | `num_predict` / `stream` / `keep_alive` / `top_k` defaults and normalisation |
 | `ollama_session_core.kotoba` | expiry, `expires_at`, eviction under a budget, reaper cadence, `*_duration` accounting |
+| `ollama_chat_core.kotoba` | which roles exist, which name them, and which role a conversation may end on |
+| `kernel_math_core.kotoba` | engine arithmetic — dot, RMS scale, softmax, SiLU (float-typed, outside the native gate) |
 
 `kotodama.inference.host.ollama-server` owns transport only — sockets, JSON,
 threads, locks, and the clock. The compiler is a **test-time** dependency:

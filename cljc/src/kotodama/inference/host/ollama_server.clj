@@ -38,6 +38,7 @@
 (defn- protocol* [export & args] (oracle/call :ollama-protocol export args))
 (defn- options* [export & args] (oracle/call :ollama-options export args))
 (defn- session* [export & args] (oracle/call :ollama-session export args))
+(defn- chat* [export & args] (oracle/call :ollama-chat export args))
 
 (defn- json-bytes [value]
   (.getBytes (json/write-str value) StandardCharsets/UTF_8))
@@ -297,6 +298,110 @@
           ;; expect a terminal NDJSON error object in this situation.
           (write! {:error (.getMessage e) :done true}))))))
 
+;; ── /api/chat ────────────────────────────────────────────────────────
+;;
+;; Ollama renders a conversation with a Go template carried on the model.
+;; This runtime does not implement Go templates, and will not guess a
+;; template for a model whose real one it has not read: the delimiters are a
+;; fact about a specific GGUF, not a default. A model spec therefore carries
+;; them explicitly under `:kotodama/chat`:
+;;
+;;   {:turn-open {2 "<start>user\n" 3 "<start>model\n"}   ; by role code
+;;    :turn-close "<end>\n"
+;;    :generation-open "<start>model\n"}
+;;
+;; and a model without them answers 400 rather than a plausible completion of
+;; a prompt assembled from invented markers.
+
+(defn- chat-spec [service model]
+  (:kotodama/chat (model-spec service model)))
+
+(defn- message-role-code [message]
+  (chat* :role-code (or (:role message) "")))
+
+(defn- render-conversation
+  "Fold messages into a prompt string using the model's own delimiters.
+
+  Role validity and the admissible final role are the chat core's decisions;
+  this walks the sequence and concatenates, which is the part that is a
+  sequence operation rather than a judgement."
+  [chat messages]
+  (let [{:keys [turn-open turn-close generation-open]} chat]
+    (str (apply str
+                (map (fn [message]
+                       (let [code (message-role-code message)]
+                         (str (get turn-open code)
+                              (or (:content message) "")
+                              turn-close)))
+                     messages))
+         generation-open)))
+
+(defn- validate-chat! [service body]
+  (let [model (or (:model body) host/default-model)
+        messages (vec (:messages body))
+        chat (chat-spec service model)]
+    (when-not (model-spec service model)
+      (throw (ex-info "model not found" {:kind (protocol* :error-not-found)})))
+    (when-not chat
+      (throw (ex-info "model has no chat template configured"
+                      {:kind (protocol* :error-bad-request)})))
+    (when (empty? messages)
+      ;; Distinct from "a message whose role I could not read" — there is no
+      ;; final role to ask the core about.
+      (throw (ex-info "messages must not be empty"
+                      {:kind (protocol* :error-bad-request)})))
+    (doseq [message messages]
+      (when-not (chat* :role-valid? (message-role-code message))
+        (throw (ex-info (str "unknown message role: " (pr-str (:role message)))
+                        {:kind (protocol* :error-bad-request)}))))
+    (when-not (chat* :admissible-final-role?
+                     (message-role-code (peek messages)))
+      (throw (ex-info "the last message must be from user or tool"
+                      {:kind (protocol* :error-bad-request)})))
+    {:model model
+     :prompt (render-conversation chat messages)}))
+
+(defn- chat-message [content]
+  {:role (chat* :assistant-wire-role) :content content})
+
+(defn- chat-final [model result total-nanos load-nanos eval-nanos content]
+  ;; /api/chat carries `message`, not `response`, and no `context` — that is
+  ;; a /api/generate field and clients key off its absence.
+  (-> (final-response model result total-nanos load-nanos eval-nanos)
+      (dissoc :response :context)
+      (assoc :message (chat-message content))))
+
+(defn- chat-json! [service exchange body]
+  (let [{:keys [model prompt]} (validate-chat! service body)
+        {:keys [result total-nanos load-nanos eval-nanos]}
+        (run-generate! service (assoc body :prompt prompt) nil)]
+    (send-json! exchange 200
+                (chat-final model result total-nanos load-nanos eval-nanos
+                            (:kotodama/text result "")))
+    (settle-session! service model)))
+
+(defn- chat-stream! [service ^HttpExchange exchange body]
+  (let [{:keys [model prompt]} (validate-chat! service body)]
+    (doto (.getResponseHeaders exchange)
+      (.set "content-type" "application/x-ndjson; charset=utf-8"))
+    (.sendResponseHeaders exchange 200 0)
+    (with-open [out (.getResponseBody exchange)]
+      (letfn [(write! [value]
+                (let [bytes (.getBytes (str (json/write-str value) "\n") StandardCharsets/UTF_8)]
+                  (.write out bytes)
+                  (.flush out)))]
+        (try
+          (let [{:keys [result total-nanos load-nanos eval-nanos]}
+                (run-generate!
+                 service (assoc body :prompt prompt)
+                 (fn [_token-id token-text _step-nanos]
+                   (write! (merge (base-generate-response model)
+                                  {:message (chat-message token-text) :done false}))))]
+            (write! (chat-final model result total-nanos load-nanos eval-nanos ""))
+            (settle-session! service model))
+          (catch Throwable e
+            (write! {:error (.getMessage e) :done true})))))))
+
 (defn- tags-response [service]
   {:models (->> (:models service)
                 vals
@@ -352,6 +457,11 @@
         (if (request-stream? body)
           (generate-stream! service exchange body)
           (generate-json! service exchange body))
+
+        (protocol* :route-chat)
+        (if (request-stream? body)
+          (chat-stream! service exchange body)
+          (chat-json! service exchange body))
 
         (error-kind! exchange (protocol* :error-not-found) "not found")))
     (catch clojure.lang.ExceptionInfo e

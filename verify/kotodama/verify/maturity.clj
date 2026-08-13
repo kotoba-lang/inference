@@ -29,7 +29,8 @@
     ;; the shipped KIR, the wire semantics, and native admission honest
     ;; (ADR-2608138800).
     :kotoba-decision-cores
-    :kotoba-engine-kernel})
+    :kotoba-engine-kernel
+    :ollama-chat-endpoint})
 
 (def banned-foundation-patterns
   [{:id :transformers-js

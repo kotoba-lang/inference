@@ -37,6 +37,12 @@
    :effects #{},
    :body 5,
    :param-types []}
+  {:name route-chat,
+   :params [],
+   :result :i64,
+   :effects #{},
+   :body 6,
+   :param-types []}
   {:name route-code,
    :params [method path],
    :result :i64,
@@ -56,7 +62,10 @@
      (if
       (string=? path "/api/show")
       4
-      (if (string=? path "/api/generate") 5 0))
+      (if
+       (string=? path "/api/generate")
+       5
+       (if (string=? path "/api/chat") 6 0)))
      0)),
    :param-types [:string :string]}
   {:name route-reads-body?,
@@ -128,6 +137,7 @@
   route-ps
   route-show
   route-generate
+  route-chat
   route-code
   route-reads-body?
   stop-eos
