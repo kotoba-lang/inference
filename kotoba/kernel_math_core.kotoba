@@ -1,5 +1,6 @@
 (ns kernel-math-core
   (:export [dot sum-of-squares inv-rms max-element
+            exp-shifted softmax-denominator silu
             clamp-unit clamp-non-negative]))
 
 ;; The first slice of the inference ENGINE in Kotoba, as opposed to the
@@ -84,10 +85,6 @@
                                   eps))))))
 
 ;; ── max element (softmax stability) ──────────────────────────────────
-;; Softmax itself is not here: it needs exp over (x - max), which reaches
-;; large negative arguments, and the only exponential admitted is
-;; `f64-exp-bounded` — bounded, with a domain this has not been measured
-;; against. Naming the max is the part that is certainly correct today.
 
 (defn max-from [a :vector-f64 i :i64 n :i64 acc :f64] :f64
   (if (>= i n)
@@ -99,6 +96,50 @@
     (if (= n 0)
       0.0
       (max-from a 1 n (vector-f64-at a 0)))))
+
+;; ── softmax and SiLU ─────────────────────────────────────────────────
+;; `f64-exp-bounded` is named "bounded" but its domain is not narrow. Measured
+;; 2026-08-13 on amu e8864273: exp(-100) = 3.72e-44 and exp(100) = 2.69e43,
+;; i.e. the usable double range. The first version of this file said softmax
+;; was excluded because that domain "has not been measured" — so it got
+;; measured, and it was wide enough all along.
+;;
+;; Softmax is decomposed rather than returned as a vector: the host already
+;; owns the destination buffer, and a shifted exponential plus a denominator
+;; is the whole computation. `exp-shifted` takes the max explicitly so the
+;; caller cannot forget the stabilising subtraction.
+
+(defn exp-shifted [x :f64 m :f64] :f64
+  (f64-exp-bounded (f64-sub x m)))
+
+(defn softmax-denom-from [a :vector-f64 m :f64 i :i64 n :i64 acc :f64] :f64
+  (if (>= i n)
+    acc
+    (softmax-denom-from a m (+ i 1) n
+                        (f64-add acc (exp-shifted (vector-f64-at a i) m)))))
+
+(defn softmax-denominator [a :vector-f64 m :f64] :f64
+  (softmax-denom-from a m 0 (vector-f64-count a) 0.0))
+
+;; SiLU: x / (1 + exp(-x)). Matches kotodama.inference.ops/silu-value.
+
+(defn silu [x :f64] :f64
+  (f64-div x (f64-add 1.0 (f64-exp-bounded (f64-sub 0.0 x)))))
+
+;; ── measured, and deliberately NOT here ──────────────────────────────
+;;
+;; **RoPE.** `f64-sin-bounded`/`f64-cos-bounded` are exact at ±1000 and trap
+;; at 1e7 with `f64-bounded-angle-domain`. A RoPE angle is position divided by
+;; theta^(2i/d), and at the divisor of 1 that is the position itself — this
+;; model's context reaches 262144, well past 1000. Range reduction (mod 2π) on
+;; the host would fix it, but that is a decision about where reduction lives,
+;; not a line of arithmetic, so it is not made here.
+;;
+;; **gelu_pytorch_tanh** (Gemma4's gated MLP activation). `f64-tanh` does not
+;; exist — "operation has no admitted lowering", measured, not guessed. SiLU
+;; needs only exp, which is why it could come and GELU could not.
+;;
+;; **Dequantisation.** Still blocked on reading `:bytes`, as above.
 
 ;; ── sampling parameter clamps ────────────────────────────────────────
 ;; Moved off the Ollama surface (ollama_options_core.kotoba explains why they

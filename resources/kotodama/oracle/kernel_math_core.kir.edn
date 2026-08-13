@@ -81,6 +81,45 @@
      (f64-from-bits 0)
      (max-from a 1 n (vector-f64-at a 0)))),
    :param-types [:vector-f64]}
+  {:name exp-shifted,
+   :params [x m],
+   :result :f64,
+   :effects #{},
+   :body (f64-exp-bounded (f64-sub x m)),
+   :param-types [:f64 :f64]}
+  {:name softmax-denom-from,
+   :params [a m i n acc],
+   :result :f64,
+   :effects #{},
+   :body
+   (if
+    (>= i n)
+    acc
+    (softmax-denom-from
+     a
+     m
+     (+ i 1)
+     n
+     (f64-add acc (exp-shifted (vector-f64-at a i) m)))),
+   :param-types [:vector-f64 :f64 :i64 :i64 :f64]}
+  {:name softmax-denominator,
+   :params [a m],
+   :result :f64,
+   :effects #{},
+   :body
+   (softmax-denom-from a m 0 (vector-f64-count a) (f64-from-bits 0)),
+   :param-types [:vector-f64 :f64]}
+  {:name silu,
+   :params [x],
+   :result :f64,
+   :effects #{},
+   :body
+   (f64-div
+    x
+    (f64-add
+     (f64-from-bits 4607182418800017408)
+     (f64-exp-bounded (f64-sub (f64-from-bits 0) x)))),
+   :param-types [:f64]}
   {:name clamp-unit,
    :params [v],
    :result :f64,
@@ -103,6 +142,9 @@
   sum-of-squares
   inv-rms
   max-element
+  exp-shifted
+  softmax-denominator
+  silu
   clamp-unit
   clamp-non-negative],
  :schemas nil,

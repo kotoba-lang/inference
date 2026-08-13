@@ -68,6 +68,38 @@
   (is (= 0.0 (call :inv-rms [] 1.0e-6)))
   (is (= 0.0 (call :max-element []))))
 
+(deftest softmax-agrees-with-ops
+  ;; ops/softmax-values returns the whole distribution; this core returns the
+  ;; two scalars it is built from, so reconstruct and compare elementwise.
+  (doseq [xs [[1.0 2.0 3.0]
+              [0.0 0.0 0.0]
+              [-5.0 5.0]
+              (mapv #(- (/ (double %) 3.0) 4.0) (range 12))]]
+    (let [expected (ops/softmax-values xs)
+          m (call :max-element xs)
+          denom (call :softmax-denominator xs m)
+          actual (mapv #(/ (call :exp-shifted (double %) m) denom) xs)]
+      (is (every? true? (map close? expected actual))
+          (str "softmax mismatch for " xs))
+      (is (close? 1.0 (reduce + actual)) "reconstructed distribution must sum to 1"))))
+
+(deftest silu-agrees-with-ops
+  (doseq [x [0.0 1.0 -1.0 4.5 -4.5 20.0 -20.0]]
+    (is (close? (ops/silu-value x) (call :silu x))
+        (str "silu mismatch at " x))))
+
+(deftest exp-is-not-narrowly-bounded
+  ;; The reason softmax was originally left out of this core was an unmeasured
+  ;; assumption about f64-exp-bounded's domain. Pin the measurement so the
+  ;; assumption cannot come back.
+  ;; An absolute tolerance would pass here even if exp underflowed to zero,
+  ;; which is the exact failure this pins. Bracket it instead.
+  (let [v (call :exp-shifted -100.0 0.0)]
+    (is (< 1.0e-45 v 1.0e-43) (str "exp(-100) came back as " v)))
+  (let [v (call :exp-shifted 100.0 0.0)]
+    (is (< 1.0e42 v 1.0e44) (str "exp(100) came back as " v)))
+  (is (close? 1.0 (call :exp-shifted 5.0 5.0))))
+
 (deftest sampling-clamps
   (is (= 0.0 (call :clamp-unit -0.5)))
   (is (= 1.0 (call :clamp-unit 1.5)))
