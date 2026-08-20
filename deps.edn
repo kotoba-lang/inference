@@ -18,12 +18,12 @@
   :test {:extra-paths ["cljc/test"]
          :extra-deps {io.github.cognitect-labs/test-runner
                       {:git/tag "v0.5.1" :git/sha "dfb30dd"}
-                      ;; kotoba-lang/amu (formerly kotoba-lang/compiler) is
+                      ;; kotoba-lang/amu (formerly kotoba-lang/amu) is
                       ;; TEST-ONLY: it compiles kotoba/*_core.kotoba for the
                       ;; parity gate and for :gen. Same pin as murakumo's
                       ;; W6 oracle gate, so the two repos agree on what the
                       ;; language admits.
-                      io.github.kotoba-lang/compiler
+                      io.github.kotoba-lang/amu
                       {:git/url "https://github.com/kotoba-lang/amu.git"
                        :git/sha "e78241dca15000f6bb3976e97f493c70b0137dcf"}}
          :main-opts ["-m" "cognitect.test-runner" "-d" "cljc/test"]
