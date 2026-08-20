@@ -22,7 +22,11 @@
 (defn- byte-fallback-token [s]
   ;; llama.cpp byte-fallback tokens are spelled "<0xAB>" (uppercase hex).
   (when-let [[_ hex] (re-matches #"<0x([0-9A-Fa-f]{2})>" s)]
-    (Integer/parseInt hex 16)))
+    ;; Integer/parseInt is JVM-only, and this file is .cljc precisely so the
+    ;; tokenizer can run where inference runs. Under SCI the unqualified host
+    ;; call does not resolve at all, so the whole namespace failed to load.
+    #?(:clj  (Integer/parseInt hex 16)
+       :cljs (js/parseInt hex 16))))
 
 (defn build
   "Build an immutable tokenizer map from materialized GGUF vocab arrays.
