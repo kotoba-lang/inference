@@ -39,6 +39,8 @@
 
     nbb --classpath \"$(clojure -Spath -M:test)\" run-tests.cljs"
   (:require [cljs.test :as t]
+            [kotodama.inference.mlx :as mlx]
+            [kotodama.inference.tokenizer :as tokenizer]
             [kotodama.inference.core-test]
             [kotodama.inference.shard-test]))
 
@@ -47,6 +49,51 @@
                 (:fail m) " failed, " (:error m) " errors"))
   ;; Without this a failing suite exits 0 and the gate is green forever.
   (when (pos? (+ (or (:fail m) 0) (or (:error m) 0)))
+    (set! (.-exitCode js/process) 1)))
+
+(def excluded
+  "Namespace -> why it is not in the run-tests call above.
+
+  The reasons were already written at length in this file's header, and prose
+  is not checked -- the superproject's `verify-cljs-runner-completeness` even
+  read that prose as a require and reported this runner for forgetting a
+  namespace it never mentions in code. As data, the entry is recognised as a
+  DECLARED exclusion; asserted below, it also stops outliving its cause."
+  '{kotodama.inference.generation-test
+    "asserts byte-fallback round-trip for an unmapped character.
+     tokenizer/symbol->ids has no cljs byte-fallback -- its :cljs branch is
+     [unknown-token-id] -- so 'z' encodes to <unk> and the assertion fails
+     honestly. Closing it means byte-fallback on TextEncoder/TextDecoder,
+     a change to production behaviour rather than a test fix."
+
+    kotodama.inference.mlx-test
+    "mlx/mlx-runtime is a host adapter whose :cljs branch throws
+     'mlx-runtime is a host adapter; provide a CLJS fetch-backed
+     IModelRuntime instead'. The test is testing the JVM adapter."})
+
+;; Both exclusions, re-checked. Each reason is behavioural, so each is asserted
+;; rather than described. If either stops being true this run says so and exits
+;; non-zero, and the entry has to be retired instead of quietly surviving.
+(let [tk (tokenizer/build
+          {:tokens ["<unk>" "a"] :merges []
+           :add-bos-token? false :add-space-prefix? false
+           :unknown-token-id 0})
+      ids (tokenizer/encode tk "z")
+      byte-fallback? (not= ids [0])]
+  (when byte-fallback?
+    (println (str "STALE EXCLUSION: kotodama.inference.generation-test is excluded "
+                  "because tokenizer has no cljs byte-fallback, and it now encodes "
+                  "'z' as " (pr-str ids) " rather than the unknown-token id. Retire "
+                  "the entry and put the namespace in the suite."))
+    (set! (.-exitCode js/process) 1)))
+
+(let [outcome (try (mlx/mlx-runtime {}) :returned
+                   (catch :default e (str (ex-message e))))]
+  (when-not (and (string? outcome) (.includes outcome "host adapter"))
+    (println (str "STALE EXCLUSION: kotodama.inference.mlx-test is excluded because "
+                  "mlx/mlx-runtime refuses on cljs, and it no longer does -- it "
+                  "answered " (pr-str outcome) ". Retire the entry and put the "
+                  "namespace in the suite."))
     (set! (.-exitCode js/process) 1)))
 
 (t/run-tests 'kotodama.inference.core-test
