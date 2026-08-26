@@ -68,6 +68,7 @@
   :verify-metal-kdot-worker {:extra-paths ["verify"]
                              :main-opts ["-m" "kotodama.verify.metal-kdot-worker"]}
   :serve-ollama {:main-opts ["-m" "kotodama.inference.host.ollama-server"]}
+  :vllm-cli {:main-opts ["-m" "kotodama.inference.cli.vllm"]}
   :verify-gemma-kvcache {:extra-paths ["verify"]
                          :main-opts ["-m" "kotodama.verify.gemma4-kvcache-smoke"]}
   ;; clj-kondo as a Clojars lib (no Homebrew/system install needed).
