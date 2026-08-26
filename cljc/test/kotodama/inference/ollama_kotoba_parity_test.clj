@@ -43,14 +43,15 @@
    "kotoba/ollama_options_core.kotoba"
    "kotoba/ollama_session_core.kotoba"
    "kotoba/ollama_chat_core.kotoba"
-   "kotoba/openai_chat_core.kotoba"])
+   "kotoba/openai_chat_core.kotoba"
+   "kotoba/vllm_infer_core.kotoba"])
 
 (deftest shipped-artifacts-match-their-source
   (let [artifacts (gen/discover-artifacts)]
     ;; Evidence floor: discovery returning nothing must not read as "every
     ;; artifact is current" (CLAUDE.md, ADR-2608136000 Q1).
-    (is (= 6 (count artifacts))
-        "expected five decision cores plus kernel-math; adjust deliberately")
+    (is (= 7 (count artifacts))
+        "expected six decision cores plus kernel-math; adjust deliberately")
     (doseq [{:keys [source out]} artifacts]
       (testing (str out " is a current compile of " source)
         (is (.exists (io/file out))
@@ -63,7 +64,7 @@
          (set (map #(.getName (io/file %)) (vals oracle/catalog))))
       "a core with no catalog entry is shipped but unreachable")
   (is (= [:kernel-math :ollama-chat :ollama-options :ollama-protocol :ollama-session
-          :openai-chat]
+          :openai-chat :vllm-infer]
          (oracle/preload!))))
 
 (deftest a-missing-artifact-fails-closed
@@ -264,7 +265,7 @@
   (let [artifacts (filter (fn [{:keys [source]}] (some #{source} ollama-cores))
                           (gen/discover-artifacts))
         checked (atom 0)]
-    (is (= 5 (count artifacts)) "a decision core stopped being discovered")
+    (is (= 6 (count artifacts)) "a decision core stopped being discovered")
     (doseq [{:keys [out]} artifacts]
       (let [kir (edn/read-string (slurp out))
             exported (set (:exports kir))]

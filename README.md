@@ -214,6 +214,30 @@ Model pull/push/copy/delete, embeddings, blobs, scheduling across multiple
 models, and exact behavior for every Ollama option remain future compatibility
 work. There is still no model-acquisition path on this surface.
 
+## JVM-independent vLLM client
+
+The native `kotoba-vllm-infer` client executes request bounds from
+`kotoba/vllm_infer_core.kotoba`, compiled by Amu to KEXE. Its narrow host
+delegates loopback HTTP to curl. The runtime bundle contains no JVM or
+JavaScript engine, and rejects non-loopback endpoints.
+
+```sh
+scripts/build-native-vllm-cli.sh
+target/native-vllm-cli/kotoba-vllm-infer \
+  --prompt 'Explain memory bandwidth in one sentence.' --max-tokens 64
+```
+
+The JVM reference executes the same shipped Kotoba policy:
+
+```sh
+clojure -M:vllm-cli --prompt 'Explain memory bandwidth in one sentence.' \
+  --max-tokens 64
+```
+
+Both clients write the vLLM response to stdout and one JSON measurement record
+to stderr. External wall time includes client startup; `request_ms` isolates
+HTTP plus model generation.
+
 `/api/chat` needs delimiters on the model spec, because this runtime does not
 implement Go templates and will not guess markers for a model whose real ones
 it has not read:
