@@ -14,6 +14,24 @@ The core foundation is `kotoba-lang/torch` plus `kotoba-lang/num`. JavaScript
 model runtimes such as Transformers.js, ONNX, and ONNX Runtime Web are not
 portable foundations for this repo.
 
+## Encrypted LM-head proof
+
+The JVM host includes a bounded, cryptographic encrypted-inference slice. A
+client encrypts a fixed-point hidden state with 2048-bit Paillier; the server
+uses plaintext model weights to compute encrypted candidate logits through
+`num.paillier/encrypted-matvec`; only the client decrypts and selects the token.
+
+```sh
+clojure -M:verify-encrypted-lm-head
+```
+
+This proves ciphertext-only **linear LM-head inference**, including randomized
+ciphertexts, modular-overflow rejection, exact fixed-point parity, and an
+executable timing receipt. It does not claim FHE or a fully encrypted
+Transformer: attention, normalization, activations, Softmax, and the preceding
+hidden-state computation remain outside the encrypted boundary. See
+`docs/ADR-encrypted-lm-head-paillier.md` for the threat model and non-claims.
+
 ## Layout
 
 ```text
