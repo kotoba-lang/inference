@@ -1,7 +1,7 @@
 (ns kotodama.verify.encrypted-lm-head
   "Executable proof receipt for ciphertext-only candidate LM-head inference."
   (:require [kotodama.inference.encrypted :as encrypted]
-            [num.paillier :as phe]))
+            [paillier.core :as phe]))
 
 (def hidden [0.25 -0.5 1.0 0.75 -0.25 0.5 -0.75 0.125])
 (def weights [[0.10 0.20 -0.30 0.40 0.05 -0.10 0.25 0.30]
@@ -61,6 +61,9 @@
                        :request-boundary? request-boundary?
                        :response-boundary? response-boundary?})))
     (prn {:kotodama/encrypted-lm-head :ok
+          :primitive-library :kotoba-lang/paillier
+          :primitive-namespace 'paillier.core
+          :primitive-wire-version :paillier-phe-v1
           :cryptographic-scope :paillier-linear-phe
           :not-proved [:full-transformer :nonlinear-layers :fhe]
           :key-bits (:bits public-key)

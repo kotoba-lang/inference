@@ -1,7 +1,7 @@
 (ns kotodama.inference.encrypted-test
   (:require [clojure.test :refer [deftest is testing]]
             [kotodama.inference.encrypted :as encrypted]
-            [num.paillier :as phe]))
+            [paillier.core :as phe]))
 
 (defonce ^:private keypair (delay (phe/generate-keypair)))
 
