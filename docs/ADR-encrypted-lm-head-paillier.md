@@ -12,10 +12,11 @@ PUMA and BumbleBee use multi-party protocols for larger models at minutes per
 token. None makes a frontier-size, interactive, fully encrypted Transformer a
 small implementation task.
 
-Kotoba already separates inference orchestration (`kotoba-lang/inference`) from
-numerical execution (`kotoba-lang/num`). We need an executable cryptographic
-slice that respects that boundary and does not label an approximation or an
-encrypted transport channel as homomorphic inference.
+Kotoba separates inference orchestration (`kotoba-lang/inference`) from numerical
+execution (`kotoba-lang/num`). The Paillier key/ciphertext boundary is a third
+concern and is owned by `kotoba-lang/paillier`, rather than by either consumer.
+We need an executable cryptographic slice that respects those boundaries and
+does not label an approximation or encrypted transport as homomorphic inference.
 
 ## Decision
 
@@ -25,13 +26,14 @@ The first slice is the decoder's candidate LM head:
    integer under a fresh-randomized 2048-bit Paillier public key.
 2. The server receives only public key material, dimensions, public range and
    scale contracts, and ciphertexts.
-3. `num.paillier/encrypted-matvec` evaluates plaintext model rows and biases as
+3. `paillier.core/encrypted-matvec` evaluates plaintext model rows and biases as
    `Enc(Wx+b)` without accepting a private key or decrypting an intermediate.
 4. The server rerandomizes and returns encrypted candidate logits.
 5. The client decrypts, rescales, and performs token selection locally.
 
 The wire map is versioned as `:paillier-phe-v1`. A mandatory, data-independent
-input bound lets num calculate worst-case row bounds and reject modular wrap.
+input bound lets the Paillier library calculate worst-case row bounds and reject
+modular wrap.
 The proof uses an independent floating-point oracle and an exact fixed-point
 oracle, so quantization error and cryptographic correctness stay separate.
 

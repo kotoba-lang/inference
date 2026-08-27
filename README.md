@@ -19,7 +19,11 @@ portable foundations for this repo.
 The JVM host includes a bounded, cryptographic encrypted-inference slice. A
 client encrypts a fixed-point hidden state with 2048-bit Paillier; the server
 uses plaintext model weights to compute encrypted candidate logits through
-`num.paillier/encrypted-matvec`; only the client decrypts and selects the token.
+`paillier.core/encrypted-matvec`; only the client decrypts and selects the token.
+The cryptographic primitive is owned by the standalone
+[`kotoba-lang/paillier`](https://github.com/kotoba-lang/paillier) library;
+`inference` owns only the LLM protocol, quantization, token selection, and proof
+receipt.
 
 ```sh
 clojure -M:verify-encrypted-lm-head

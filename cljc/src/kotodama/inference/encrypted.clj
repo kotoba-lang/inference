@@ -2,12 +2,12 @@
   "Client/server contract for an encrypted LLM output-head slice.
 
   The client encrypts a fixed-point hidden-state vector.  The server evaluates
-  candidate LM-head rows with plaintext model weights through `num.paillier`
+  candidate LM-head rows with plaintext model weights through `paillier.core`
   and returns encrypted logits.  Only the client decrypts and selects a token.
 
   This is a real Paillier PHE path for a linear LLM operation, not a claim of a
   fully homomorphic Transformer."
-  (:require [num.paillier :as phe]))
+  (:require [paillier.core :as phe]))
 
 (def ^:private wire-version 1)
 (def ^:private scheme :paillier-phe-v1)
