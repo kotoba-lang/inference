@@ -41,3 +41,21 @@
     (is (false? (:kotodama/mtp-admitted?
                  (qwen4exp/checkpoint-audit
                   (assoc config "model_type" "qwen3_5") complete-index))))))
+
+(deftest separates-real-token-correctness-from-mtp-speed
+  (is (= {:kotodama/mtp-execution-qualified? false
+          :kotodama/mtp-optimization-qualified? false
+          :kotodama/token-parity? false
+          :kotodama/off-deterministic? true
+          :kotodama/on-deterministic? false
+          :kotodama/end-to-end-speedup 0.5514117336596434
+          :kotodama/disqualification :unstable-mtp}
+         (qwen4exp/execution-qualification
+          {"off_deterministic" true
+           "on_deterministic" false
+           "token_parity" false
+           "end_to_end_speedup" 0.5514117336596434})))
+  (is (:kotodama/mtp-optimization-qualified?
+       (qwen4exp/execution-qualification
+        {:off_deterministic true :on_deterministic true
+         :token_parity true :end_to_end_speedup 1.25}))))
