@@ -283,6 +283,16 @@ route must therefore remain disabled for this artifact pair. This result does
 not reject the Qwen4Exp architecture or MTP in general; it rejects this pinned
 engine/checkpoint/quantization/device combination.
 
+The separate resident qualification is recorded in
+`verify/evidence/qwen4exp-flash-next-b70-resident-20260828.json`. B70 now serves
+the same Flash Next target at 32,768 tokens with one slot, 18 GPU layers, Q8 KV,
+and MTP disabled. A clean short request completed in 15 seconds at 6.35 prompt
+tok/s and 6.29 generation tok/s, and reboot proof observed health 200 plus fleet
+join enrollment 201. This qualifies resident short generation and restart
+recovery only. An approximately 8K-token cold agent job remained around 11--12
+prompt tok/s and exceeded the synchronous public timeout, so 32K capacity must
+not be reported as qualified synchronous 32K end-to-end service.
+
 `/api/chat` needs delimiters on the model spec, because this runtime does not
 implement Go templates and will not guess markers for a model whose real ones
 it has not read:
