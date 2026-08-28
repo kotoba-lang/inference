@@ -260,6 +260,29 @@ Both clients write the vLLM response to stdout and one JSON measurement record
 to stderr. External wall time includes client startup; `request_ms` isolates
 HTTP plus model generation.
 
+### Qwen4Exp MTP qualification on B70
+
+`kotodama.inference.qwen4exp` admits the exact Qwen4Exp MTP tensor set, but
+checkpoint completeness is not treated as proof that speculative decoding is
+correct. `execution-qualification` separately requires deterministic MTP-OFF
+and MTP-ON runs, exact emitted-token parity, and then records whether MTP
+actually improves end-to-end throughput.
+
+The reproducible B70 harness is `verify/qwen4exp-b70-bench.sh`. It runs the
+Qwen4Exp hyper-connection / sparse-MoE decoder through a commit-pinned SYCL
+host, executes the separate MTP decoder, captures raw token IDs, and restores
+the resident vLLM service even when qualification fails. The 2026-08-28
+qualification evidence is in
+`verify/evidence/qwen4exp-mtp-b70-20260828.json`.
+
+That measured IQ1_S target + Q4_K_M MTP combination is deliberately **not
+qualified**: MTP-OFF was deterministic, MTP-ON was not, all three MTP runs
+diverged from the target, aggregate draft acceptance was 4/374 (1.07%), and
+median end-to-end output throughput fell from 5.46 to 3.01 tok/s. The MTP
+route must therefore remain disabled for this artifact pair. This result does
+not reject the Qwen4Exp architecture or MTP in general; it rejects this pinned
+engine/checkpoint/quantization/device combination.
+
 `/api/chat` needs delimiters on the model spec, because this runtime does not
 implement Go templates and will not guess markers for a model whose real ones
 it has not read:

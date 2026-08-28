@@ -111,3 +111,31 @@
                     opts))
             {:kotodama/architecture :qwen4exp
              :kotodama/checkpoint-audit audit}))))
+
+(defn execution-qualification
+  "Qualify a deterministic MTP benchmark without confusing checkpoint
+  completeness with decoder correctness or speed.  `report` is the compact
+  output of `verify/qwen4exp-b70-bench.sh`.
+
+  Execution requires stable target and draft runs plus exact token parity.
+  Optimization additionally requires end-to-end speedup above 1.0."
+  [report]
+  (let [off-stable? (true? (get-key report "off_deterministic"))
+        on-stable? (true? (get-key report "on_deterministic"))
+        parity? (true? (get-key report "token_parity"))
+        speedup (double (or (get-key report "end_to_end_speedup") 0.0))
+        execution? (and off-stable? on-stable? parity?)
+        optimization? (and execution? (> speedup 1.0))]
+    {:kotodama/mtp-execution-qualified? execution?
+     :kotodama/mtp-optimization-qualified? optimization?
+     :kotodama/token-parity? parity?
+     :kotodama/off-deterministic? off-stable?
+     :kotodama/on-deterministic? on-stable?
+     :kotodama/end-to-end-speedup speedup
+     :kotodama/disqualification
+     (cond
+       (not off-stable?) :unstable-target
+       (not on-stable?) :unstable-mtp
+       (not parity?) :token-parity-failed
+       (<= speedup 1.0) :no-end-to-end-speedup
+       :else nil)}))

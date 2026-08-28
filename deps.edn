@@ -46,6 +46,9 @@
   :verify-qwen4exp-mtp
   {:extra-paths ["verify"]
    :main-opts ["-m" "kotodama.verify.qwen4exp-mtp-checkpoint"]}
+  :verify-qwen4exp-mtp-b70-evidence
+  {:extra-paths ["verify"]
+   :main-opts ["-m" "kotodama.verify.qwen4exp-mtp-b70-evidence"]}
   :verify-encrypted-lm-head
   {:extra-paths ["verify"]
    :main-opts ["-m" "kotodama.verify.encrypted-lm-head"]}
