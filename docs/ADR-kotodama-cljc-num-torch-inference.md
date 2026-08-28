@@ -143,3 +143,32 @@ cache hit on a repeated call.
 executed through a host backend that lowers layers to num-clj tensor ops; it
 now also runs a two-layer `:gemma4-block` graph through a custom num-backed host
 runner to prove the graph-level handoff for block composition.
+
+## 2026-08-28 addendum: Qwen4Exp Flash Next residency on B70
+
+The Qwen4Exp hyper-connection and sparse-MoE decoder may be admitted through a
+host runtime without promoting speculative MTP or advertised context capacity
+to a stronger qualification. The B70 resident decision is:
+
+- serve `Qwen3.8-Flash-Next-UD-IQ1_S` through the pinned SYCL llama.cpp host;
+- bind the model server to loopback and join Murakumo through the authenticated
+  worker rather than exposing the unauthenticated llama.cpp origin;
+- use one slot, 32,768 context tokens, 18 GPU layers, batch 512, ubatch 128, and
+  Q8 key/value KV cache;
+- keep MTP disabled because the separately checked MTP evidence is
+  nondeterministic, lacks token parity, and is slower than target-only decode;
+- keep the former 27B vLLM unit disabled but intact as the rollback service.
+
+This is a resident short-generation and restart-recovery qualification, not a
+synchronous long-context SLO. The clean 32K-configured request produced the
+expected content in 15 seconds at 6.35 prompt tok/s and 6.29 generation tok/s.
+After reboot, the service and Murakumo join were active and enabled, health was
+200, the server reported `n_ctx=32768`, and enrollment returned 201. A queued
+roughly 8K-token cold agent prompt processed around 11--12 prompt tok/s and the
+synchronous public request returned 502 after its operation timeout. Long
+context therefore requires an asynchronous result path, a qualified prefix
+cache, or a faster host before synchronous end-to-end service can be claimed.
+
+The machine-readable boundary is
+`verify/evidence/qwen4exp-flash-next-b70-resident-20260828.json`, checked by
+`clojure -M:verify-qwen4exp-flash-next-b70-resident`.
