@@ -3,10 +3,10 @@
  ;; resolvable as a git dep — monorepo-layout-only). Workspace-offline dev
  ;; against sibling checkouts: use the :dev alias.
  :deps {org.clojure/data.json {:mvn/version "2.5.1"}
-        io.github.kotoba-lang/num {:git/sha "cb814b1e7bf7bbc3047f98e4b432152a2b480504"}
+        io.github.kotoba-lang/num {:git/sha "03390ba9c59193d9f962cea8a9e089ceabac3858"}
         io.github.kotoba-lang/paillier
         {:git/sha "c6dad193ccdb306a02b6818ea34958c78e658570"}
-        io.github.kotoba-lang/torch {:git/sha "e986ef3047375cd9d657018b6377a08c28745a30"}
+        io.github.kotoba-lang/torch {:git/sha "54eb13bbb87eb8affeb00fc91354a67d56b2201a"}
         ;; Runtime side of the Kotoba decision cores (ADR-2608130700): execute
         ;; the precompiled KIR in resources/kotodama/oracle/. The COMPILER is
         ;; test-only (see :test) — a running server carries the interpreter,
@@ -43,6 +43,9 @@
                         :main-opts ["-m" "kotodama.verify.run-maturity"]}
   :verify-torch-num {:extra-paths ["verify"]
                      :main-opts ["-m" "kotodama.verify.torch-num-smoke"]}
+  :verify-qwen4exp-mtp
+  {:extra-paths ["verify"]
+   :main-opts ["-m" "kotodama.verify.qwen4exp-mtp-checkpoint"]}
   :verify-encrypted-lm-head
   {:extra-paths ["verify"]
    :main-opts ["-m" "kotodama.verify.encrypted-lm-head"]}
