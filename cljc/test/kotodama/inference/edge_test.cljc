@@ -20,4 +20,15 @@
                :memory-bytes (* 16 1073741824)})]
     (is (:admitted? plan))
     (is (= "murakumo-edge" (:model-id plan)))
+    (is (false? (:mtp-enabled? plan)))
     (is (some #{"--mmproj"} (:argv plan)))))
+
+(deftest builds-explicit-mtp-canary-plan
+  (let [plan (edge/mtp-replica-plan
+              {:home "/Users/a" :llama-server "/opt/llama-server"
+               :memory-bytes (* 16 1073741824)})]
+    (is (:admitted? plan))
+    (is (= "murakumo-edge-mtp-canary" (:model-id plan)))
+    (is (:mtp-enabled? plan))
+    (is (= 3 (:draft-token-count plan)))
+    (is (some #{"draft-mtp"} (:argv plan)))))
