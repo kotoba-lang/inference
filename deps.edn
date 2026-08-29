@@ -3,10 +3,10 @@
  ;; resolvable as a git dep — monorepo-layout-only). Workspace-offline dev
  ;; against sibling checkouts: use the :dev alias.
  :deps {org.clojure/data.json {:mvn/version "2.5.1"}
-        io.github.kotoba-lang/num {:git/sha "7bba3039e69cf47e5f75e82064fbca9213170a8e"}
+        io.github.kotoba-lang/num {:git/sha "250b96362e8428764a13865f93def5cd86e38237"}
         io.github.kotoba-lang/paillier
         {:git/sha "c6dad193ccdb306a02b6818ea34958c78e658570"}
-        io.github.kotoba-lang/torch {:git/sha "ce636e29ba3551c51ce6e86beaf0c8a7e5b24dbd"}
+        io.github.kotoba-lang/torch {:git/sha "71fccee26bcc2c6e5c37266455f5c3674d256968"}
         ;; Runtime side of the Kotoba decision cores (ADR-2608130700): execute
         ;; the precompiled KIR in resources/kotodama/oracle/. The COMPILER is
         ;; test-only (see :test) — a running server carries the interpreter,
