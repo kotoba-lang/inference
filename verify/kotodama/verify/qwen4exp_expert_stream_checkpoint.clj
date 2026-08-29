@@ -33,6 +33,8 @@
                    (= 512 (:kotodama/experts audit))
                    (= 10 (:kotodama/active-experts audit))
                    (= 96 (:kotodama/expert-tensor-count audit))
+                   (= 387 (:kotodama/hyper-connection-tensor-count audit))
+                   (empty? (:kotodama/hyper-connection-missing audit))
                    (= 9830400 (:kotodama/bf16-bytes-per-expert audit)))
       (throw (ex-info "published checkpoint is not the expected expert layout" audit)))
     (prn (assoc audit

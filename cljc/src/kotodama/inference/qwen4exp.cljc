@@ -73,6 +73,30 @@
               (str "model.language_model.layers." layer ".mlp.experts.down_proj")])
            (range layer-count))))
 
+(def ^:private decoder-hyper-connection-root-suffixes
+  ["hyper_connection_mixer.hc_norm.weight"
+   "hyper_connection_mixer.input_mix_weight_down.weight"
+   "hyper_connection_mixer.input_mix_weight_up.weight"])
+
+(def ^:private decoder-hyper-connection-layer-suffixes
+  ["attn_hyper_connection.block_inject_weight.weight"
+   "attn_hyper_connection.hc_norm.weight"
+   "attn_hyper_connection.input_mix_weight_down.weight"
+   "attn_hyper_connection.input_mix_weight_up.weight"
+   "mlp_hyper_connection.block_inject_weight.weight"
+   "mlp_hyper_connection.hc_norm.weight"
+   "mlp_hyper_connection.input_mix_weight_down.weight"
+   "mlp_hyper_connection.input_mix_weight_up.weight"])
+
+(defn required-decoder-hyper-connection-tensors
+  "All base-decoder Hyper-Connection tensors, distinct from the MTP head."
+  [layer-count]
+  (into (mapv #(str "model.language_model." %)
+              decoder-hyper-connection-root-suffixes)
+        (for [layer (range layer-count)
+              suffix decoder-hyper-connection-layer-suffixes]
+          (str "model.language_model.layers." layer "." suffix))))
+
 (defn expert-stream-audit
   "Fail-closed admission for lossless Expert-aware NVMe streaming.
 
@@ -89,7 +113,9 @@
         weight-map (or (get-key index "weight_map") index {})
         tensor-names (set (map name (keys weight-map)))
         required (required-expert-tensors layers)
+        hyper-required (required-decoder-hyper-connection-tensors layers)
         missing (vec (remove tensor-names required))
+        hyper-missing (vec (remove tensor-names hyper-required))
         shards (vec (sort (distinct (keep #(or (get weight-map %)
                                                (get weight-map (keyword %)))
                                           required))))
@@ -106,11 +132,15 @@
      :kotodama/active-experts active
      :kotodama/expert-axis 0
      :kotodama/expert-tensor-count (count required)
+     :kotodama/hyper-connection-tensor-count (count hyper-required)
      :kotodama/expert-shards shards
      :kotodama/expert-missing missing
+     :kotodama/hyper-connection-missing hyper-missing
      :kotodama/bf16-bytes-per-expert bf16-bytes-per-expert
      :kotodama/bf16-token-working-set-bytes (* layers active bf16-bytes-per-expert)
-     :kotodama/expert-stream-admitted? (and official-shape? (empty? missing))
+     :kotodama/expert-stream-admitted? (and official-shape?
+                                            (empty? missing)
+                                            (empty? hyper-missing))
      :kotodama/mtp-compatible? false}))
 
 (defn expert-stream-spec
@@ -121,6 +151,7 @@
       (throw (ex-info "Qwen4Exp checkpoint is not expert-stream complete" audit)))
     {:kotodama/model model
      :kotodama/architecture :qwen4exp
+     :kotodama/decoder :qwen4exp-hyper-connection-moe
      :kotodama/execution :expert-aware-nvme
      :kotodama/expert-stream
      (merge {:kotodama/lossless? true
