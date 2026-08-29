@@ -75,6 +75,8 @@
     "evidence": "verify/evidence/qwen4exp-flash-next-b70-resident-20260828.json"
   },
   "final_resident_state": {
+    "snapshot_kind": "comparison-end",
+    "not_current_state_claim": true,
     "flash_next_service_active": true,
     "flash_next_service_enabled": true,
     "join_service_active": true,
@@ -82,5 +84,20 @@
     "health_http_status": 200,
     "reported_context_tokens": 32768,
     "temporary_vllm_image_removed": true
+  },
+  "post_record_live_check": {
+    "observed_at": "2026-08-29T00:36:40Z",
+    "flash_next_service_active": false,
+    "flash_next_service_enabled": false,
+    "llama_27b_service_active": true,
+    "llama_27b_service_enabled": true,
+    "join_service_active": true,
+    "join_service_enabled": true,
+    "health_http_status": 200,
+    "reported_context_tokens": 32768,
+    "model_path": "/home/jun/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf",
+    "model_alias": "qwen3.8-27b-throughput-b70",
+    "join_enrollment": "ubuntu-server-b70-27b",
+    "qualification_effect": "This later resident switch does not change the three-runtime Qwen3.8-Flash-Next compatibility result."
   }
 }

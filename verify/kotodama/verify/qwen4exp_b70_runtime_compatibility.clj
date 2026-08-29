@@ -12,7 +12,8 @@
         runtimes (get evidence "runtimes")
         comparison (get evidence "comparison")
         control (get evidence "control")
-        resident (get evidence "final_resident_state")]
+        resident (get evidence "final_resident_state")
+        post-record (get evidence "post_record_live_check")]
     (when-not (and (= "qwen4_exp" (get target "model_type"))
                    (= "Intel(R) Arc(TM) Pro B70 Graphics" (get node "gpu"))
                    (= 32656 (get node "gpu_memory_mib"))
@@ -29,10 +30,20 @@
                    (false? (get comparison "unsupported_is_zero_throughput"))
                    (false? (get control "ranking_member"))
                    (pos? (get control "generation_tok_s"))
+                   (= "comparison-end" (get resident "snapshot_kind"))
+                   (true? (get resident "not_current_state_claim"))
                    (true? (get resident "flash_next_service_active"))
                    (true? (get resident "join_service_active"))
                    (= 200 (get resident "health_http_status"))
-                   (= 32768 (get resident "reported_context_tokens")))
+                   (= 32768 (get resident "reported_context_tokens"))
+                   (false? (get post-record "flash_next_service_active"))
+                   (false? (get post-record "flash_next_service_enabled"))
+                   (true? (get post-record "llama_27b_service_active"))
+                   (true? (get post-record "llama_27b_service_enabled"))
+                   (true? (get post-record "join_service_active"))
+                   (= 200 (get post-record "health_http_status"))
+                   (= "qwen3.8-27b-throughput-b70"
+                      (get post-record "model_alias")))
       (throw (ex-info "B70 runtime evidence crossed its qualification boundary"
                       comparison)))
     (prn {:target (get target "model_type")
