@@ -75,7 +75,9 @@
          (map-indexed (fn [i tensor]
                         [tensor (str "model-" (inc (mod i 131))
                                      "-of-00131.safetensors")])
-                      (qwen4exp/required-expert-tensors 48)))})
+                      (concat
+                       (qwen4exp/required-expert-tensors 48)
+                       (qwen4exp/required-decoder-hyper-connection-tensors 48))))})
 
 (deftest admits-only-the-exact-flash-next-expert-layout
   (let [audit (qwen4exp/expert-stream-audit flash-next-config complete-expert-index)
@@ -84,10 +86,13 @@
                                          {:kotodama/cache-mib 2048})]
     (is (:kotodama/expert-stream-admitted? audit))
     (is (= 96 (:kotodama/expert-tensor-count audit)))
+    (is (= 387 (:kotodama/hyper-connection-tensor-count audit)))
+    (is (empty? (:kotodama/hyper-connection-missing audit)))
     (is (= 9830400 (:kotodama/bf16-bytes-per-expert audit)))
     (is (= 4718592000 (:kotodama/bf16-token-working-set-bytes audit)))
     (is (false? (:kotodama/mtp-compatible? audit)))
     (is (true? (get-in spec [:kotodama/expert-stream :kotodama/lossless?])))
+    (is (= :qwen4exp-hyper-connection-moe (:kotodama/decoder spec)))
     (is (false? (get-in spec [:kotodama/expert-stream :kotodama/mtp-enabled?]))))
   (is (false? (:kotodama/expert-stream-admitted?
                (qwen4exp/expert-stream-audit
