@@ -59,3 +59,62 @@
        (qwen4exp/execution-qualification
         {:off_deterministic true :on_deterministic true
          :token_parity true :end_to_end_speedup 1.25}))))
+
+(def flash-next-config
+  {"architectures" ["Qwen4ExpForConditionalGeneration"]
+   "model_type" "qwen4_exp"
+   "text_config" {"num_hidden_layers" 48
+                   "num_experts" 512
+                   "num_experts_per_tok" 10
+                   "hidden_size" 2560
+                   "moe_intermediate_size" 640}})
+
+(def complete-expert-index
+  {"weight_map"
+   (into {}
+         (map-indexed (fn [i tensor]
+                        [tensor (str "model-" (inc (mod i 131))
+                                     "-of-00131.safetensors")])
+                      (qwen4exp/required-expert-tensors 48)))})
+
+(deftest admits-only-the-exact-flash-next-expert-layout
+  (let [audit (qwen4exp/expert-stream-audit flash-next-config complete-expert-index)
+        spec (qwen4exp/expert-stream-spec "Qwen/Qwen3.8-Flash-Next"
+                                         flash-next-config complete-expert-index
+                                         {:kotodama/cache-mib 2048})]
+    (is (:kotodama/expert-stream-admitted? audit))
+    (is (= 96 (:kotodama/expert-tensor-count audit)))
+    (is (= 9830400 (:kotodama/bf16-bytes-per-expert audit)))
+    (is (= 4718592000 (:kotodama/bf16-token-working-set-bytes audit)))
+    (is (false? (:kotodama/mtp-compatible? audit)))
+    (is (true? (get-in spec [:kotodama/expert-stream :kotodama/lossless?])))
+    (is (false? (get-in spec [:kotodama/expert-stream :kotodama/mtp-enabled?]))))
+  (is (false? (:kotodama/expert-stream-admitted?
+               (qwen4exp/expert-stream-audit
+                (assoc-in flash-next-config ["text_config" "num_experts"] 256)
+                complete-expert-index))))
+  (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                        #"not expert-stream complete"
+                        (qwen4exp/expert-stream-spec
+                         "missing" flash-next-config {"weight_map" {}} {}))))
+
+(deftest qualifies-streaming-correctness-before-speed
+  (let [qualified (qwen4exp/expert-stream-qualification
+                   {"baseline_token_ids" [1 2 3]
+                    "streamed_token_ids" [1 2 3]
+                    "streamed_deterministic" true
+                    "active_experts" 10
+                    "drop_cold_experts" 0.0
+                    "page_cache_bypassed" false
+                    "baseline_tok_s" 0.4
+                    "streamed_tok_s" 1.2})]
+    (is (:kotodama/expert-stream-execution-qualified? qualified))
+    (is (:kotodama/expert-stream-speed-qualified? qualified))
+    (is (< 2.99 (:kotodama/end-to-end-speedup qualified) 3.01))
+    (is (false? (:kotodama/page-cache-bypassed? qualified))))
+  (is (= :token-parity-failed
+         (:kotodama/disqualification
+          (qwen4exp/expert-stream-qualification
+           {:baseline_token_ids [1] :streamed_token_ids [2]
+            :streamed_deterministic true :active_experts 10
+            :baseline_tok_s 1.0 :streamed_tok_s 2.0})))))
