@@ -61,6 +61,110 @@
               suffix mtp-layer-suffixes]
           (str "mtp.layers." layer "." suffix))))
 
+(defn required-expert-tensors
+  "Packed routed-expert tensors required by the target decoder.
+
+  Qwen4Exp stores the expert axis first. A host may therefore read exactly one
+  expert from each packed tensor without materialising the other 511."
+  [layer-count]
+  (vec
+   (mapcat (fn [layer]
+             [(str "model.language_model.layers." layer ".mlp.experts.gate_up_proj")
+              (str "model.language_model.layers." layer ".mlp.experts.down_proj")])
+           (range layer-count))))
+
+(defn expert-stream-audit
+  "Fail-closed admission for lossless Expert-aware NVMe streaming.
+
+  This is deliberately separate from MTP admission: the streaming seam is
+  single-token decode (`n=1`), while MTP verifies multiple draft rows."
+  [config index]
+  (let [text (text-config config)
+        model-type (or (get-key config "model_type") (get-key text "model_type"))
+        layers (long (or (get-key text "num_hidden_layers") 0))
+        experts (long (or (get-key text "num_experts") 0))
+        active (long (or (get-key text "num_experts_per_tok") 0))
+        hidden (long (or (get-key text "hidden_size") 0))
+        moe-inter (long (or (get-key text "moe_intermediate_size") 0))
+        weight-map (or (get-key index "weight_map") index {})
+        tensor-names (set (map name (keys weight-map)))
+        required (required-expert-tensors layers)
+        missing (vec (remove tensor-names required))
+        shards (vec (sort (distinct (keep #(or (get weight-map %)
+                                               (get weight-map (keyword %)))
+                                          required))))
+        official-shape? (and (= "qwen4_exp" model-type)
+                             (= 48 layers) (= 512 experts) (= 10 active)
+                             (= 2560 hidden) (= 640 moe-inter))
+        ;; Official checkpoint is BF16. Each routed expert has a fused
+        ;; [2*inter, hidden] gate/up plus [hidden, inter] down matrix.
+        bf16-bytes-per-expert (* 2 (+ (* 2 moe-inter hidden)
+                                      (* hidden moe-inter)))]
+    {:kotodama/architecture :qwen4exp
+     :kotodama/layers layers
+     :kotodama/experts experts
+     :kotodama/active-experts active
+     :kotodama/expert-axis 0
+     :kotodama/expert-tensor-count (count required)
+     :kotodama/expert-shards shards
+     :kotodama/expert-missing missing
+     :kotodama/bf16-bytes-per-expert bf16-bytes-per-expert
+     :kotodama/bf16-token-working-set-bytes (* layers active bf16-bytes-per-expert)
+     :kotodama/expert-stream-admitted? (and official-shape? (empty? missing))
+     :kotodama/mtp-compatible? false}))
+
+(defn expert-stream-spec
+  "Create the exact lossless streaming contract consumed by torch/murakumo."
+  [model config index opts]
+  (let [audit (expert-stream-audit config index)]
+    (when-not (:kotodama/expert-stream-admitted? audit)
+      (throw (ex-info "Qwen4Exp checkpoint is not expert-stream complete" audit)))
+    {:kotodama/model model
+     :kotodama/architecture :qwen4exp
+     :kotodama/execution :expert-aware-nvme
+     :kotodama/expert-stream
+     (merge {:kotodama/lossless? true
+             :kotodama/drop-cold-experts 0.0
+             :kotodama/active-experts (:kotodama/active-experts audit)
+             :kotodama/io-threads 4
+             :kotodama/prefetch-layers 0
+             :kotodama/mtp-enabled? false}
+            opts)
+     :kotodama/checkpoint-audit audit}))
+
+(defn expert-stream-qualification
+  "Qualify one resident-vs-streamed benchmark report.
+
+  Speed is only comparable after exact token parity and lossless settings.
+  `page_cache_bypassed` is recorded separately because macOS has no O_DIRECT."
+  [report]
+  (let [baseline (vec (or (get-key report "baseline_token_ids") []))
+        streamed (vec (or (get-key report "streamed_token_ids") []))
+        deterministic? (true? (get-key report "streamed_deterministic"))
+        lossless? (and (= baseline streamed)
+                       (zero? (double (or (get-key report "drop_cold_experts") 0.0)))
+                       (= 10 (long (or (get-key report "active_experts") 0))))
+        baseline-tps (double (or (get-key report "baseline_tok_s") 0.0))
+        streamed-tps (double (or (get-key report "streamed_tok_s") 0.0))
+        speedup (if (pos? baseline-tps) (/ streamed-tps baseline-tps) 0.0)
+        execution? (and deterministic? lossless? (pos? streamed-tps))]
+    {:kotodama/expert-stream-execution-qualified? execution?
+     :kotodama/expert-stream-speed-qualified? (and execution? (> speedup 1.0))
+     :kotodama/token-parity? (= baseline streamed)
+     :kotodama/lossless-settings? lossless?
+     :kotodama/page-cache-bypassed? (true? (get-key report "page_cache_bypassed"))
+     :kotodama/baseline-tok-s baseline-tps
+     :kotodama/streamed-tok-s streamed-tps
+     :kotodama/end-to-end-speedup speedup
+     :kotodama/disqualification
+     (cond
+       (not deterministic?) :unstable-stream
+       (not= baseline streamed) :token-parity-failed
+       (not lossless?) :lossy-settings
+       (not (pos? streamed-tps)) :no-real-generation
+       (<= speedup 1.0) :no-end-to-end-speedup
+       :else nil)}))
+
 (defn checkpoint-audit
   "Return a fail-closed Qwen4Exp MTP checkpoint audit.
 
