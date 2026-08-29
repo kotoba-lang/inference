@@ -301,6 +301,11 @@ The checked limits are architecture/backend admission and memory capacity; the
 6.29 generation tok/s SYCL llama.cpp resident result above is only a control
 and is not used to rank those three runtimes.
 
+The evidence keeps the comparison-end resident snapshot separate from current
+operations. A 2026-08-29 closing check observed Flash Next inactive/disabled
+and the 27B llama.cpp service active/enabled on port 8090. That later switch is
+recorded, but it does not change the three Flash Next runtime `N/A` results.
+
 `/api/chat` needs delimiters on the model spec, because this runtime does not
 implement Go templates and will not guess markers for a model whose real ones
 it has not read:

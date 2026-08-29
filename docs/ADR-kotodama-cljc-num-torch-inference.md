@@ -206,6 +206,14 @@ into the requested runtime ranking: the separately recorded clean 32K resident
 request measured 6.35 prompt tok/s and 6.29 generation tok/s. The comparison
 did not stop or replace that resident. Final observation retained active and
 enabled Flash Next and Murakumo join services, health 200, and `n_ctx=32768`.
+That sentence is a timestamped comparison-end observation, not a continuing
+desired-state assertion. A closing live check at 2026-08-29T00:36:40Z found
+`murakumo-b70-flash-next.service` inactive and disabled, while
+`murakumo-b70-llama.service` and the join service were active and enabled. Port
+8090 was healthy with `n_ctx=32768`, but served the separate
+`Qwen3.8-27B-Q4_K_M` artifact as `qwen3.8-27b-throughput-b70`; join enrollment
+was `ubuntu-server-b70-27b`. This later resident switch does not turn any of the
+three Flash Next runtime checks into a generation or tok/s qualification.
 
 The machine-readable boundary is
 `verify/evidence/qwen4exp-b70-runtime-compatibility-20260829.json`, checked by
