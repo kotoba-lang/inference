@@ -52,6 +52,9 @@
   :verify-qwen4exp-flash-next-b70-resident
   {:extra-paths ["verify"]
    :main-opts ["-m" "kotodama.verify.qwen4exp-flash-next-b70-resident"]}
+  :verify-qwen4exp-b70-runtime-compatibility
+  {:extra-paths ["verify"]
+   :main-opts ["-m" "kotodama.verify.qwen4exp-b70-runtime-compatibility"]}
   :verify-encrypted-lm-head
   {:extra-paths ["verify"]
    :main-opts ["-m" "kotodama.verify.encrypted-lm-head"]}
