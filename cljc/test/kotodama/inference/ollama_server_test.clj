@@ -1,5 +1,5 @@
 (ns kotodama.inference.ollama-server-test
-  (:require [clojure.data.json :as json]
+  (:require [json.data-json :as json]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [kotodama.inference.host.ollama-server :as server])

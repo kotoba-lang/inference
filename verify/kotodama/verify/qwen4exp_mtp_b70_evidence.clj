@@ -1,6 +1,6 @@
 (ns kotodama.verify.qwen4exp-mtp-b70-evidence
   "Verify the checked-in B70 observation as a disqualification record."
-  (:require [clojure.data.json :as json]
+  (:require [json.data-json :as json]
             [kotodama.inference.qwen4exp :as qwen4exp]))
 
 (defn -main [& _]

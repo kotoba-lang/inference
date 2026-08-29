@@ -1,7 +1,7 @@
 (ns kotodama.verify.qwen4exp-flash-next-b70-resident
   "Verify the checked-in B70 resident observation without promoting capacity to
   synchronous long-context qualification."
-  (:require [clojure.data.json :as json]))
+  (:require [json.data-json :as json]))
 
 (defn -main [& _]
   (let [evidence (json/read-str
