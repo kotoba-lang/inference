@@ -264,7 +264,8 @@ HTTP plus model generation.
 
 The same namespace now admits Expert-aware NVMe streaming independently of
 MTP. `expert-stream-audit` verifies the official 48-layer, 512-expert,
-top-10 packed expert layout and all 96 routed tensors. For the BF16 source it
+top-10 packed expert layout, all 96 routed tensors, and all 387 base-decoder
+Hyper-Connection tensors before naming the decoder executable. For the BF16 source it
 derives 9,830,400 bytes per expert and a 4,718,592,000-byte worst-case routed
 working set per token; GGUF runtimes must measure their quantized value rather
 than reuse the BF16 number. The streaming contract is lossless and keeps MTP
