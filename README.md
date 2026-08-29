@@ -293,6 +293,14 @@ recovery only. An approximately 8K-token cold agent job remained around 11--12
 prompt tok/s and exceeded the synchronous public timeout, so 32K capacity must
 not be reported as qualified synchronous 32K end-to-end service.
 
+The B70 runtime compatibility record is
+`verify/evidence/qwen4exp-b70-runtime-compatibility-20260829.json`. SGLang,
+KTransformers, and vLLM did not reach model-specific generation for this exact
+Qwen4Exp checkpoint on Intel XPU, so their B70 tok/s values are `N/A`, not zero.
+The checked limits are architecture/backend admission and memory capacity; the
+6.29 generation tok/s SYCL llama.cpp resident result above is only a control
+and is not used to rank those three runtimes.
+
 `/api/chat` needs delimiters on the model spec, because this runtime does not
 implement Go templates and will not guess markers for a model whose real ones
 it has not read:

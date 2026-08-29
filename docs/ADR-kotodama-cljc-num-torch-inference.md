@@ -172,3 +172,41 @@ cache, or a faster host before synchronous end-to-end service can be claimed.
 The machine-readable boundary is
 `verify/evidence/qwen4exp-flash-next-b70-resident-20260828.json`, checked by
 `clojure -M:verify-qwen4exp-flash-next-b70-resident`.
+
+## 2026-08-29 addendum: B70 runtime comparison is not numerically qualified
+
+SGLang, KTransformers, and vLLM were checked for the exact
+`Qwen/Qwen3.8-Flash-Next` Qwen4Exp model on the single Arc Pro B70 resident
+node. No runtime reached model-specific token generation, so none has a valid
+B70 tok/s value and no speed ranking is recorded. Unsupported startup is
+`N/A`, not zero throughput.
+
+The independent gates were:
+
+- SGLang's day-zero Flash Next support was not in a tagged release and its
+  deployment matrix covered NVIDIA and AMD, not Intel XPU.
+- KTransformers main at `948129159aa750075a0264aca16dba061cc6e6ae` had no
+  Qwen4Exp/Flash Next model implementation or optimization rule. Its documented
+  Intel XPU path was beta and did not support serving.
+- The current B70 XPU image for vLLM ran as vLLM 0.28.0 with PyTorch
+  2.13.0+xpu and detected the Arc Pro B70, but its model registry contained no
+  Qwen4Exp architecture. The separate Flash Next recipe required a newer
+  dedicated image and explicitly excluded XPU/TPU from the initial
+  implementation.
+
+Capacity is a second, independent failure gate. The node had 32,656 MiB GPU
+memory and 15 GiB system memory. The official vLLM recipe described 172.78 GiB
+of FP8 weights, 335.28 GiB of BF16 weights, and at least 51 GB of host memory
+plus headroom for N-gram embedding offload. The resident IQ1_S GGUF was about
+72.5 GB, but that artifact was not an admitted Qwen4Exp input for any of the
+three checked B70 paths.
+
+The existing SYCL llama.cpp result remains a control, not a fourth row promoted
+into the requested runtime ranking: the separately recorded clean 32K resident
+request measured 6.35 prompt tok/s and 6.29 generation tok/s. The comparison
+did not stop or replace that resident. Final observation retained active and
+enabled Flash Next and Murakumo join services, health 200, and `n_ctx=32768`.
+
+The machine-readable boundary is
+`verify/evidence/qwen4exp-b70-runtime-compatibility-20260829.json`, checked by
+`clojure -M:verify-qwen4exp-b70-runtime-compatibility`.
