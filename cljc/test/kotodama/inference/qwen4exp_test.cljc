@@ -83,7 +83,8 @@
   (let [audit (qwen4exp/expert-stream-audit flash-next-config complete-expert-index)
         spec (qwen4exp/expert-stream-spec "Qwen/Qwen3.8-Flash-Next"
                                          flash-next-config complete-expert-index
-                                         {:kotodama/cache-mib 2048})]
+                                         {:kotodama/cache-mib 2048
+                                          :kotodama/gpu-layers 0})]
     (is (:kotodama/expert-stream-admitted? audit))
     (is (= 96 (:kotodama/expert-tensor-count audit)))
     (is (= 387 (:kotodama/hyper-connection-tensor-count audit)))
@@ -92,6 +93,12 @@
     (is (= 4718592000 (:kotodama/bf16-token-working-set-bytes audit)))
     (is (false? (:kotodama/mtp-compatible? audit)))
     (is (true? (get-in spec [:kotodama/expert-stream :kotodama/lossless?])))
+    (is (= {:kotodama/gpu-layers 0
+            :kotodama/expert-buffer :cpu
+            :kotodama/ple-buffer :cpu
+            :kotodama/non-expert-buffer :metal-eligible}
+           (:kotodama/placement spec)))
+    (is (nil? (get-in spec [:kotodama/expert-stream :kotodama/gpu-layers])))
     (is (= :qwen4exp-hyper-connection-moe (:kotodama/decoder spec)))
     (is (false? (get-in spec [:kotodama/expert-stream :kotodama/mtp-enabled?]))))
   (is (false? (:kotodama/expert-stream-admitted?

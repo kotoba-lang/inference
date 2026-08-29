@@ -146,13 +146,22 @@
 (defn expert-stream-spec
   "Create the exact lossless streaming contract consumed by torch/murakumo."
   [model config index opts]
-  (let [audit (expert-stream-audit config index)]
+  (let [audit (expert-stream-audit config index)
+        gpu-layers (long (or (:kotodama/gpu-layers opts) 0))]
     (when-not (:kotodama/expert-stream-admitted? audit)
       (throw (ex-info "Qwen4Exp checkpoint is not expert-stream complete" audit)))
+    (when (neg? gpu-layers)
+      (throw (ex-info "Qwen4Exp gpu-layers must be non-negative"
+                      {:kotodama/gpu-layers gpu-layers})))
     {:kotodama/model model
      :kotodama/architecture :qwen4exp
      :kotodama/decoder :qwen4exp-hyper-connection-moe
      :kotodama/execution :expert-aware-nvme
+     :kotodama/placement
+     {:kotodama/gpu-layers gpu-layers
+      :kotodama/expert-buffer :cpu
+      :kotodama/ple-buffer :cpu
+      :kotodama/non-expert-buffer :metal-eligible}
      :kotodama/expert-stream
      (merge {:kotodama/lossless? true
              :kotodama/drop-cold-experts 0.0
@@ -160,7 +169,7 @@
              :kotodama/io-threads 4
              :kotodama/prefetch-layers 0
              :kotodama/mtp-enabled? false}
-            opts)
+            (dissoc opts :kotodama/gpu-layers))
      :kotodama/checkpoint-audit audit}))
 
 (defn expert-stream-qualification
