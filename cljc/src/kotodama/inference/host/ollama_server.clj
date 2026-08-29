@@ -10,7 +10,7 @@
   `kotoba/*_core.kotoba` and are executed through
   `kotodama.inference.host.oracle` (ADR-2608138800). What is here is transport:
   sockets, JSON, threads, locks, and the clock."
-  (:require [clojure.data.json :as json]
+  (:require [json.data-json :as json]
             [clojure.string :as str]
             [kotodama.inference.host.jvm :as host]
             [kotodama.inference.host.oracle :as oracle])

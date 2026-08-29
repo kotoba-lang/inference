@@ -3,7 +3,7 @@
   model shards. This gate proves identity, exact tensor coverage, and the
   minimal shard acquisition set; it does not claim that the MTP decoder layer
   has executed."
-  (:require [clojure.data.json :as json]
+  (:require [json.data-json :as json]
             [kotodama.inference.qwen4exp :as qwen4exp])
   (:import [java.net URI]
            [java.net.http HttpClient HttpRequest HttpResponse$BodyHandlers]

@@ -1,7 +1,7 @@
 (ns kotodama.verify.qwen4exp-b70-runtime-compatibility
   "Verify that unsupported B70 runtime checks remain N/A instead of becoming a
   fabricated zero-throughput ranking."
-  (:require [clojure.data.json :as json]))
+  (:require [json.data-json :as json]))
 
 (defn -main [& _]
   (let [evidence (json/read-str

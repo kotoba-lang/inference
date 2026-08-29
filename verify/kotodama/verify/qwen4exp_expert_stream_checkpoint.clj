@@ -1,6 +1,6 @@
 (ns kotodama.verify.qwen4exp-expert-stream-checkpoint
   "Verify the exact official routed-expert index without downloading weights."
-  (:require [clojure.data.json :as json]
+  (:require [json.data-json :as json]
             [kotodama.inference.qwen4exp :as qwen4exp])
   (:import [java.net URI]
            [java.net.http HttpClient HttpRequest HttpResponse$BodyHandlers]
