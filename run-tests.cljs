@@ -37,12 +37,21 @@
   scanning the test path and a cljs runner cannot, so one left off this list
   would silently never run rather than fail.
 
-    nbb --classpath \"$(clojure -Spath -M:test)\" run-tests.cljs"
+    nbb --classpath 'scripts:$(clojure -Spath -M:test)' run-tests.cljs
+
+  (The JVM classpath is the pre-existing, test-only mechanism carrying this
+  repo's cljc sources, tests and git deps; `scripts` is prepended so this
+  runner can also require kotodama.oracle-gen — scripts/kotodama/oracle_gen.cljs,
+  the Kotoba CLI build path pinned by nbb.edn, which needs no JVM classpath of
+  its own — and re-check that every kotoba/*_core.kotoba still compiles
+  byte-for-byte to the shipped oracle artifact, the same authority gate the
+  JVM suite asserts through kotodama.inference.ollama-kotoba-parity-test.)"
   (:require [cljs.test :as t]
             [kotodama.inference.mlx :as mlx]
             [kotodama.inference.tokenizer :as tokenizer]
             [kotodama.inference.core-test]
-            [kotodama.inference.shard-test]))
+            [kotodama.inference.shard-test]
+            [kotodama.oracle-gen :as oracle-gen]))
 
 (defmethod t/report [:cljs.test/default :end-run-tests] [m]
   (println (str "\nnbb: " (:test m) " tests, " (:pass m) " passed, "
@@ -98,3 +107,22 @@
 
 (t/run-tests 'kotodama.inference.core-test
              'kotodama.inference.shard-test)
+
+;; The Kotoba CLI build path's parity gate (scripts/kotodama/oracle_gen.cljs,
+;; pinned by nbb.edn): every kotoba/*_core.kotoba compiled JVM-free under nbb
+;; must equal the shipped resources/kotodama/oracle/*.kir.edn byte-for-byte —
+;; the same authority assertion `clojure -M:test` makes through
+;; kotodama.inference.ollama-kotoba-parity-test, from a second runtime.
+(let [fs (js/require "fs")
+      artifacts (oracle-gen/discover-artifacts)
+      drift (atom 0)]
+  (doseq [art artifacts]
+    (let [fresh (oracle-gen/compile-kir-text
+                 (.readFileSync fs (:source art) "utf8"))]
+      (when-not (= fresh (.readFileSync fs (:out art) "utf8"))
+        (swap! drift inc)
+        (println (str "KIR PARITY FAIL: " (:source art) " != " (:out art))))))
+  (println (str "nbb kotoba-cli build path: " (count artifacts)
+                " cores checked, " @drift " drifting"))
+  (when (pos? @drift)
+    (set! (.-exitCode js/process) 1)))

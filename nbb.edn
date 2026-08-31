@@ -1,0 +1,3 @@
+{:deps {io.github.kotoba-lang/amu
+        {:git/url "https://github.com/kotoba-lang/amu.git"
+         :git/sha "e78241dca15000f6bb3976e97f493c70b0137dcf"}}}
