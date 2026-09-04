@@ -371,6 +371,27 @@ clojure -M:test        # includes the parity gate: shipped artifact == fresh
                        # native-boundary admission
 ```
 
+### JVM-free build path (opt-in)
+
+The same artifact can be compiled with no JVM at all.
+`nbb.edn` pins `io.github.kotoba-lang/amu` to the **same :git/sha the `:test`
+alias carries**, and `scripts/kotodama/oracle_gen.cljs` runs that compiler's
+pipeline (analyze → admission → lower) under nbb/Node:
+
+```sh
+nbb scripts/kotodama/oracle_gen.cljs         # parity gate: all 7 cores must
+                                             #   compile byte-identical to the
+                                             #   shipped artifacts (exit 1 on drift)
+nbb scripts/kotodama/oracle_gen.cljs --write # regenerate the shipped artifacts
+```
+
+The nbb route is byte-compatible with the JVM route on purpose: the KIR text it
+writes is identical to what `clojure -M:test:gen` writes, verified across all
+seven cores (2026-09-01). `nbb run-tests.cljs` (see run-tests.cljs) re-checks
+the same gate JVM-free. The JVM commands above remain the authority and are
+unchanged; rollback is one command — `git rm nbb.edn scripts/kotodama/oracle_gen.cljs`.
+nbb caches its resolved deps under `.nbb/` in the working tree (untracked).
+
 Editing a core without regenerating is caught by the parity gate, not by the
 semantics tests — those run against the shipped artifact and would keep
 passing. Both failure modes are demonstrated in ADR-2608138800.
