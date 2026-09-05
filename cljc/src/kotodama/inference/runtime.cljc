@@ -3,7 +3,8 @@
   public surface people normally reach for through model runtimes: model,
   session, generate, and forward are plain EDN maps. Model graphs are torch-clj
   data; tensor execution is num-clj over an injected backend such as WGSL/WebGPU."
-  (:require [torch.model :as torch]))
+  (:require [torch.model :as torch]
+            [torch.device-profile :as device-profile]))
 
 (def supported-backends #{:webgpu :webgl :wasm :native})
 (def supported-adapter-kinds #{:browser :wasm :native :remote :edge})
@@ -22,6 +23,7 @@
                             :diffusion/euler
                             :diffusion/euler-a
                             :diffusion/dpm-solver})
+(def supported-execution-intents #{:latency :throughput :fallback})
 
 (def distributed-defaults
   {:kotodama/distributed? false
@@ -46,6 +48,26 @@
   their local decoder implementation."
   ([] default-generation)
   ([opts] (merge default-generation opts)))
+
+(defn performance
+  "Resolve a physical adapter into portable serving data.
+
+  Hosts may override the returned measurements after a local benchmark, but
+  the execution intent and hardware prerequisites remain explicit in the
+  runtime spec."
+  ([adapter] (performance adapter :latency))
+  ([adapter intent]
+   (when-not (contains? supported-execution-intents intent)
+     (throw (ex-info "unsupported inference execution intent" {:intent intent})))
+   (let [profile (device-profile/serving-profile adapter intent)]
+     {:kotodama/execution-intent intent
+      :kotodama/device (:torch/device profile)
+      :kotodama/max-running (:torch/max-running profile)
+      :kotodama/batch-size (:torch/batch-size profile)
+      :kotodama/ubatch-size (:torch/ubatch-size profile)
+      :kotodama/flash-attention? (:torch/flash-attention? profile)
+      :kotodama/speculative (:torch/speculative profile)
+      :kotodama/host-prerequisites (:torch/host-prerequisites profile)})))
 
 (defn distributed
   "Distributed inference execution options, intentionally expressed as data so
@@ -104,7 +126,17 @@
                                :kotodama/local-files-only?
                                :kotodama/tokenizer
                                :kotodama/distributed
-                               :kotodama/mtp])))))
+                               :kotodama/mtp
+                               :kotodama/performance])))))
+
+(defn optimized-transformer
+  "Build a transformer spec with a measured hardware serving profile."
+  ([model adapter] (optimized-transformer model adapter :latency {}))
+  ([model adapter intent] (optimized-transformer model adapter intent {}))
+  ([model adapter intent opts]
+   (transformer model
+                (assoc opts :kotodama/performance
+                       (performance adapter intent)))))
 
 (defn mtp-transformer
   "Spec for multi-token prediction LLM execution. Hosts may lower the same

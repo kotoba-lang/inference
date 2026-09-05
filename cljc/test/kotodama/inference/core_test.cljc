@@ -35,6 +35,26 @@
       (is (= :num/wgsl (:kotodama/compute-backend spec)))
       (is (= :sequential (:torch/module (:kotodama/model-graph spec)))))))
 
+(deftest optimized-runtime-specs-carry-measured-serving-intent
+  (let [b70 (rt/optimized-transformer "qwen3.8-27b"
+                                      "Intel Arc Pro B70 8086:e223"
+                                      :latency)
+        strix (rt/optimized-transformer "qwen3.8-27b"
+                                        "Radeon 8060S gfx1151"
+                                        :throughput)
+        xavier (rt/optimized-transformer "qwen3.8-27b"
+                                         "Jetson AGX Xavier tegra194"
+                                         :fallback)]
+    (is (= 1 (get-in b70 [:kotodama/performance :kotodama/max-running])))
+    (is (= {:type :mtp :draft-token-count 3}
+           (get-in b70 [:kotodama/performance :kotodama/speculative])))
+    (is (= 2 (get-in strix [:kotodama/performance :kotodama/max-running])))
+    (is (= #{:max-performance-power-mode :locked-clocks}
+           (get-in xavier [:kotodama/performance :kotodama/host-prerequisites])))
+    (is (empty? (validate/problems (rt/load-op b70))))
+    (is (empty? (validate/problems (rt/load-op strix))))
+    (is (empty? (validate/problems (rt/load-op xavier))))))
+
 (deftest multimodal-runtime-specs-are-data
   (testing "distributed and MTP transformer specs"
     (let [distributed (rt/distributed-transformer "gemma4:e4b"
