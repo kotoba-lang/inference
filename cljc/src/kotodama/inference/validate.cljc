@@ -15,6 +15,9 @@
         distributed (:kotodama/distributed runtime-spec)
         tensor-parallel-size (:kotodama/tensor-parallel-size distributed)
         pipeline-parallel-size (:kotodama/pipeline-parallel-size distributed)
+        performance (:kotodama/performance runtime-spec)
+        execution-intent (:kotodama/execution-intent performance)
+        max-running (:kotodama/max-running performance)
         scheduler (:kotodama/scheduler runtime-spec)]
     (cond-> []
       (not (contains? runtime/supported-runtimes rt))
@@ -62,6 +65,18 @@
       (conj (problem :distributed/parallel-size
                      "distributed tensor/pipeline parallel sizes must be positive integers"
                      {:kotodama/distributed distributed}))
+
+      (and performance
+           (not (contains? runtime/supported-execution-intents execution-intent)))
+      (conj (problem :performance/execution-intent
+                     "unsupported inference execution intent"
+                     {:kotodama/execution-intent execution-intent}))
+
+      (and performance
+           (or (not (integer? max-running)) (not (pos? max-running))))
+      (conj (problem :performance/max-running
+                     "optimized inference max-running must be a positive integer"
+                     {:kotodama/max-running max-running}))
 
       (and (= rt :torch-diffusion)
            (not (contains? #{:image-generation :image-to-image} task)))

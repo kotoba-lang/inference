@@ -14,6 +14,13 @@ The core foundation is `kotoba-lang/torch` plus `kotoba-lang/num`. JavaScript
 model runtimes such as Transformers.js, ONNX, and ONNX Runtime Web are not
 portable foundations for this repo.
 
+`kotodama.inference.runtime/optimized-transformer` carries measured device
+tuning through the portable runtime contract. An adapter is resolved by num,
+translated into scheduler settings by torch, then attached here as explicit
+`:latency`, `:throughput`, or `:fallback` intent. This prevents a host from
+silently treating Xavier like B70 or applying Strix's two-slot throughput
+profile to a latency-sensitive request.
+
 ## Encrypted LM-head proof
 
 The JVM host includes a bounded, cryptographic encrypted-inference slice. A
