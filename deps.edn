@@ -11,8 +11,8 @@
         ;; the precompiled KIR in resources/kotodama/oracle/. The COMPILER is
         ;; test-only (see :test) — a running server carries the interpreter,
         ;; not the toolchain.
-        io.github.kotoba-lang/kotoba-kir
-        {:git/url "https://github.com/kotoba-lang/kotoba-kir.git"
+        io.github.kotoba-lang/osaho
+        {:git/url "https://github.com/kotoba-lang/osaho.git"
          :git/sha "d58972da61758584a5bec0e863bcb3ea6fdd6c64"}}
  :aliases
  {:dev {:override-deps {io.github.kotoba-lang/num {:local/root "../num"}
