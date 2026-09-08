@@ -10,7 +10,7 @@
   distributed half of kotoba-native inference, before the compute lands.
 
   usage: --layers 0:21 --first | --layers 21:42 --last [--model gemma4:e4b]"
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [kotodama.inference.gemma :as gemma]
             [kotodama.inference.shard :as shard]
             [kotodama.verify.gemma4-e4b-gguf :as gguf-verify]))

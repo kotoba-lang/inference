@@ -5,7 +5,7 @@
   direct-loader gate: model identity and architecture metadata must be available
   to kotodama before tensor loading/decoding can move from a host adapter to
   torch-clj + num-clj."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [kotodama.inference.gguf :as gguf]
             [kotodama.inference.gemma :as gemma])
   (:import (java.io RandomAccessFile)

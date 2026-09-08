@@ -6,7 +6,7 @@
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.pprint :as pprint]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [kotodama.verify.maturity :as maturity]))
 
 (defn- read-maturity []
@@ -18,7 +18,7 @@
 
 (defn- shell-command [command]
   (let [os (System/getProperty "os.name")]
-    (if (str/includes? (str/lower-case os) "windows")
+    (if (str/includes? (str/lower os) "windows")
       ["cmd.exe" "/c" command]
       ["sh" "-lc" command])))
 

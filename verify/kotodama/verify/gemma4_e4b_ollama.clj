@@ -3,7 +3,7 @@
 
   This uses Ollama only as a local host adapter. The portable inference
   foundation remains torch-clj model graphs lowered to num-clj compute."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [kotodama.inference.core :as infer]
             [kotodama.inference.ollama :as ollama]
             [kotodama.inference.runtime :as rt])

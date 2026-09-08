@@ -2,7 +2,7 @@
   "Static maturity gate for kotodama inference verification assets."
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [kotodama.inference.gemma :as gemma]
             [kotodama.inference.runtime :as rt]))
 
