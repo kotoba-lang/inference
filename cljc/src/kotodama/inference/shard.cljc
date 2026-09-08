@@ -12,7 +12,7 @@
   Everything here is pure cljc: it runs in the JVM verifier, in babashka on a
   fleet node, in a browser WebGPU host, and inside a kotoba WASM component.
   File IO and transport stay host-injected, as everywhere else in kotodama."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             #?(:clj [clojure.edn :as edn]
                :cljs [cljs.reader :as edn])))
 

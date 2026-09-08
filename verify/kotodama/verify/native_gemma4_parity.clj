@@ -1,6 +1,6 @@
 (ns kotodama.verify.native-gemma4-parity
   "Fixed raw-completion parity gate: native kotodama host versus live Ollama."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [kotodama.inference.host.jvm :as host])
   (:import (java.net URI)
            (java.net.http HttpClient HttpRequest HttpRequest$BodyPublishers HttpResponse$BodyHandlers)

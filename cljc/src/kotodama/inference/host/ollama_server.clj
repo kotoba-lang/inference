@@ -11,7 +11,7 @@
   `kotodama.inference.host.oracle` (ADR-2608138800). What is here is transport:
   sockets, JSON, threads, locks, and the clock."
   (:require [json.data-json :as json]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [kotodama.inference.host.jvm :as host]
             [kotodama.inference.host.oracle :as oracle])
   (:import [com.sun.net.httpserver HttpExchange HttpHandler HttpServer]
@@ -225,7 +225,7 @@
   as an explicit request (it takes the default, like absence)."
   [value]
   (letfn [(unit-seconds [n unit]
-            (case (some-> unit str/lower-case)
+            (case (some-> unit str/lower)
               "ns" (quot n 1000000000)
               "us" (quot n 1000000)
               "ms" (quot n 1000)

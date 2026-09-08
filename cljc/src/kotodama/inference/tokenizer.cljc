@@ -15,7 +15,7 @@
   ASCII prompts through the real Gemma4 GGUF vocab (SentencePiece-style `▁`
   word-boundary marker + GPT2-style rank-ordered merges), which is the stated
   v1 bar."
-  (:require [clojure.string :as str]))
+  (:require [kotoba.lang.text :as str]))
 
 (def space-marker "▁")
 

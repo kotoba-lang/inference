@@ -4,7 +4,7 @@
   This namespace consumes config and Safetensors index data, not filenames
   guessed from a quant label. A target checkpoint without its MTP tensors is
   rejected before a host attempts speculative setup."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [kotodama.inference.runtime :as runtime]))
 
 (def ^:private mtp-root-tensors

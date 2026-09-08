@@ -46,7 +46,7 @@
   cached K/V for prior positions. It is a pure optimization: with the cache off
   every position is recomputed each step, and both paths must produce identical
   token ids (asserted by `verify/kotodama/verify/gemma4_e4b_ple_generate_smoke`)."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [kotodama.inference.gguf :as gguf]
             [kotodama.inference.ggml-kdot :as kdot]
             [kotodama.inference.ops :as ops]
