@@ -24,7 +24,7 @@
 
 (require '["fs" :as fs]
          '[clojure.edn :as edn]
-         '[clojure.string :as str])
+         '[kotoba.lang.text :as str])
 
 (defn slurp [path] (fs/readFileSync path "utf8"))
 (defn spit [path content] (fs/writeFileSync path content "utf8"))

@@ -42,7 +42,7 @@
   nbb.edn (`git rm nbb.edn scripts/kotodama/oracle_gen.cljs`). Nothing else in
   the repository depends on either file."
   (:require [clojure.pprint :as pp]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [clojure.walk :as walk]
             [kotoba.kir :as ir]
             [kotoba.kir.admission :as admission]
