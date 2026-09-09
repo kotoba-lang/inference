@@ -50,6 +50,7 @@
             [kotodama.inference.mlx :as mlx]
             [kotodama.inference.tokenizer :as tokenizer]
             [kotodama.inference.core-test]
+            [kotodama.inference.scheduler-test]
             [kotodama.inference.shard-test]
             [kotodama.oracle-gen :as oracle-gen]))
 
@@ -106,6 +107,7 @@
     (set! (.-exitCode js/process) 1)))
 
 (t/run-tests 'kotodama.inference.core-test
+             'kotodama.inference.scheduler-test
              'kotodama.inference.shard-test)
 
 ;; The Kotoba CLI build path's parity gate (scripts/kotodama/oracle_gen.cljs,
