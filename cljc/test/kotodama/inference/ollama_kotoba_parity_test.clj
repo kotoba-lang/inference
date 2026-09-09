@@ -50,8 +50,12 @@
   (let [artifacts (gen/discover-artifacts)]
     ;; Evidence floor: discovery returning nothing must not read as "every
     ;; artifact is current" (CLAUDE.md, ADR-2608136000 Q1).
-    (is (= 7 (count artifacts))
-        "expected six decision cores plus kernel-math; adjust deliberately")
+    ;; EIGHT: six surface cores, kernel-math, and the scheduler. The count is
+    ;; asserted rather than the presence, and "adjust deliberately" is the
+    ;; instruction it carries -- a core arriving without this number moving is
+    ;; a core nobody decided to ship.
+    (is (= 8 (count artifacts))
+        "expected six decision cores, kernel-math and the scheduler; adjust deliberately")
     (doseq [{:keys [source out]} artifacts]
       (testing (str out " is a current compile of " source)
         (is (.exists (io/file out))
@@ -63,8 +67,14 @@
   (is (= (set (map #(.getName (io/file (:out %))) (gen/discover-artifacts)))
          (set (map #(.getName (io/file %)) (vals oracle/catalog))))
       "a core with no catalog entry is shipped but unreachable")
+  ;; `preload!` sorts, so this list is the catalog in key order. `:scheduler`
+  ;; joined it 2026-09-09: the artifact had been shipped since the P3-P5 cores
+  ;; landed and was never catalogued, so `load-all!` never loaded it and the
+  ;; assertion above was correctly red -- for a day, unlooked-at, because the
+  ;; maturity loop runs in a checkout that was four commits behind and did not
+  ;; have the artifact at all.
   (is (= [:kernel-math :ollama-chat :ollama-options :ollama-protocol :ollama-session
-          :openai-chat :vllm-infer]
+          :openai-chat :scheduler :vllm-infer]
          (oracle/preload!))))
 
 (deftest a-missing-artifact-fails-closed
