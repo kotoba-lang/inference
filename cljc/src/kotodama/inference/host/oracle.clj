@@ -37,7 +37,21 @@
    :vllm-infer "kotodama/oracle/vllm_infer_core.kir.edn"
    ;; Engine arithmetic rather than surface policy, and float-typed rather
    ;; than word-typed — see kotoba/kernel_math_core.kotoba.
-   :kernel-math "kotodama/oracle/kernel_math_core.kir.edn"})
+   :kernel-math "kotodama/oracle/kernel_math_core.kir.edn"
+   ;; The scheduler's decisions: paged-KV block accounting and the vLLM
+   ;; watermark, chunked prefill, admission and preemption rank, prefix-cache
+   ;; reuse and speculative accept/emit. Neither surface policy nor engine
+   ;; arithmetic -- it is what a serving loop decides every step.
+   ;;
+   ;; It shipped WITHOUT this entry. `scheduler_core.kir.edn` was generated,
+   ;; committed and asserted against its host mirror, and nothing put it in
+   ;; the catalog -- so `load-all!` never loaded it and
+   ;; `every-core-is-catalogued-and-loadable` said, correctly, "a core with no
+   ;; catalog entry is shipped but unreachable". The test was right and red
+   ;; for a day; it was not looked at because the maturity loop runs in a
+   ;; checkout that was four commits behind and did not have the artifact at
+   ;; all. Registering it is what makes it reachable, not shipping it.
+   :scheduler "kotodama/oracle/scheduler_core.kir.edn"})
 
 (def ^:private cache (atom {}))
 
