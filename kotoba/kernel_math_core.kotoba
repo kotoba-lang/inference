@@ -29,14 +29,32 @@
 ;;
 ;; ── this core deliberately does NOT claim native qualification ──
 ;;
-;; `kotoba.kir/only-native-word-typed-features?` rejects f64 expressions, so
-;; every export here is outside the native-word-typed walk that the ollama
-;; decision cores stay inside. That is a gap in kir's admission walk rather
-;; than in the language — amu ADR 0241 pins scalar f64 through machine IR on
-;; x86-64 and AArch64 — but until the walk catches up, float code and
-;; word-typed code cannot be in the same core without one of them losing.
-;; They are separate files for that reason, and the parity test asserts the
-;; split rather than letting it drift.
+;; ⚠ The reason WHY changed on 2026-09-09, and the old one was wrong twice
+;; over. It read: "`kotoba.kir/only-native-word-typed-features?` rejects f64
+;; expressions". Measured: it does not, and had not since ADR-2608030300 —
+;; `native-f64-arithmetic-operations` admits f64-add/sub/mul/div/min/max/abs/
+;; neg/sqrt and the bit conversions, and
+;;
+;;   (defn add [a :i64 b :i64] :i64
+;;     (f64-to-bits (f64-add (f64-from-bits a) (f64-from-bits b))))
+;;
+;; compiled to aarch64 while that sentence was in this file. What native
+;; refused was the SIGNATURE: `[x :f64] :f64` was not a shape the boundary
+;; carried. That admission landed the same day (osaho 74426bad, kotoba-verifier
+;; 39db2f3f), so `(defn scale [x :f64] :f64 (f64-mul x 2.5))` now lowers to
+;; MOVZ X1,#0x4004,LSL#48 / FMUL D0,D0,D1 on AArch64.
+;;
+;; What still keeps THIS file off native is the other half of its own
+;; docstring, above: `:vector-f64`. A vector is a context-owned handle that
+;; `native-private-handle-type?` carries between private functions and
+;; `native-function-boundary-type?` refuses at an export — so a dot product
+;; cannot be handed its operands. That is the same absence as the missing
+;; `:bytes` access, seen from the other side, and it is the one primitive
+;; between this file and a native inference kernel
+;; (com-junkawasaki adr-2609091800).
+;;
+;; Float code and word-typed code still live in separate files, and the parity
+;; test still asserts the split.
 ;;
 ;; Parity oracle: kotodama.inference.ops (dot-values, rms-normalize-values).
 ;; Test: cljc/test/kotodama/inference/kernel_math_parity_test.clj
