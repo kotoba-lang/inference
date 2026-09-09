@@ -8,8 +8,7 @@
   (:require [kotoba.lang.text :as str]
             [kotodama.inference.gguf :as gguf]
             [kotodama.inference.gemma :as gemma])
-  (:import (java.io RandomAccessFile)
-           (java.lang ProcessBuilder)))
+  (:import (java.io RandomAccessFile)))
 
 (def default-model "gemma4:e4b")
 
@@ -212,23 +211,28 @@
            :gguf/tensor-type-counts (into (sorted-map) @type-counts)
            :gguf/tensors selected-with-spans})))))
 
-(defn- process-lines [cmd]
-  (let [process (-> (ProcessBuilder. ^java.util.List cmd)
-                    (.redirectErrorStream true)
-                    (.start))
-        out (slurp (.getInputStream process))
-        exit (.waitFor process)]
-    (when-not (zero? exit)
-      (throw (ex-info "command failed" {:command cmd :exit exit :output out})))
-    (str/split-lines out)))
 
-(defn ollama-gguf-path [model]
-  (let [lines (process-lines ["ollama" "show" model "--modelfile"])
-        from-line (first (filter #(str/starts-with? % "FROM ") lines))]
-    (when-not from-line
-      (throw (ex-info "could not resolve Ollama GGUF blob path"
-                      {:model model :lines lines})))
-    (subs from-line 5)))
+(defn gguf-path
+  "Where the GGUF artifact is, from `KOTODAMA_VERIFY_GGUF_PATH`, and from
+  nowhere else.
+
+  ⚠ THIS USED TO SHELL OUT TO `ollama show <model> --modelfile` when the
+  variable was unset, and that fallback was removed 2026-09-09. A GGUF file is
+  a real artifact and reading one is not a dependence; asking Ollama WHERE IT
+  IS makes Ollama required to run a gate that never needed it to compute
+  anything. The owner's direction is that no vLLM, Ollama, MLX or llama.cpp
+  sits underneath, and a locator is underneath.
+
+  Fail closed with the variable named, rather than falling back: a gate that
+  quietly finds the file a second way is a gate whose requirements nobody can
+  read off its failure."
+  [model]
+  (or (System/getenv "KOTODAMA_VERIFY_GGUF_PATH")
+      (throw (ex-info (str "set KOTODAMA_VERIFY_GGUF_PATH to the GGUF artifact "
+                           "for " model " -- this gate no longer asks Ollama "
+                           "where it is")
+                      {:model model
+                       :variable "KOTODAMA_VERIFY_GGUF_PATH"}))))
 
 (defn- require= [actual expected key]
   (when-not (= expected actual)
@@ -336,8 +340,7 @@
 
 (defn -main [& _]
   (let [model (or (System/getenv "KOTODAMA_VERIFY_MODEL") default-model)
-        path (or (System/getenv "KOTODAMA_VERIFY_GGUF_PATH")
-                 (ollama-gguf-path model))
+        path (gguf-path model)
         parsed (read-gguf-metadata path)
         m (:gguf/metadata parsed)
         expected gemma/gemma4-e4b-expected

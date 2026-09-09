@@ -1,36 +1,34 @@
 (ns kotodama.verify.native-gemma4-parity
-  "Fixed raw-completion parity gate: native kotodama host versus live Ollama."
-  (:require [kotoba.lang.text :as str]
-            [kotodama.inference.host.jvm :as host])
-  (:import (java.net URI)
-           (java.net.http HttpClient HttpRequest HttpRequest$BodyPublishers HttpResponse$BodyHandlers)
-           (java.time Duration)))
+  "Fixed raw-completion gate: the native kotodama host against a RECORDED
+  oracle.
+
+  ⚠ IT USED TO BE 'versus live Ollama', and that is what changed on 2026-09-09.
+  The old shape ran `POST 127.0.0.1:11434/api/generate` and asserted three
+  things: that Ollama still answered the recorded text, that this host agreed
+  with Ollama, and that this host's token id was the recorded one. The middle
+  assertion is the dependence -- it made a third-party server the reference for
+  what this stack should say -- and the owner's direction is that no vLLM,
+  Ollama, MLX or llama.cpp sits underneath.
+
+  Removing it costs one thing and it should be said plainly: nothing here now
+  notices if the RECORDED constants are themselves wrong. They were not made up
+  -- ` Paris` and token 9079 were measured against live Ollama 0.31.1 greedy
+  when this gate was written, and that measurement is what the constants are --
+  but from here on they are an oracle rather than a comparison. That is the
+  correct trade: a value checked against a service that can change underneath
+  you is not a fixed oracle, it is a moving one that looks fixed.
+
+  What is NOT lost: this still fails if the native host's answer moves, which
+  is the whole reason the gate exists."
+  (:require [kotodama.inference.host.jvm :as host]))
 
 (def model "gemma4:e4b")
 (def prompt "The capital of France is")
+
+;; Measured against live Ollama 0.31.1 greedy when this gate was written, and
+;; recorded here so the comparison no longer needs it running.
 (def expected-text " Paris")
 (def expected-token-id 9079)
-
-(defn- ollama-raw-one-token []
-  (let [body (str "{\"model\":\"" model "\",\"prompt\":\"" prompt
-                  "\",\"raw\":true,\"stream\":false,"
-                  "\"options\":{\"num_predict\":1,\"temperature\":0}}")
-        request (-> (HttpRequest/newBuilder (URI/create "http://127.0.0.1:11434/api/generate"))
-                    (.timeout (Duration/ofMinutes 10))
-                    (.header "content-type" "application/json")
-                    (.POST (HttpRequest$BodyPublishers/ofString body))
-                    (.build))
-        response (.send (HttpClient/newHttpClient) request (HttpResponse$BodyHandlers/ofString))
-        json (.body response)
-        marker "\"response\":\""
-        start (.indexOf json marker)]
-    (when-not (= 200 (.statusCode response))
-      (throw (ex-info "Ollama parity request failed" {:status (.statusCode response) :body json})))
-    (when (neg? start)
-      (throw (ex-info "Ollama response field missing" {:body json})))
-    (let [from (+ start (count marker))
-          end (.indexOf json "\"" from)]
-      (subs json from end))))
 
 (defn -main [& _]
   (let [t0 (System/nanoTime)
@@ -41,20 +39,20 @@
                               :kotodama/dbg {:native-k-dot? true}})
         local-seconds (/ (- (System/nanoTime) t0) 1.0e9)
         local-text (:kotodama/text local)
-        local-ids (:kotodama/generated-token-ids local)
-        ollama-text (ollama-raw-one-token)]
-    (when-not (= expected-text ollama-text)
-      (throw (ex-info "live Ollama fixed probe changed" {:expected expected-text :actual ollama-text})))
-    (when-not (= ollama-text local-text)
-      (throw (ex-info "native Gemma4 output differs from Ollama"
-                      {:ollama ollama-text :kotodama local-text :ids local-ids})))
+        local-ids (:kotodama/generated-token-ids local)]
+    ;; Both, not one. The text and the id can disagree -- a tokenizer change
+    ;; moves one without the other -- and a gate that checked only the id would
+    ;; call that a pass.
+    (when-not (= expected-text local-text)
+      (throw (ex-info "native Gemma4 text differs from the recorded oracle"
+                      {:expected expected-text :actual local-text :ids local-ids})))
     (when-not (= [expected-token-id] local-ids)
-      (throw (ex-info "native Gemma4 token id differs from fixed oracle"
+      (throw (ex-info "native Gemma4 token id differs from the recorded oracle"
                       {:expected [expected-token-id] :actual local-ids})))
     (prn {:kotodama/native-gemma4-parity :ok
           :model model
           :prompt prompt
           :token-id expected-token-id
           :text local-text
-          :ollama-text ollama-text
+          :oracle :recorded
           :seconds local-seconds})))

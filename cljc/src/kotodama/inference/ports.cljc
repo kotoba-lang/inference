@@ -37,8 +37,15 @@
 
 (defn fn-runtime
   "Build an `IModelRuntime` from functions. Useful for tests, SCI, and thin
-  adapters around browser WebGPU, terminal wasm, or hosted inference runtimes
-  (e.g. kotodama.inference.ollama, kotodama.inference.mlx)."
+  adapters around browser WebGPU, terminal wasm, or the native Kotoba host.
+
+  ⚠ THE EXAMPLES THIS DOCSTRING USED TO GIVE ARE GONE, and their absence is
+  the point. It named `kotodama.inference.ollama` and `kotodama.inference.mlx`
+  -- HTTP clients that made a third-party server do the inference and reported
+  its answer as this stack's. Both were removed 2026-09-09 (owner instruction:
+  no vLLM, Ollama, MLX or llama.cpp underneath; kotoba CLI and the amu native
+  binary only). A runtime built here computes, or it refuses and says what is
+  missing; it does not forward."
   [{:keys [probe load generate forward dispose]}]
   (reify IModelRuntime
     (probe! [_] (if probe (probe) {:kotodama/backends []}))

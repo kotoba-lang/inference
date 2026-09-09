@@ -848,7 +848,7 @@
      :or {model verify-gguf/default-model
           full-layer-count 2}}]
    (let [expected gemma/gemma4-e4b-expected
-         path* (or path (verify-gguf/ollama-gguf-path model))
+         path* (or path (verify-gguf/gguf-path model))
          backend (cpu/cpu-backend)
          sessions (atom {})]
      (inference-ports/fn-runtime
@@ -915,7 +915,7 @@
 (defn -main [& _]
   (let [model (or (System/getenv "KOTODAMA_VERIFY_MODEL") verify-gguf/default-model)
         path (or (System/getenv "KOTODAMA_VERIFY_GGUF_PATH")
-                 (verify-gguf/ollama-gguf-path model))
+                 (verify-gguf/gguf-path model))
         expected gemma/gemma4-e4b-expected
         full-mlp? (= "1" (System/getenv "KOTODAMA_VERIFY_FULL_MLP"))
         full-vocab? (= "1" (System/getenv "KOTODAMA_VERIFY_FULL_VOCAB"))
