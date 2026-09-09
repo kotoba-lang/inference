@@ -52,8 +52,7 @@
             [kotodama.inference.ops :as ops]
             [kotodama.inference.tokenizer :as tokenizer]
             [kotodama.inference.decode :as decode])
-  (:import (java.io RandomAccessFile)
-           (java.lang ProcessBuilder)))
+  (:import (java.io RandomAccessFile)))
 
 ;; ---------------------------------------------------------------------------
 ;; GGUF byte/metadata IO (JVM-only)
@@ -131,21 +130,29 @@
              :gguf/tensors @tensors
              :gguf/tensor-data-start tensor-data-start}))))))
 
-(defn- process-lines [cmd]
-  (let [process (-> (ProcessBuilder. ^java.util.List cmd) (.redirectErrorStream true) (.start))
-        out (slurp (.getInputStream process))
-        exit (.waitFor process)]
-    (when-not (zero? exit) (throw (ex-info "command failed" {:command cmd :exit exit :output out})))
-    (str/split-lines out)))
 
-(defn ollama-gguf-path
-  "Resolve a local Ollama model tag to its on-disk GGUF blob path."
+(defn gguf-path
+  "Where a model's GGUF artifact is, from `KOTODAMA_GGUF_PATH`, and from
+  nowhere else.
+
+  ⚠ THIS USED TO BE `ollama-gguf-path`, which shelled out to
+  `ollama show <model> --modelfile` and read the FROM line. It was removed
+  2026-09-09 (owner instruction: no vLLM, Ollama, MLX or llama.cpp
+  underneath). Reading a GGUF file is not a dependence -- the file is a real
+  artifact and this host decodes it itself, Q4_K, Q6_K, BF16 and F32, in the
+  rows below. Asking Ollama WHERE the file is made Ollama required to run a
+  host that never needed it to compute anything, which is the dependence
+  wearing a small enough coat to be missed.
+
+  Fail closed with the variable named rather than falling back to a second
+  route: a host that quietly finds the file another way is a host whose
+  requirements cannot be read off its failure."
   [model]
-  (let [lines (process-lines ["ollama" "show" model "--modelfile"])
-        from-line (first (filter #(str/starts-with? % "FROM ") lines))]
-    (when-not from-line
-      (throw (ex-info "could not resolve Ollama GGUF blob path" {:model model :lines lines})))
-    (subs from-line 5)))
+  (or (System/getenv "KOTODAMA_GGUF_PATH")
+      (throw (ex-info (str "set KOTODAMA_GGUF_PATH to the GGUF artifact for "
+                           model " -- this host no longer asks Ollama where "
+                           "it is")
+                      {:model model :variable "KOTODAMA_GGUF_PATH"}))))
 
 ;; ---------------------------------------------------------------------------
 ;; fast array-only row dequantize (byte-for-byte the portable gguf decode,
@@ -910,7 +917,7 @@
   cache are mutated per forward)."
   [{:keys [kotodama/model-path kotodama/model kotodama/cache-weights? kotodama/use-kv-cache?]
     :or {model default-model use-kv-cache? true} :as opts}]
-  (let [path (or model-path (ollama-gguf-path model))
+  (let [path (or model-path (gguf-path model))
         {:gguf/keys [metadata tensors tensor-data-start]} (read-gguf! path (wanted-tensor-names 128))
         expected (model-expected metadata)
         hidden (long (:gemma4/embedding-length expected))

@@ -21,7 +21,18 @@
     :torch-num-smoke
     :cljs-wasm-smoke
     :gemma4-e4b-gguf
-    :gemma4-e4b-live
+    ;; ⚠ `:gemma4-e4b-live` LEFT THIS SET on 2026-09-09, and it is the only
+    ;; gate ever removed from it. It ran generation through a LIVE OLLAMA and
+    ;; proved `:imodelruntime-live-generate` -- which is to say it proved that
+    ;; a third-party server generates tokens, and reported that as this
+    ;; stack's maturity. The owner's direction is that no vLLM, Ollama, MLX or
+    ;; llama.cpp sits underneath, so the gate went with its adapter.
+    ;;
+    ;; What it proved is NOT replaced, and saying otherwise would be the lie
+    ;; this file exists to prevent: there is no live real-model generation
+    ;; gate now. `:gemma4-e4b-native-parity` below still runs the native host
+    ;; on the real GGUF and compares one token against a recorded oracle, and
+    ;; that is a smaller claim than the one that left.
     :gemma4-e4b-native-parity
     :gemma4-metal-kdot
     :ollama-http-api
@@ -32,7 +43,13 @@
     :kotoba-engine-kernel
     :ollama-chat-endpoint
     :openai-compatible-surface
-    :session-memory-budget})
+    :session-memory-budget
+    ;; The owner's direction has had no gate at all until now: inference with
+    ;; no vLLM, Ollama, MLX or llama.cpp underneath, kotoba CLI and the amu
+    ;; native binary only. Everything above measures either the portable CLJC
+    ;; contract or the Ollama-compatible surface this repository SERVES, and
+    ;; neither is the native path.
+    :kotoba-native-executed})
 
 (def banned-foundation-patterns
   [{:id :transformers-js

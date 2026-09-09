@@ -36,7 +36,7 @@
         expected gemma/gemma4-e4b-expected
         rank {:layers layers :first? first? :last? last?}
         path (or (System/getenv "KOTODAMA_VERIFY_GGUF_PATH")
-                 (gguf-verify/ollama-gguf-path model))
+                 (gguf-verify/gguf-path model))
         index (gguf-verify/read-gguf-tensor-index path #(shard/owned-tensor? rank %))
         tensors (:gguf/tensors index)
         owned-bytes (reduce + (map :span-bytes (vals tensors)))

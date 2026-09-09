@@ -476,7 +476,7 @@
   Returns the `kotodama.inference.decode/generate` result map plus timing."
   [{:keys [kotodama/model-path kotodama/model kotodama/prompt kotodama/max-tokens kotodama/on-token]
     :or {model default-model prompt default-prompt max-tokens 16}}]
-  (let [path (or model-path (verify-gguf/ollama-gguf-path model))
+  (let [path (or model-path (verify-gguf/gguf-path model))
         ;; block-count is not known yet, so pass a permissive `wanted` that
         ;; covers up to 128 layers -- cheap (name-string compare only), and
         ;; correct regardless of this model's real depth.
