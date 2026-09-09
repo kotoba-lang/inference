@@ -153,8 +153,19 @@
         (js/process.exit 64))))
 
 ;; Run -main only when this file is the script nbb was given, not when it is
-;; required from run-tests.cljs. nbb has no *main-ns*; the last argv is the
-;; script path it was handed.
-(when (str/ends-with? (str (aget js/process.argv (dec (.-length js/process.argv))))
-                      "kotodama/oracle_gen.cljs")
-  (apply -main (drop 3 js/process.argv)))
+;; required from run-tests.cljs. nbb has no *main-ns*, so this looks for the
+;; script path ANYWHERE in argv.
+;;
+;; It used to look only at the LAST argv, which made this file's own documented
+;; usage unreachable: `nbb scripts/kotodama/oracle_gen.cljs --write` ends in
+;; `--write`, the guard was false, `-main` never ran, and the process exited 0
+;; having written nothing. Measured 2026-09-09 — the parity check (no flag)
+;; worked, so the half that is run by CI hid the half that is run by a person.
+(let [argv (vec js/process.argv)
+      script-index (first (keep-indexed (fn [i a]
+                                          (when (str/ends-with? (str a)
+                                                                "kotodama/oracle_gen.cljs")
+                                            i))
+                                        argv))]
+  (when script-index
+    (apply -main (subvec argv (inc script-index)))))

@@ -1,3 +1,12 @@
 {:deps {io.github.kotoba-lang/amu
         {:git/url "https://github.com/kotoba-lang/amu.git"
-         :git/sha "e78241dca15000f6bb3976e97f493c70b0137dcf"}}}
+         :git/sha "e78241dca15000f6bb3976e97f493c70b0137dcf"}
+        ;; The compiler pinned above requires kotoba.lang.text, and nbb resolves
+        ;; only what this file names -- so oracle_gen.cljs died with
+        ;; "Could not find namespace: kotoba.lang.text" on main, before it
+        ;; reached the parity gate it exists to run. Measured 2026-09-09 in a
+        ;; clean checkout. Naming the library here fixes the tool without moving
+        ;; the compiler pin, which would move every core's KIR at once.
+        io.github.kotoba-lang/text
+        {:git/url "https://github.com/kotoba-lang/text.git"
+         :git/sha "73bdb13ae7a3d004b44bca08be03a3191157a38f"}}}
