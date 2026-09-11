@@ -20,7 +20,7 @@
 ;; Word-typed at the boundary and in the bodies, like the other decision
 ;; cores (see ollama_protocol_core.kotoba).
 ;;
-;; Parity: cljc/test/kotodama/inference/ollama_kotoba_parity_test.clj
+;; Parity: cljc/test/kotodama/inference/ollama_kotoba_parity_test.cljk
 
 ;; ── roles ────────────────────────────────────────────────────────────
 ;; `tool` is admitted as a role because Ollama clients send it, and silently

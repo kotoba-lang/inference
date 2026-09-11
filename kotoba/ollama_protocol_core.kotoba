@@ -26,7 +26,7 @@
 ;; Both are checked, separately, by the parity test — passing one says nothing
 ;; about the other.
 ;;
-;; Parity: cljc/test/kotodama/inference/ollama_kotoba_parity_test.clj
+;; Parity: cljc/test/kotodama/inference/ollama_kotoba_parity_test.cljk
 
 ;; ── route codes ──────────────────────────────────────────────────────
 ;; Codes, not strings, so the host `case` is a dense i64 dispatch and an

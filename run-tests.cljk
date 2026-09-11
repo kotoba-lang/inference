@@ -31,17 +31,17 @@
 
     clojure -M:test -n core-test -n shard-test
                              Ran 12 tests containing 125 assertions, 0 failures
-    nbb run-tests.cljs           12 tests containing 125 assertions, 0 failures
+    nbb run-tests.cljk           12 tests containing 125 assertions, 0 failures
 
   Namespaces are listed explicitly. clojure -M:test discovers them by
   scanning the test path and a cljs runner cannot, so one left off this list
   would silently never run rather than fail.
 
-    nbb --classpath 'scripts:$(clojure -Spath -M:test)' run-tests.cljs
+    nbb --classpath 'scripts:$(clojure -Spath -M:test)' run-tests.cljk
 
   (The JVM classpath is the pre-existing, test-only mechanism carrying this
   repo's cljc sources, tests and git deps; `scripts` is prepended so this
-  runner can also require kotodama.oracle-gen — scripts/kotodama/oracle_gen.cljs,
+  runner can also require kotodama.oracle-gen — scripts/kotodama/oracle_gen.cljk,
   the Kotoba CLI build path pinned by nbb.edn, which needs no JVM classpath of
   its own — and re-check that every kotoba/*_core.kotoba still compiles
   byte-for-byte to the shipped oracle artifact, the same authority gate the
@@ -110,7 +110,7 @@
              'kotodama.inference.scheduler-test
              'kotodama.inference.shard-test)
 
-;; The Kotoba CLI build path's parity gate (scripts/kotodama/oracle_gen.cljs,
+;; The Kotoba CLI build path's parity gate (scripts/kotodama/oracle_gen.cljk,
 ;; pinned by nbb.edn): every kotoba/*_core.kotoba compiled JVM-free under nbb
 ;; must equal the shipped resources/kotodama/oracle/*.kir.edn byte-for-byte —
 ;; the same authority assertion `clojure -M:test` makes through
