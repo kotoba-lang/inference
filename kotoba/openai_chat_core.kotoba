@@ -22,7 +22,7 @@
 ;; ask for reports a parse error, not a server error.
 ;;
 ;; Word-typed at the boundary and in the bodies.
-;; Parity: cljc/test/kotodama/inference/ollama_kotoba_parity_test.clj
+;; Parity: cljc/test/kotodama/inference/ollama_kotoba_parity_test.cljk
 
 ;; ── stream: default OFF, the opposite of Ollama ──────────────────────
 

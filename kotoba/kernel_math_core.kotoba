@@ -57,7 +57,7 @@
 ;; test still asserts the split.
 ;;
 ;; Parity oracle: kotodama.inference.ops (dot-values, rms-normalize-values).
-;; Test: cljc/test/kotodama/inference/kernel_math_parity_test.clj
+;; Test: cljc/test/kotodama/inference/kernel_math_parity_test.cljk
 
 ;; ── dot product ──────────────────────────────────────────────────────
 ;; Tail self-recursion over an index; the host guarantees equal lengths, and

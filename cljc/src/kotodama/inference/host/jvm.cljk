@@ -2,7 +2,7 @@
   "JVM host adapter: real local Gemma4 GGUF -> end-to-end text generation.
 
   This is the promoted, library-grade home for what used to live only in
-  `verify/kotodama/verify/gemma4_e4b_generate_smoke.clj`. It is `.clj`-only on
+  `verify/kotodama/verify/gemma4_e4b_generate_smoke.cljk`. It is `.clj`-only on
   purpose: per `kotodama.inference.ports`, the portable `.cljc` kernel never
   opens a file or touches a host runtime, so all GGUF-file IO and the JVM
   forward pass live here, while the loop/tokenizer/sampler stay portable.

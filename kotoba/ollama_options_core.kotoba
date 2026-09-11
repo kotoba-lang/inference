@@ -31,7 +31,7 @@
 ;; instead, which is float-typed by nature and does not claim native
 ;; qualification. See ADR-2608138800's amendment.
 ;;
-;; Parity: cljc/test/kotodama/inference/ollama_kotoba_parity_test.clj
+;; Parity: cljc/test/kotodama/inference/ollama_kotoba_parity_test.cljk
 
 ;; ── num_predict ──────────────────────────────────────────────────────
 ;; 32 rather than Ollama's own -1 (unbounded) because this runtime generates on

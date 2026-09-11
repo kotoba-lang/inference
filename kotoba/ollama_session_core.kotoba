@@ -16,7 +16,7 @@
 ;;
 ;; Word-typed (i64/:bool) at both the export boundary and in the bodies — see
 ;; ollama_protocol_core.kotoba for what those two mean and where each is checked.
-;; Parity: cljc/test/kotodama/inference/ollama_kotoba_parity_test.clj
+;; Parity: cljc/test/kotodama/inference/ollama_kotoba_parity_test.cljk
 
 ;; ── expiry ───────────────────────────────────────────────────────────
 ;; keep-alive-ms is already normalised by ollama-options-core: negative is the
