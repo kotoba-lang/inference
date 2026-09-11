@@ -82,12 +82,12 @@ model weights and GPU device; kotoba guest wasm should call this through the
 Live local-model verification:
 
 ```sh
-clojure -M:verify-maturity
-clojure -M:verify-torch-num
-clojure -M:verify-gguf
-clojure -M:verify-maturity-run
-clojure -M:verify-maturity-run --include-local-model
-clojure -M:verify-ollama
+kbb -M:verify-maturity
+kbb -M:verify-torch-num
+kbb -M:verify-gguf
+kbb -M:verify-maturity-run
+kbb -M:verify-maturity-run --include-local-model
+kbb -M:verify-ollama
 ```
 
 `verify-maturity` checks that the coverage/maturity gate is wired to the

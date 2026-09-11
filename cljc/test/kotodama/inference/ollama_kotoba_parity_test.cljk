@@ -59,9 +59,9 @@
     (doseq [{:keys [source out]} artifacts]
       (testing (str out " is a current compile of " source)
         (is (.exists (io/file out))
-            "artifact missing — run `clojure -M:test:gen`")
+            "artifact missing — run `kbb -M:test:gen`")
         (is (= (edn/read-string (slurp out)) (:kir (compiled source)))
-            "artifact is stale — run `clojure -M:test:gen`")))))
+            "artifact is stale — run `kbb -M:test:gen`")))))
 
 (deftest every-core-is-catalogued-and-loadable
   (is (= (set (map #(.getName (io/file (:out %))) (gen/discover-artifacts)))

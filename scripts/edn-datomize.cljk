@@ -1,4 +1,4 @@
-#!/usr/bin/env nbb
+#!/usr/bin/env kbb
 ;; scripts/edn-datomize.cljk — EDN → Datomic/Datascript tx-data 変換ツール。
 ;;
 ;; kotoba-lang/inference 用に com-junkawasaki/root superproject の
@@ -20,7 +20,7 @@
 ;; 使わない）。
 ;;
 ;; 使い方:
-;;   nbb scripts/edn-datomize.cljk wrap-map <path> <ns>   — map 1個のファイルを変換
+;;   kbb --backend sci scripts/edn-datomize.cljk wrap-map <path> <ns>   — map 1個のファイルを変換
 
 (require '["fs" :as fs]
          '[clojure.edn :as edn]
@@ -120,7 +120,7 @@
   (let [[mode a b] args]
     (case mode
       "wrap-map" (wrap-map! a b)
-      (do (println "usage: nbb scripts/edn-datomize.cljk [wrap-map <path> <ns>]")
+      (do (println "usage: kbb --backend sci scripts/edn-datomize.cljk [wrap-map <path> <ns>]")
           (js/process.exit 1)))))
 
 (apply -main *command-line-args*)

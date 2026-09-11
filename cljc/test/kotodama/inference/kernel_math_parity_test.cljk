@@ -29,7 +29,7 @@
 (deftest shipped-artifact-matches-source
   (is (= (edn/read-string (slurp "resources/kotodama/oracle/kernel_math_core.kir.edn"))
          (:kir (compiler/compile-source (slurp source) :wasm32-kotoba-v1 {})))
-      "artifact is stale — run `clojure -M:test:gen`"))
+      "artifact is stale — run `kbb -M:test:gen`"))
 
 ;; ── parity against the engine's own ops ──────────────────────────────
 

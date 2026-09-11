@@ -33,7 +33,7 @@ The cryptographic primitive is owned by the standalone
 receipt.
 
 ```sh
-clojure -M:verify-encrypted-lm-head
+kbb -M:verify-encrypted-lm-head
 ```
 
 This proves ciphertext-only **linear LM-head inference**, including randomized
@@ -59,16 +59,16 @@ docs/        ADRs
 ## Verify
 
 ```sh
-clojure -M:test
-clojure -M:verify-maturity
-clojure -M:verify-torch-num
+kbb -M:test
+kbb -M:verify-maturity
+kbb -M:verify-torch-num
 ```
 
 Local model verification expects a local Ollama `gemma4:e4b` GGUF artifact:
 
 ```sh
-clojure -M:verify-gguf
-KOTODAMA_VERIFY_FULL_MLP=1 KOTODAMA_VERIFY_FULL_LAYERS=2 KOTODAMA_VERIFY_FULL_VOCAB=1 clojure -M:verify-gemma-num
+kbb -M:verify-gguf
+KOTODAMA_VERIFY_FULL_MLP=1 KOTODAMA_VERIFY_FULL_LAYERS=2 KOTODAMA_VERIFY_FULL_VOCAB=1 kbb -M:verify-gemma-num
 ```
 
 `gemma4-e4b-num-smoke` proves 2 composed transformer blocks against golden
@@ -77,7 +77,7 @@ single-request text generation (real tokenizer, every real transformer block,
 greedy sampling, no KV-cache — recompute-from-scratch) is:
 
 ```sh
-clojure -M:verify-gemma-generate
+kbb -M:verify-gemma-generate
 # optional env: KOTODAMA_VERIFY_MODEL, KOTODAMA_VERIFY_GGUF_PATH,
 # KOTODAMA_VERIFY_PROMPT, KOTODAMA_VERIFY_MAX_TOKENS
 ```
@@ -122,8 +122,8 @@ rotary on global layers), the gated GELU MLP, KV-sharing, and a KV-cache. The
 Verify:
 
 ```sh
-CACHE_WEIGHTS=1 clojure -M:verify-gemma-ple-generate   # end-to-end via host.jvm/generate
-CACHE_WEIGHTS=1 clojure -M:verify-gemma-kvcache         # KV-cache == from-scratch, + tok/s
+CACHE_WEIGHTS=1 kbb -M:verify-gemma-ple-generate   # end-to-end via host.jvm/generate
+CACHE_WEIGHTS=1 kbb -M:verify-gemma-kvcache         # KV-cache == from-scratch, + tok/s
 ```
 
 > Status: the decode loop, tokenizer (SentencePiece `add_dummy_prefix`), GGUF
@@ -141,10 +141,10 @@ dequantization, passed with a 4 GiB heap, and measured 1.94 GiB maximum RSS on
 Apple M4:
 
 ```sh
-CACHE_WEIGHTS=1 KOTODAMA_VERIFY_MAX_TOKENS=1 clojure -M:verify-gemma-ple-generate
+CACHE_WEIGHTS=1 KOTODAMA_VERIFY_MAX_TOKENS=1 kbb -M:verify-gemma-ple-generate
 scripts/build-native-kdot.sh
-clojure -M:verify-native-kdot
-clojure -M:verify-native-gemma-parity
+kbb -M:verify-native-kdot
+kbb -M:verify-native-gemma-parity
 ```
 
 For numerical parity work, emit compact activation fingerprints for every
@@ -154,7 +154,7 @@ attention, MLP, PLE, and output stage without retaining full activations:
 CACHE_WEIGHTS=1 \
 KOTODAMA_VERIFY_MAX_TOKENS=1 \
 KOTODAMA_TRACE_EDN=/tmp/gemma4-trace.edn \
-clojure -M:verify-gemma-ple-generate
+kbb -M:verify-gemma-ple-generate
 ```
 
 `KOTODAMA_FLOAT32=1` additionally uses explicit float32 projection
@@ -180,9 +180,9 @@ as WebGPU buffers:
 
 ```sh
 deno run --unstable-webgpu --allow-read verify/metal_kdot.js
-clojure -M:verify-metal-kdot-worker
+kbb -M:verify-metal-kdot-worker
 KOTODAMA_METAL_K_DOT=1 KOTODAMA_VERIFY_MAX_TOKENS=2 \
-  clojure -M:verify-gemma-ple-generate
+  kbb -M:verify-gemma-ple-generate
 ```
 
 On Apple M4 it preserves `" Paris."` generation and measures roughly 15–20 ms
@@ -203,7 +203,7 @@ caches, and persistent Metal worker are reused instead of recreated:
 
 ```sh
 # defaults to 127.0.0.1:11434; an optional first argument overrides the port
-KOTODAMA_METAL_K_DOT=1 clojure -M:serve-ollama 11434
+KOTODAMA_METAL_K_DOT=1 kbb -M:serve-ollama 11434
 
 curl http://127.0.0.1:11434/api/tags
 curl http://127.0.0.1:11434/api/generate \
@@ -259,7 +259,7 @@ target/native-vllm-cli/kotoba-vllm-infer \
 The JVM reference executes the same shipped Kotoba policy:
 
 ```sh
-clojure -M:vllm-cli --prompt 'Explain memory bandwidth in one sentence.' \
+kbb -M:vllm-cli --prompt 'Explain memory bandwidth in one sentence.' \
   --max-tokens 64
 ```
 
@@ -279,7 +279,7 @@ than reuse the BF16 number. The streaming contract is lossless and keeps MTP
 off because the current streaming seam is single-token decode.
 
 ```sh
-clojure -M:verify-qwen4exp-expert-stream
+kbb -M:verify-qwen4exp-expert-stream
 ```
 
 Checkpoint admission is metadata evidence only. Real execution additionally
@@ -372,8 +372,8 @@ fails the server at start rather than falling back to a second, unreviewed
 copy of the policy in Clojure.
 
 ```sh
-clojure -M:test:gen    # recompile kotoba/*_core.kotoba → resources/kotodama/oracle/
-clojure -M:test        # includes the parity gate: shipped artifact == fresh
+kbb -M:test:gen    # recompile kotoba/*_core.kotoba → resources/kotodama/oracle/
+kbb -M:test        # includes the parity gate: shipped artifact == fresh
                        # compile, semantics vs the Ollama wire contract, and
                        # native-boundary admission
 ```
@@ -386,15 +386,15 @@ alias carries**, and `scripts/kotodama/oracle_gen.cljk` runs that compiler's
 pipeline (analyze → admission → lower) under nbb/Node:
 
 ```sh
-nbb scripts/kotodama/oracle_gen.cljk         # parity gate: all 7 cores must
+kbb --backend sci scripts/kotodama/oracle_gen.cljk         # parity gate: all 7 cores must
                                              #   compile byte-identical to the
                                              #   shipped artifacts (exit 1 on drift)
-nbb scripts/kotodama/oracle_gen.cljk --write # regenerate the shipped artifacts
+kbb --backend sci scripts/kotodama/oracle_gen.cljk --write # regenerate the shipped artifacts
 ```
 
 The nbb route is byte-compatible with the JVM route on purpose: the KIR text it
-writes is identical to what `clojure -M:test:gen` writes, verified across all
-seven cores (2026-09-01). `nbb run-tests.cljk` (see run-tests.cljk) re-checks
+writes is identical to what `kbb -M:test:gen` writes, verified across all
+seven cores (2026-09-01). `kbb --backend sci run-tests.cljk` (see run-tests.cljk) re-checks
 the same gate JVM-free. The JVM commands above remain the authority and are
 unchanged; rollback is one command — `git rm nbb.edn scripts/kotodama/oracle_gen.cljk`.
 nbb caches its resolved deps under `.nbb/` in the working tree (untracked).
