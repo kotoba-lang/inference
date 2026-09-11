@@ -25,18 +25,18 @@
 
   Commands:
 
-    nbb scripts/kotodama/oracle_gen.cljk            # parity gate (default):
+    kbb --backend sci scripts/kotodama/oracle_gen.cljk            # parity gate (default):
                                                     #   compile every core,
                                                     #   compare with the shipped
                                                     #   artifact, exit 1 on drift
-    nbb scripts/kotodama/oracle_gen.cljk --write    # regenerate the shipped
+    kbb --backend sci scripts/kotodama/oracle_gen.cljk --write    # regenerate the shipped
                                                     #   artifacts in place
 
   Rollback / oracle retention: the JVM route is UNCHANGED and remains the
   authority —
 
-    clojure -M:test:gen    # JVM regeneration (the pre-existing command)
-    clojure -M:test        # JVM parity gate over the same fixtures
+    kbb -M:test:gen    # JVM regeneration (the pre-existing command)
+    kbb -M:test        # JVM parity gate over the same fixtures
 
   One documented rollback command: delete scripts/kotodama/oracle_gen.cljk and
   nbb.edn (`git rm nbb.edn scripts/kotodama/oracle_gen.cljk`). Nothing else in
@@ -149,7 +149,7 @@
     "--write" (write-artifacts!)
     nil (check-parity!)
     (do (println (str "unknown argument: " (first args)
-                      "; usage: nbb scripts/kotodama/oracle_gen.cljk [--write]"))
+                      "; usage: kbb --backend sci scripts/kotodama/oracle_gen.cljk [--write]"))
         (js/process.exit 64))))
 
 ;; Run -main only when this file is the script nbb was given, not when it is
@@ -157,7 +157,7 @@
 ;; script path ANYWHERE in argv.
 ;;
 ;; It used to look only at the LAST argv, which made this file's own documented
-;; usage unreachable: `nbb scripts/kotodama/oracle_gen.cljk --write` ends in
+;; usage unreachable: `kbb --backend sci scripts/kotodama/oracle_gen.cljk --write` ends in
 ;; `--write`, the guard was false, `-main` never ran, and the process exited 0
 ;; having written nothing. Measured 2026-09-09 — the parity check (no flag)
 ;; worked, so the half that is run by CI hid the half that is run by a person.

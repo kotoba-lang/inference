@@ -38,7 +38,7 @@
          :exec-fn cognitect.test-runner.api/test}
   ;; Regenerate resources/kotodama/oracle/*.kir.edn from kotoba/*_core.kotoba.
   ;; Carries no deps of its own; combine with :test, which carries the
-  ;; compiler:  clojure -M:test:gen
+  ;; compiler:  kbb -M:test:gen
   :gen {:main-opts ["-m" "kotodama.inference.kotoba-oracle-gen"]}
   :verify-shard {:extra-paths ["verify"]
                  :main-opts ["-m" "kotodama.verify.gemma4-e4b-shard"]}

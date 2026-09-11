@@ -62,7 +62,7 @@
         resource (or (io/resource path)
                      (throw (ex-info "oracle artifact missing from the classpath"
                                      {:oracle-id oracle-id :path path
-                                      :fix "clojure -M:test:gen"})))]
+                                      :fix "kbb -M:test:gen"})))]
     (edn/read-string (slurp resource))))
 
 (defn kir

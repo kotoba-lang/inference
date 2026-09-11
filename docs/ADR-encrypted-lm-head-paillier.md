@@ -60,7 +60,7 @@ prompt-to-token inference.
 
 ## Verification
 
-`clojure -M:verify-encrypted-lm-head` emits a receipt containing:
+`kbb -M:verify-encrypted-lm-head` emits a receipt containing:
 
 - a 2048-bit key gate;
 - distinct ciphertexts for repeated encryption of the same hidden vector;

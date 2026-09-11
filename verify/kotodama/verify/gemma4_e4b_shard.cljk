@@ -5,7 +5,7 @@
   tensors inside the range byte-identical (span + payload prefix), and the
   shard's resident byte total reported for the credits ledger.
 
-  Runs under the JVM (clojure -M:verify-shard) AND babashka (bb -cp …) so a
+  Runs under the JVM (kbb -M:verify-shard) AND babashka (kbb -cp …) so a
   fleet node needs nothing but the bb binary and this repo's sources — the
   distributed half of kotoba-native inference, before the compute lands.
 

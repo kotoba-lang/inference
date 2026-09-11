@@ -1,6 +1,6 @@
 ;; Regenerate the precompiled KIR artifacts from the Kotoba decision cores.
 ;;
-;;   clojure -M:test:gen
+;;   kbb -M:test:gen
 ;;
 ;; Discovers every kotoba/*_core.kotoba and writes
 ;; resources/kotodama/oracle/<name>.kir.edn through the same
