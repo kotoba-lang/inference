@@ -21,6 +21,7 @@
 //                  scale 1/sqrt(head_dim), then * sigmoid(gate) (qwen35 attn gate)
 //   argmax         greedy token over n logits (two-stage: per-workgroup then final)
 //   add            residual: o = a + b                                                (n)
+//   add_rmsnorm    fused residual + norm: o = a + b ; s = rmsnorm(o) * c              (n, one workgroup)
 //   f32_matvec     o[r] = sum_i w[r*n + i] * x[i] for f32 weights (router ffn_gate_inp
 //                  [256 x 2048], shared-expert gate [1 x 2048]); one workgroup per row
 
@@ -153,13 +154,17 @@ fn softmax_topk(@builtin(local_invocation_id) lid: vec3<u32>) {
   if t < k { o[t] = o[t] / wsum * P.scale; }
 }
 
-// a = x_alpha [rows], b = dt_bias [rows], c = ssm_a [rows], s = x_beta [rows] -> o = g (log decay),
-// s = sigmoid(s) in place (beta), so both feed deltanet_step from their own buffers.
+// a = [x_alpha (rows) ... x_beta (rows) at element aux2] (one read-only slice of the concatenated
+// z|alpha|alpha|beta projection output), b = dt_bias [rows], c = ssm_a [rows] ->
+// o[h] = g = softplus(x_alpha + dt) * ssm_a (log decay), o[aux + h] = beta = sigmoid(x_beta).
+// aux = 64 in the harness so beta starts 256 bytes in and can be bound as its own range. Everything
+// read comes through read-only bindings: WebGPU rejects one buffer bound read-only and read-write
+// in the same dispatch, which is what a beta-in-place variant did (measured 2026-09-18).
 @compute @workgroup_size(256)
 fn gate_decay(@builtin(global_invocation_id) gid: vec3<u32>) {
   let h = gid.x; if h >= P.rows { return; }
   o[h] = softplus(a[h] + b[h]) * c[h];
-  s[h] = sigmoid(s[h]);
+  o[P.aux + h] = sigmoid(a[P.aux2 + h]);
 }
 
 // a = expert_out [k x n], b = weights [k], c = shexp_out [n], s[0] = shared gate logit -> o [n]
@@ -256,4 +261,16 @@ fn f32_matvec(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id
   for (var i = t; i < n; i += 256u) { acc += a[base + i] * b[i]; }
   let tot = wg_sum(t, acc);
   if t == 0u { o[r] = tot; }
+}
+
+// a = x [n], b = delta [n], c = w [n] -> o = x + delta (the new residual stream), s = rmsnorm(o) * w.
+// One workgroup: the sum of squares needs the whole row. Replaces add + rmsnorm (2 dispatches -> 1).
+@compute @workgroup_size(256)
+fn add_rmsnorm(@builtin(local_invocation_id) lid: vec3<u32>) {
+  let t = lid.x; let n = P.n;
+  var ss = 0.0;
+  for (var i = t; i < n; i += 256u) { let v = a[i] + b[i]; o[i] = v; ss += v * v; }
+  let tot = wg_sum(t, ss);
+  let inv = inverseSqrt(tot / f32(n) + P.eps);
+  for (var i = t; i < n; i += 256u) { s[i] = o[i] * inv * c[i]; }
 }
