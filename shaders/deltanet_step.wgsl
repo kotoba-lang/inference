@@ -20,9 +20,12 @@
 // V are 128 in Nex (linear_key_head_dim = linear_value_head_dim = 128), so the
 // workgroup is 128 threads and each thread walks 128 rows four times.
 //
-// Key heads are fewer than value heads in Nex (16 vs 32): the host passes
-// kv_head_of(h) = h / (heads / k_heads) through params.kv_group so q/k are read
-// from head h / kv_group.
+// Key heads are fewer than value heads in Nex (16 vs 32). llama.cpp maps value
+// head h to key/query head h % k_heads (ggml_compute_forward_gated_delta_net:
+// iq1 = iv1 % neq1; the unfused path's ggml_repeat_4d tiles the same way) --
+// NOT h / group. Measured 2026-09-18: with h / group, value head 1 read key
+// head 0 and layer-0 output diverged from llama.cpp at head 1 while head 0
+// matched. params.k_heads carries the key-head count.
 //
 // Dispatch: (heads, 1, 1) workgroups. State is updated in place.
 
@@ -30,7 +33,7 @@ struct Meta {
   heads: u32,       // value heads (32 in Nex)
   k_dim: u32,       // 128
   v_dim: u32,       // 128, must equal the workgroup size
-  kv_group: u32,    // value heads per key head (2 in Nex)
+  k_heads: u32,     // key/query heads (16 in Nex); value head h uses key head h % k_heads
 }
 
 @group(0) @binding(0) var<uniform> params: Meta;
@@ -49,7 +52,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
   if h >= params.heads || j >= params.v_dim { return; }
   let K = params.k_dim;
   let V = params.v_dim;
-  let kh = h / params.kv_group;
+  let kh = h % params.k_heads;
   let sbase = h * K * V;
   let decay = exp(g[h]);
   let b = beta[h];

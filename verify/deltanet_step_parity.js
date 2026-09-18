@@ -32,7 +32,7 @@ const S = new Float64Array(HEADS * K * V);
 function refStep({q, k, v, g, beta}) {
   const o = new Float64Array(HEADS * V);
   for (let h = 0; h < HEADS; h++) {
-    const kh = Math.floor(h / GROUP), dec = Math.exp(g[h]), base = h * K * V;
+    const kh = h % KHEADS, dec = Math.exp(g[h]), base = h * K * V;
     const kvm = new Float64Array(V);
     for (let i = 0; i < K; i++) for (let j = 0; j < V; j++) { S[base + i * V + j] *= dec; kvm[j] += S[base + i * V + j] * k[kh * K + i]; }
     const delta = new Float64Array(V); for (let j = 0; j < V; j++) delta[j] = (v[h * V + j] - kvm[j]) * beta[h];
@@ -41,7 +41,7 @@ function refStep({q, k, v, g, beta}) {
   return o;
 }
 // GPU
-const meta = mk(16, UU); write(meta, new Uint32Array([HEADS, K, V, GROUP]));
+const meta = mk(16, UU); write(meta, new Uint32Array([HEADS, K, V, KHEADS]));
 const bq = mk(KHEADS * K * 4), bk = mk(KHEADS * K * 4), bv = mk(HEADS * V * 4), bg = mk(HEADS * 4), bb = mk(HEADS * 4);
 const bstate = mk(HEADS * K * V * 4); write(bstate, new Float32Array(HEADS * K * V));
 const bout = mk(HEADS * V * 4);

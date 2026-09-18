@@ -73,14 +73,16 @@ fn rmsnorm(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) l
   for (var i = t; i < n; i += 256u) { o[obase + i] = a[ibase + i] * inv * b[i]; }
 }
 
-// a = x [rows x n] -> o = x / sqrt(sum x^2 + eps)
+// a = x [rows x n] -> o = x / sqrt(sum x^2 + eps) * scale (scale 0 -> 1). llama.cpp's
+// build_gdn_l2_norm is rms_norm(x, eps/n) / sqrt(n), i.e. exactly this; the delta-net q is then
+// scaled by 1/sqrt(S_k) (delta-net-base.cpp), which the harness folds into `scale`.
 @compute @workgroup_size(256)
 fn l2norm(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
   let r = wg.x; let t = lid.x; let n = P.n; let base = r * n;
   var ss = 0.0;
   for (var i = t; i < n; i += 256u) { let x = a[base + i]; ss += x * x; }
   let tot = wg_sum(t, ss);
-  let inv = inverseSqrt(tot + P.eps);
+  let inv = inverseSqrt(tot + P.eps) * select(P.scale, 1.0, P.scale == 0.0);
   for (var i = t; i < n; i += 256u) { o[base + i] = a[base + i] * inv; }
 }
 

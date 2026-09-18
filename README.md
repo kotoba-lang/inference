@@ -173,6 +173,28 @@ K-quant dots, the expert gather and the delta-net step, every kernel of a Nex
 decode step now exists; composing them into one command buffer against real
 weights needs a GPU that is not serving.
 
+## The composed Nex decode step (`verify/nex_decode_step.js`)
+
+```sh
+deno run --unstable-webgpu --allow-read --allow-env verify/nex_decode_step.js <Nex-N2.5-mini-Uncensored-IQ4_XS.gguf> 760,6511,314,9338,369 8 11751,13,220,97034,95779,103725,95895,9398
+```
+
+All 40 layers of Nex-N2.5-mini on the GPU from the served GGUF (18.45 GB with
+`token_embd`), **one command buffer per token**, the only readback the argmax
+token id. Matvecs use `shaders/ggml_kdot_f32.wgsl` (weights dequantised
+in-kernel, f32 activations — what llama.cpp's GPU backends do; the Q8_K
+activation path diverged from them by 7% at layer 0). 2026-09-18 on M1 Max:
+layer 0 and layer 3 match an f64 reference (`verify/nex_layer0_reference.js`) to
+~1e-6; after the prompt the top-8 next tokens equal llama.cpp Metal's set and
+order, the top-1/top-2 logprob gap matches both llama.cpp builds to 0.04, and
+the first two greedy tokens equal the B70 Vulkan control host's (" Paris", ".").
+68 ms/token (14.7 tok/s) vs llama.cpp Metal 56.5 tok/s on the same Mac — the
+3.9× is kernel bandwidth, the next co-scientist target. Gate
+`:nex-decode-step-parity`. Two bugs this harness found and fixed: the value-head
+→ key-head mapping is `h % k_heads` (llama.cpp), not `h / group`; and 18 GB of
+queued `writeBuffer`s must be flushed with a submit per tensor or wgpu drops the
+small ones.
+
 ## Stable JVM production entry point (`kotodama.inference.host.jvm`)
 
 Downstream JVM hosts (e.g. `kotoba-lang/murakumo-studio`) should call the
