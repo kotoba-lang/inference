@@ -116,6 +116,14 @@ M1 Max; one command buffer per token 40.5 / 39.9 (per-layer) / 71.8 ms — a
 weight-stream floor (24.7 tok/s on B70), not a generation rate. Needs ~8 GB
 free GPU memory; do not run the full size on a serving node.
 
+`shaders/q8k_quantize.wgsl` quantises an f32 activation row into ggml's
+`block_q8_K` stream on the GPU (one 64-thread workgroup per 256-block, bsums
+included), so a decode step never brings the hidden state back to the host.
+`verify/q8k_quantize_parity.js` checks it against a JS port of
+`quantize_row_q8_K_ref` (qs/bsums exact; `d` within the backend's f32 division
+bound, 1 ulp Metal / 2 ulp Intel and AMD) and feeds both streams through
+`ggml_kdot_wg.wgsl`. 2026-09-18: 10240-wide × 3 rows in 0.006–0.018 ms.
+
 ## Stable JVM production entry point (`kotodama.inference.host.jvm`)
 
 Downstream JVM hosts (e.g. `kotoba-lang/murakumo-studio`) should call the
