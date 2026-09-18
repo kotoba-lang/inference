@@ -138,6 +138,13 @@ pins the expected values. Owner 2026-09-18: Nex is the verification target and
 the finished path is Kotoba + amu native only; the Gemma4/JVM host is the
 correctness oracle's history, not the road.
 
+`ggml_kdot_wg.wgsl` also reads **Q5_K (13)** and **IQ4_XS (23)** — the two
+types Nex-N2.5-mini adds (attn_qkv is Q5_K; 391 of 733 tensors are IQ4_XS).
+`verify/nex_kdot_parity.js` runs the real `blk.0.attn_gate.weight` and
+`blk.0.attn_qkv.weight`, cut from the served GGUF, against JS ports of ggml's
+generic reference dots: 2026-09-18 maxAbs 6e-7 / 1.2e-6, identical on M1 Max,
+Intel B70 and AMD 8060S. Gate `:nex-kdot-parity`.
+
 ## Stable JVM production entry point (`kotodama.inference.host.jvm`)
 
 Downstream JVM hosts (e.g. `kotoba-lang/murakumo-studio`) should call the
