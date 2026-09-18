@@ -54,12 +54,12 @@ log("gguf", {version, nTensors, arch, dataOff}, H);
 // ---------------- GPU ----------------
 const adapter = await navigator.gpu.requestAdapter(); if (!adapter) throw new Error("no adapter");
 const device = await adapter.requestDevice({requiredLimits: {maxStorageBufferBindingSize: Math.min(adapter.limits.maxStorageBufferBindingSize, 1 << 30), maxBufferSize: Math.min(adapter.limits.maxBufferSize, 1 << 30), maxStorageBuffersPerShaderStage: Math.max(8, adapter.limits.maxStorageBuffersPerShaderStage >= 8 ? 8 : adapter.limits.maxStorageBuffersPerShaderStage)}});
-device.pushErrorScope("validation");
+device.pushErrorScope("validation"); device.pushErrorScope("out-of-memory");
 const src = async (f) => await Deno.readTextFile(new URL("../shaders/" + f, here));
 const mod = async (f) => device.createShaderModule({code: await src(f)});
-const kdotPipe = device.createComputePipeline({layout: "auto", compute: {module: await mod("ggml_kdot_wg.wgsl"), entryPoint: "main"}});
-const moePipe = device.createComputePipeline({layout: "auto", compute: {module: await mod("ggml_kdot_moe.wgsl"), entryPoint: "main"}});
-const q8Pipe = device.createComputePipeline({layout: "auto", compute: {module: await mod("q8k_quantize.wgsl"), entryPoint: "main"}});
+// One dot kernel with f32 activations for both plain matvecs (expert_ids = [0]) and expert gathers.
+const kdotPipe = device.createComputePipeline({layout: "auto", compute: {module: await mod("ggml_kdot_f32.wgsl"), entryPoint: "main"}});
+const moePipe = kdotPipe;
 const dnPipe = device.createComputePipeline({layout: "auto", compute: {module: await mod("deltanet_step.wgsl"), entryPoint: "main"}});
 const opsMod = await mod("nex_ops.wgsl");
 const bgl = device.createBindGroupLayout({entries: [
@@ -89,6 +89,10 @@ async function upload(name) {
   const t = tensors[name]; if (!t) throw new Error("missing tensor " + name);
   const bytes = tensorBytes(t); const b = gbuf(bytes);
   const CH = 64 << 20; for (let o = 0; o < bytes; o += CH) { const n = Math.min(CH, bytes - o); const chunk = await readAt(dataOff + t.off + o, n); device.queue.writeBuffer(b, o, chunk, 0, n); }
+  // Flush: wgpu stages queue.writeBuffer data until the next submit; 18 GB of pending staging
+  // silently lost the small tensors (measured: layer norm weights read back as zeros while the
+  // last-uploaded output_norm was intact). An empty submit per tensor bounds the staging.
+  device.queue.submit([]);
   uploaded += bytes; return {buf: b, t};
 }
 // f32 tensor to a JS array (small ones)
@@ -137,71 +141,66 @@ for (let il = 0; il < H.nLayer; il++) {
   L.gateExps = await w("ffn_gate_exps.weight"); L.upExps = await w("ffn_up_exps.weight"); L.downExps = await w("ffn_down_exps.weight");
   L.gateSh = await w("ffn_gate_shexp.weight"); L.upSh = await w("ffn_up_shexp.weight"); L.downSh = await w("ffn_down_shexp.weight");
   layers.push(L);
-  if (il % 5 === 4) log(`layer ${il} uploaded, ${(uploaded / 1e9).toFixed(2)} GB so far`);
+  if (il % 5 === 4) { await device.queue.onSubmittedWorkDone(); log(`layer ${il} uploaded, ${(uploaded / 1e9).toFixed(2)} GB so far`); }
 }
 const outNorm = await upload("output_norm.weight"); const outW = await upload("output.weight");
 await device.queue.onSubmittedWorkDone();
 log(`weights uploaded: ${(uploaded / 1e9).toFixed(2)} GB`);
 
 // ---------------- bind groups (static) ----------------
-const kdotBG = (W, q8, out, rows, cols, outOffsetBytes = 0, weightOffsetBytes = 0, weightBytes = null) => {
-  const m = meta4(rows, cols, W.t.type, 1);
+const zeroIds = gbuf(16); device.queue.writeBuffer(zeroIds, 0, new Uint32Array([0, 0, 0, 0]));
+// plain matvec: expert 0 of a 1-expert tensor = the tensor itself; xin is an f32 buffer (or [buf, off, size])
+const kdotBG = (W, xin, out, rows, cols, outOffsetBytes = 0, weightOffsetBytes = 0, weightBytes = null) => {
+  const m = meta8(rows, cols, W.t.type, 1, 0, 0, 0, 0);
   const wres = weightBytes ? [W.buf, weightOffsetBytes, weightBytes] : W.buf;
   const ores = outOffsetBytes ? [out, outOffsetBytes, rows * 4] : out;
-  return {bg: device.createBindGroup({layout: kdotPipe.getBindGroupLayout(0), entries: ent([m, wres, q8, ores])}), rows};
+  return {bg: device.createBindGroup({layout: kdotPipe.getBindGroupLayout(0), entries: ent([m, wres, xin, ores, zeroIds])}), rows};
 };
-const moeBG = (W, q8, out, rowsPerExpert, cols, perExpertInput) => ({bg: device.createBindGroup({layout: moePipe.getBindGroupLayout(0), entries: ent([meta8(rowsPerExpert, cols, W.t.type, H.nExpertUsed, perExpertInput ? 1 : 0, 0, 0, 0), W.buf, q8, out, A.topIds])}), rows: rowsPerExpert});
-const q8BG = (x, q8, blocks, rows) => ({bg: device.createBindGroup({layout: q8Pipe.getBindGroupLayout(0), entries: ent([meta4(blocks, rows, 0, 0), x, q8])}), blocks, rows});
+const moeBG = (W, xin, out, rowsPerExpert, cols, perExpertInput) => ({bg: device.createBindGroup({layout: moePipe.getBindGroupLayout(0), entries: ent([meta8(rowsPerExpert, cols, W.t.type, H.nExpertUsed, perExpertInput ? 1 : 0, 0, 0, 0), W.buf, xin, out, A.topIds])}), rows: rowsPerExpert});
 const opBG = (metaBuf, a, b, c, o, s, ids) => device.createBindGroup({layout: bgl, entries: ent([metaBuf, a, b ?? dummies[0], c ?? dummies[1], o, s ?? dummies[2], ids ?? dummies[3]])});
 const kdotOutBytes = 0;
 for (const L of layers) {
   L.bg = {};
   L.bg.attnNorm = opBG(opsMeta(E, 1, 0, 0, H.eps, 0), A.x, L.attnNorm.buf, null, A.h);
-  L.bg.q8x = q8BG(A.h, A.q8x, E / 256, 1);
-  if (L.recr) {
-    L.bg.qkv = kdotBG(L.qkv, A.q8x, A.qkv, QKV, E); L.bg.z = kdotBG(L.gate, A.q8x, A.z, VD, E);
-    L.bg.alpha = kdotBG(L.alpha, A.q8x, A.alpha, H.nVHeads, E); L.bg.beta = kdotBG(L.beta, A.q8x, A.beta, H.nVHeads, E);
+    if (L.recr) {
+    L.bg.qkv = kdotBG(L.qkv, A.h, A.qkv, QKV, E); L.bg.z = kdotBG(L.gate, A.h, A.z, VD, E);
+    L.bg.alpha = kdotBG(L.alpha, A.h, A.alpha, H.nVHeads, E); L.bg.beta = kdotBG(L.beta, A.h, A.beta, H.nVHeads, E);
     L.bg.gateDecay = opBG(opsMeta(0, H.nVHeads, 0, 0, 0, 0), A.alpha, L.dt.buf, L.ssmA.buf, A.g, A.beta);
     L.bg.conv = opBG(opsMeta(QKV, 1, 0, 0, 0, 0), A.qkv, L.conv1d.buf, null, A.conv, L.convRing);
-    L.bg.qn = opBG(opsMeta(H.dState, H.nKHeads, 0, 0, H.eps, 0), [A.conv, 0, KD * 4], null, null, A.qn);
+    L.bg.qn = opBG(opsMeta(H.dState, H.nKHeads, 0, 0, H.eps, 1 / Math.sqrt(H.dState)), [A.conv, 0, KD * 4], null, null, A.qn); // q * 1/sqrt(S_k) as in delta-net-base.cpp
     L.bg.kn = opBG(opsMeta(H.dState, H.nKHeads, 0, 0, H.eps, 0), [A.conv, KD * 4, KD * 4], null, null, A.kn);
-    L.bg.dn = device.createBindGroup({layout: dnPipe.getBindGroupLayout(0), entries: ent([meta4(H.nVHeads, H.dState, H.dState, H.nVHeads / H.nKHeads), A.qn, A.kn, [A.conv, 2 * KD * 4, VD * 4], A.g, A.beta, L.state, A.dnOut])});
+    L.bg.dn = device.createBindGroup({layout: dnPipe.getBindGroupLayout(0), entries: ent([meta4(H.nVHeads, H.dState, H.dState, H.nKHeads), A.qn, A.kn, [A.conv, 2 * KD * 4, VD * 4], A.g, A.beta, L.state, A.dnOut])});
     L.bg.gnorm = opBG(opsMeta(H.dState, H.nVHeads, 0, 0, H.eps, 0), A.dnOut, L.ssmNorm.buf, A.z, A.gnorm);
-    L.bg.q8vd = q8BG(A.gnorm, A.q8vd, VD / 256, 1);
-    L.bg.out = kdotBG(L.out, A.q8vd, A.attnOut, E, VD);
+    L.bg.out = kdotBG(L.out, A.gnorm, A.attnOut, E, VD);
   } else {
-    L.bg.q = kdotBG(L.q, A.q8x, A.qFull, H.nHead * H.headDim * 2, E); L.bg.k = kdotBG(L.k, A.q8x, A.kProj, H.nHeadKv * H.headDim, E); L.bg.v = kdotBG(L.v, A.q8x, A.vProj, H.nHeadKv * H.headDim, E);
+    L.bg.q = kdotBG(L.q, A.h, A.qFull, H.nHead * H.headDim * 2, E); L.bg.k = kdotBG(L.k, A.h, A.kProj, H.nHeadKv * H.headDim, E); L.bg.v = kdotBG(L.v, A.h, A.vProj, H.nHeadKv * H.headDim, E);
     L.bg.qNorm = opBG(opsMeta(H.headDim, H.nHead, 2 * H.headDim, 0, H.eps, 0), A.qFull, L.qNormW.buf, null, A.qNorm);
     L.bg.kNorm = opBG(opsMeta(H.headDim, H.nHeadKv, 0, 0, H.eps, 0), A.kProj, L.kNormW.buf, null, A.kNorm);
     L.ropeQMeta = opsMeta(H.headDim, H.nHead, H.nRot, 0, 0, H.ropeBase); L.ropeKMeta = opsMeta(H.headDim, H.nHeadKv, H.nRot, 0, 0, H.ropeBase);
     L.bg.ropeQ = opBG(L.ropeQMeta, A.qNorm, null, null, A.qRope); L.bg.ropeK = opBG(L.ropeKMeta, A.kNorm, null, null, A.kRope);
     L.attnMeta = opsMeta(H.headDim, H.nHead, 1, H.nHeadKv, -1.0, 1 / Math.sqrt(H.headDim));
     L.bg.attn = opBG(L.attnMeta, A.qRope, L.kCache, L.vCache, A.attnO, A.qFull);
-    L.bg.q8attn = q8BG(A.attnO, A.q8attn, (H.nHead * H.headDim) / 256, 1);
-    L.bg.o = kdotBG(L.o, A.q8attn, A.attnOut, E, H.nHead * H.headDim);
+    L.bg.o = kdotBG(L.o, A.attnO, A.attnOut, E, H.nHead * H.headDim);
   }
   L.bg.resid = opBG(opsMeta(E, 1, 0, 0, 0, 0), A.x, A.attnOut, null, A.resid);
   L.bg.postNorm = opBG(opsMeta(E, 1, 0, 0, H.eps, 0), A.resid, L.postNorm.buf, null, A.h2);
-  L.bg.q8h2 = q8BG(A.h2, A.q8h2, E / 256, 1);
   L.bg.router = opBG(opsMeta(E, H.nExpert, 0, 0, 0, 0), L.gateInp.buf, A.h2, null, A.router);
   L.bg.shLogit = opBG(opsMeta(E, 1, 0, 0, 0, 0), L.gateInpSh.buf, A.h2, null, A.shLogit);
   L.bg.topk = opBG(opsMeta(H.nExpert, 1, H.nExpertUsed, 0, 0, 1.0), A.router, null, null, A.topW, null, A.topIds);
-  L.bg.gateE = moeBG(L.gateExps, A.q8h2, A.gateE, H.nFfExp, E, false); L.bg.upE = moeBG(L.upExps, A.q8h2, A.upE, H.nFfExp, E, false);
+  L.bg.gateE = moeBG(L.gateExps, A.h2, A.gateE, H.nFfExp, E, false); L.bg.upE = moeBG(L.upExps, A.h2, A.upE, H.nFfExp, E, false);
   L.bg.actE = opBG(opsMeta(H.nExpertUsed * H.nFfExp, 1, 0, 0, 0, 0), A.gateE, A.upE, null, A.actE);
-  L.bg.q8e = q8BG(A.actE, A.q8e, H.nFfExp / 256, H.nExpertUsed);
-  L.bg.downE = moeBG(L.downExps, A.q8e, A.downE, E, H.nFfExp, true);
-  L.bg.shGate = kdotBG(L.gateSh, A.q8h2, A.shGate, H.nFfShexp, E); L.bg.shUp = kdotBG(L.upSh, A.q8h2, A.shUp, H.nFfShexp, E);
+  L.bg.downE = moeBG(L.downExps, A.actE, A.downE, E, H.nFfExp, true);
+  L.bg.shGate = kdotBG(L.gateSh, A.h2, A.shGate, H.nFfShexp, E); L.bg.shUp = kdotBG(L.upSh, A.h2, A.shUp, H.nFfShexp, E);
   L.bg.shAct = opBG(opsMeta(H.nFfShexp, 1, 0, 0, 0, 0), A.shGate, A.shUp, null, A.shAct);
-  L.bg.q8sh = q8BG(A.shAct, A.q8sh, H.nFfShexp / 256, 1);
-  L.bg.shDown = kdotBG(L.downSh, A.q8sh, A.shDown, E, H.nFfShexp);
+  L.bg.shDown = kdotBG(L.downSh, A.shAct, A.shDown, E, H.nFfShexp);
   L.bg.wsum = opBG(opsMeta(E, 1, H.nExpertUsed, 0, 0, 0), A.downE, A.topW, A.shDown, A.ffnOut, A.shLogit);
   L.bg.resid2 = opBG(opsMeta(E, 1, 0, 0, 0, 0), A.resid, A.ffnOut, null, A.x);
 }
 const finalBG = {
-  norm: opBG(opsMeta(E, 1, 0, 0, H.eps, 0), A.x, outNorm.buf, null, A.hn), q8: q8BG(A.hn, A.q8hn, E / 256, 1),
+  norm: opBG(opsMeta(E, 1, 0, 0, H.eps, 0), A.x, outNorm.buf, null, A.hn),
   lmChunks: [], parts: Math.ceil(H.vocab / 4096),
 };
-{ const CH = 62080; const rb = rowBytes(outW.t); for (let r0 = 0; r0 < H.vocab; r0 += CH) { const rows = Math.min(CH, H.vocab - r0); finalBG.lmChunks.push(kdotBG(outW, A.q8hn, A.logits, rows, E, r0 * 4, r0 * rb, rows * rb)); } }
+{ const CH = 62080; const rb = rowBytes(outW.t); for (let r0 = 0; r0 < H.vocab; r0 += CH) { const rows = Math.min(CH, H.vocab - r0); finalBG.lmChunks.push(kdotBG(outW, A.hn, A.logits, rows, E, r0 * 4, r0 * rb, rows * rb)); } }
 finalBG.amaxP = opBG(opsMeta(H.vocab, 1, finalBG.parts, 0, 0, 0), A.logits, null, null, A.amaxVal, A.amaxPart, A.amaxIds);
 finalBG.amaxF = opBG(opsMeta(H.vocab, 1, finalBG.parts, 0, 0, 0), A.logits, null, null, A.amaxVal, A.amaxPart, A.amaxIds);
 const idStaging = device.createBuffer({size: (finalBG.parts + 1) * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ});
@@ -214,11 +213,11 @@ const wgN = (n) => Math.ceil(n / 256);
 // every layer]? No -- layers are sequential, so the copy must sit between rope and attn of the same
 // layer. WebGPU allows copyBufferToBuffer between compute passes in one command buffer, so the step
 // is one command buffer with 10 short pass breaks (one per attention layer), still one submit.
+const DEBUG_LAYERS = Number(Deno.env.get("NEX_DEBUG_LAYERS") ?? 0);
 function encodeToken(enc, position) {
   let p = enc.beginComputePass();
-  for (const L of layers) {
+  for (const L of (DEBUG_LAYERS ? layers.slice(0, DEBUG_LAYERS) : layers)) {
     p.setPipeline(OPS.rmsnorm); p.setBindGroup(0, L.bg.attnNorm); p.dispatchWorkgroups(1);
-    p.setPipeline(q8Pipe); p.setBindGroup(0, L.bg.q8x.bg); p.dispatchWorkgroups(L.bg.q8x.blocks, 1);
     if (L.recr) {
       p.setPipeline(kdotPipe);
       for (const k of [L.bg.qkv, L.bg.z, L.bg.alpha, L.bg.beta]) { p.setBindGroup(0, k.bg); p.dispatchWorkgroups(k.rows, 1, 1); }
@@ -227,7 +226,6 @@ function encodeToken(enc, position) {
       p.setPipeline(OPS.l2norm); p.setBindGroup(0, L.bg.qn); p.dispatchWorkgroups(H.nKHeads); p.setBindGroup(0, L.bg.kn); p.dispatchWorkgroups(H.nKHeads);
       p.setPipeline(dnPipe); p.setBindGroup(0, L.bg.dn); p.dispatchWorkgroups(H.nVHeads);
       p.setPipeline(OPS.gated_rmsnorm); p.setBindGroup(0, L.bg.gnorm); p.dispatchWorkgroups(H.nVHeads);
-      p.setPipeline(q8Pipe); p.setBindGroup(0, L.bg.q8vd.bg); p.dispatchWorkgroups(L.bg.q8vd.blocks, 1);
       p.setPipeline(kdotPipe); p.setBindGroup(0, L.bg.out.bg); p.dispatchWorkgroups(L.bg.out.rows, 1, 1);
     } else {
       p.setPipeline(kdotPipe);
@@ -240,32 +238,55 @@ function encodeToken(enc, position) {
       enc.copyBufferToBuffer(A.vProj, 0, L.vCache, position * kvBytes, kvBytes);
       p = enc.beginComputePass();
       p.setPipeline(OPS.attn_decode); p.setBindGroup(0, L.bg.attn); p.dispatchWorkgroups(H.nHead);
-      p.setPipeline(q8Pipe); p.setBindGroup(0, L.bg.q8attn.bg); p.dispatchWorkgroups(L.bg.q8attn.blocks, 1);
       p.setPipeline(kdotPipe); p.setBindGroup(0, L.bg.o.bg); p.dispatchWorkgroups(L.bg.o.rows, 1, 1);
     }
     p.setPipeline(OPS.add); p.setBindGroup(0, L.bg.resid); p.dispatchWorkgroups(wgN(E));
     p.setPipeline(OPS.rmsnorm); p.setBindGroup(0, L.bg.postNorm); p.dispatchWorkgroups(1);
-    p.setPipeline(q8Pipe); p.setBindGroup(0, L.bg.q8h2.bg); p.dispatchWorkgroups(L.bg.q8h2.blocks, 1);
     p.setPipeline(OPS.f32_matvec); p.setBindGroup(0, L.bg.router); p.dispatchWorkgroups(H.nExpert); p.setBindGroup(0, L.bg.shLogit); p.dispatchWorkgroups(1);
     p.setPipeline(OPS.softmax_topk); p.setBindGroup(0, L.bg.topk); p.dispatchWorkgroups(1);
     p.setPipeline(moePipe); p.setBindGroup(0, L.bg.gateE.bg); p.dispatchWorkgroups(H.nFfExp, H.nExpertUsed); p.setBindGroup(0, L.bg.upE.bg); p.dispatchWorkgroups(H.nFfExp, H.nExpertUsed);
     p.setPipeline(OPS.silu_mul); p.setBindGroup(0, L.bg.actE); p.dispatchWorkgroups(wgN(H.nExpertUsed * H.nFfExp));
-    p.setPipeline(q8Pipe); p.setBindGroup(0, L.bg.q8e.bg); p.dispatchWorkgroups(L.bg.q8e.blocks, L.bg.q8e.rows);
     p.setPipeline(moePipe); p.setBindGroup(0, L.bg.downE.bg); p.dispatchWorkgroups(E, H.nExpertUsed);
     p.setPipeline(kdotPipe); p.setBindGroup(0, L.bg.shGate.bg); p.dispatchWorkgroups(H.nFfShexp, 1, 1); p.setBindGroup(0, L.bg.shUp.bg); p.dispatchWorkgroups(H.nFfShexp, 1, 1);
     p.setPipeline(OPS.silu_mul); p.setBindGroup(0, L.bg.shAct); p.dispatchWorkgroups(wgN(H.nFfShexp));
-    p.setPipeline(q8Pipe); p.setBindGroup(0, L.bg.q8sh.bg); p.dispatchWorkgroups(L.bg.q8sh.blocks, 1);
     p.setPipeline(kdotPipe); p.setBindGroup(0, L.bg.shDown.bg); p.dispatchWorkgroups(E, 1, 1);
     p.setPipeline(OPS.weighted_sum); p.setBindGroup(0, L.bg.wsum); p.dispatchWorkgroups(wgN(E));
     p.setPipeline(OPS.add); p.setBindGroup(0, L.bg.resid2); p.dispatchWorkgroups(wgN(E));
   }
   p.setPipeline(OPS.rmsnorm); p.setBindGroup(0, finalBG.norm); p.dispatchWorkgroups(1);
-  p.setPipeline(q8Pipe); p.setBindGroup(0, finalBG.q8.bg); p.dispatchWorkgroups(finalBG.q8.blocks, 1);
   p.setPipeline(kdotPipe); for (const c of finalBG.lmChunks) { p.setBindGroup(0, c.bg); p.dispatchWorkgroups(c.rows, 1, 1); }
   p.setPipeline(OPS.argmax_partial); p.setBindGroup(0, finalBG.amaxP); p.dispatchWorkgroups(finalBG.parts);
   p.setPipeline(OPS.argmax_final); p.setBindGroup(0, finalBG.amaxF); p.dispatchWorkgroups(1);
   p.end();
   enc.copyBufferToBuffer(A.amaxIds, 0, idStaging, 0, (finalBG.parts + 1) * 4);
+}
+async function stats(name, buf, n, u32 = false) {
+  const st = device.createBuffer({size: n * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ});
+  const e = device.createCommandEncoder(); e.copyBufferToBuffer(buf, 0, st, 0, n * 4); device.queue.submit([e.finish()]);
+  await st.mapAsync(GPUMapMode.READ); const raw = st.getMappedRange().slice(0); st.unmap();
+  if (u32) { console.error(name, Array.from(new Uint32Array(raw)).slice(0, 16)); return; }
+  const a = new Float32Array(raw); let nan = 0, sum = 0, sq = 0, mx = -Infinity, mn = Infinity;
+  for (const v of a) { if (Number.isNaN(v) || !Number.isFinite(v)) { nan++; continue; } sum += v; sq += v * v; if (v > mx) mx = v; if (v < mn) mn = v; }
+  const m = sum / a.length; console.error(name.padEnd(12), `n=${a.length} nan/inf=${nan} mean=${m.toExponential(3)} rms=${Math.sqrt(sq / a.length).toExponential(3)} min=${mn.toExponential(2)} max=${mx.toExponential(2)} head=[${Array.from(a.slice(0, 4)).map((v) => v.toPrecision(4)).join(", ")}]`);
+}
+async function dumpF32(buf, n) { const st = device.createBuffer({size: n * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ}); const e = device.createCommandEncoder(); e.copyBufferToBuffer(buf, 0, st, 0, n * 4); device.queue.submit([e.finish()]); await st.mapAsync(GPUMapMode.READ); const a = Array.from(new Float32Array(st.getMappedRange().slice(0))); st.unmap(); return a; }
+async function dumpU32(buf, n) { const st = device.createBuffer({size: n * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ}); const e = device.createCommandEncoder(); e.copyBufferToBuffer(buf, 0, st, 0, n * 4); device.queue.submit([e.finish()]); await st.mapAsync(GPUMapMode.READ); const a = Array.from(new Uint32Array(st.getMappedRange().slice(0))); st.unmap(); return a; }
+async function debugDump() {
+  const L = layers[DEBUG_LAYERS - 1];
+  if (Deno.env.get("NEX_DEBUG_JSON")) {
+    const d = {xout: await dumpF32(A.x, E), h: await dumpF32(A.h, E), qFull: await dumpF32(A.qFull, H.nHead * H.headDim * 2), kProj: await dumpF32(A.kProj, H.nHeadKv * H.headDim), vProj: await dumpF32(A.vProj, H.nHeadKv * H.headDim), qNorm: await dumpF32(A.qNorm, H.nHead * H.headDim), qRope: await dumpF32(A.qRope, H.nHead * H.headDim), kRope: await dumpF32(A.kRope, H.nHeadKv * H.headDim), attnO: await dumpF32(A.attnO, H.nHead * H.headDim), qkv: await dumpF32(A.qkv, QKV), z: await dumpF32(A.z, VD), alpha: await dumpF32(A.alpha, H.nVHeads), g: await dumpF32(A.g, H.nVHeads), beta: await dumpF32(A.beta, H.nVHeads), conv: await dumpF32(A.conv, QKV), qn: await dumpF32(A.qn, KD), kn: await dumpF32(A.kn, KD), dnOut: await dumpF32(A.dnOut, VD), gnorm: await dumpF32(A.gnorm, VD), attnOut: await dumpF32(A.attnOut, E), resid: await dumpF32(A.resid, E), h2: await dumpF32(A.h2, E), router: await dumpF32(A.router, H.nExpert), topIds: await dumpU32(A.topIds, H.nExpertUsed), topW: await dumpF32(A.topW, H.nExpertUsed), gateE: await dumpF32(A.gateE, H.nExpertUsed * H.nFfExp), actE: await dumpF32(A.actE, H.nExpertUsed * H.nFfExp), downE: await dumpF32(A.downE, H.nExpertUsed * E), shDown: await dumpF32(A.shDown, E), shLogit: await dumpF32(A.shLogit, 1), ffnOut: await dumpF32(A.ffnOut, E)};
+    // NOTE: A.x has been overwritten by the layer output at this point; the layer input is resid - attnOut
+    if (DEBUG_LAYERS >= H.nLayer) { const lg = await dumpF32(A.logits, H.vocab); const top = Array.from(lg.keys()).sort((a, b) => lg[b] - lg[a]).slice(0, 8).map((i) => [i, +lg[i].toFixed(3)]); d.top8 = top; console.error("GPU top-8 logits", JSON.stringify(top)); }
+    await Deno.writeTextFile(Deno.env.get("NEX_DEBUG_JSON"), JSON.stringify(d)); console.error("wrote", Deno.env.get("NEX_DEBUG_JSON"));
+  }
+  console.error("attn_norm tensor", L.attnNorm.t, "bytes", tensorBytes(L.attnNorm.t));
+  await stats("attnNormW", L.attnNorm.buf, E); await stats("postNormW", L.postNorm.buf, E); await stats("outNormW", outNorm.buf, E);
+  await stats("x(in)", A.x, E); await stats("h(norm)", A.h, E);
+  if (L.recr) { await stats("qkv", A.qkv, QKV); await stats("z", A.z, VD); await stats("alpha", A.alpha, H.nVHeads); await stats("g", A.g, H.nVHeads); await stats("beta", A.beta, H.nVHeads); await stats("conv", A.conv, QKV); await stats("qn", A.qn, KD); await stats("kn", A.kn, KD); await stats("dnOut", A.dnOut, VD); await stats("gnorm", A.gnorm, VD); }
+  else { await stats("qFull", A.qFull, H.nHead * H.headDim * 2); await stats("qRope", A.qRope, H.nHead * H.headDim); await stats("kRope", A.kRope, H.nHeadKv * H.headDim); await stats("attnO", A.attnO, H.nHead * H.headDim); }
+  await stats("attnOut", A.attnOut, E); await stats("resid", A.resid, E); await stats("h2", A.h2, E); await stats("router", A.router, H.nExpert); await stats("topIds", A.topIds, H.nExpertUsed, true); await stats("topW", A.topW, H.nExpertUsed);
+  await stats("gateE", A.gateE, H.nExpertUsed * H.nFfExp); await stats("actE", A.actE, H.nExpertUsed * H.nFfExp); await stats("downE", A.downE, H.nExpertUsed * E); await stats("shDown", A.shDown, E); await stats("shLogit", A.shLogit, 1); await stats("ffnOut", A.ffnOut, E); await stats("x(out)", A.x, E);
+  await stats("hn", A.hn, E); await stats("logits", A.logits, H.vocab);
 }
 async function step(tokenId, position) {
   device.queue.writeBuffer(A.x, 0, await embedRow(tokenId));
@@ -273,6 +294,7 @@ async function step(tokenId, position) {
   const enc = device.createCommandEncoder(); encodeToken(enc, position);
   const t0 = performance.now(); device.queue.submit([enc.finish()]);
   await idStaging.mapAsync(GPUMapMode.READ); const ids = new Uint32Array(idStaging.getMappedRange().slice(0)); idStaging.unmap();
+  if (DEBUG_LAYERS && position === promptIds.length - 1) { await debugDump(); const oom = await device.popErrorScope(); const val = await device.popErrorScope(); console.error("scopes", oom?.message, val?.message); Deno.exit(0); }
   return {next: ids[finalBG.parts], ms: performance.now() - t0};
 }
 
@@ -282,7 +304,8 @@ let position = 0; let next = null;
 for (const id of promptIds) { const r = await step(id, position++); next = r.next; times.push(r.ms); }
 log(`prompt ${promptIds.length} tokens processed, first prediction ${next}`);
 for (let i = 0; i < nPredict; i++) { generated.push(next); const r = await step(next, position++); next = r.next; times.push(r.ms); }
-const validation = await device.popErrorScope();
+const oom = await device.popErrorScope(); const validation = await device.popErrorScope();
+if (oom) console.error("OUT OF MEMORY:", oom.message);
 const sorted = [...times].sort((a, b) => a - b);
 const report = {gpu: adapter.info?.description, model: modelPath.split("/").pop(), weightsGB: +(uploaded / 1e9).toFixed(2), promptIds, generated, expected, match: expected ? generated.slice(0, expected.length).filter((v, i) => v === expected[i]).length + "/" + Math.min(expected.length, generated.length) : "no expected given", msPerToken: {median: +sorted[Math.floor(sorted.length / 2)].toFixed(1), min: +sorted[0].toFixed(1)}, "tok/s@median": +(1000 / sorted[Math.floor(sorted.length / 2)]).toFixed(2), validation: validation?.message, submitsPerToken: 1};
 console.log(JSON.stringify(report));
