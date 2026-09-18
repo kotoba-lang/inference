@@ -57,9 +57,21 @@ const device = await adapter.requestDevice({requiredLimits: {maxStorageBufferBin
 device.pushErrorScope("validation"); device.pushErrorScope("out-of-memory");
 const src = async (f) => await Deno.readTextFile(new URL("../shaders/" + f, here));
 const mod = async (f) => device.createShaderModule({code: await src(f)});
-// One dot kernel with f32 activations for both plain matvecs (expert_ids = [0]) and expert gathers.
-const kdotPipe = device.createComputePipeline({layout: "auto", compute: {module: await mod("ggml_kdot_f32.wgsl"), entryPoint: "main"}});
-const moePipe = kdotPipe;
+// f32-activation K-quant dot, four layouts (co-scientist iteration 3): r1 = thread per 4 values, row
+// per workgroup; r8 = 8 rows per workgroup, x loaded once; v3 = sub-block per thread, x staged in
+// workgroup memory; v3b = v3 + codebook staged in workgroup memory. Which one is fastest depends on
+// the backend AND the tensor type (verify/kdot_f32_bench.js, 2026-09-18, GB/s on real Nex tensors):
+//   Intel B70 : Q5_K v3 162 / r8 108 / r1 22 ; IQ4_XS v3b 30-54 / v3 24-37 / r1 13-29
+//   AMD 8060S : Q5_K r8 151 / r1 92 ; IQ4_XS r1 51-81 / v3b 53-60
+//   M1 Max    : Q5_K v3b 29 / r8 26 ; IQ4_XS v3b 40 / v3 34 / r1 13-19
+// so the host picks per (backend, type). Owner 2026-09-18: every backend properly, none is the reference.
+const KDOT = {}; for (const [n, f] of [["r1", "ggml_kdot_f32.wgsl"], ["r8", "ggml_kdot_f32_r8.wgsl"], ["v3", "ggml_kdot_f32_v3.wgsl"], ["v3b", "ggml_kdot_f32_v3b.wgsl"]]) KDOT[n] = device.createComputePipeline({layout: "auto", compute: {module: await mod(f), entryPoint: "main"}});
+const gpuName = (adapter.info?.description ?? "").toLowerCase();
+const backend = gpuName.includes("intel") ? "intel" : gpuName.includes("radeon") || gpuName.includes("amd") ? "amd" : gpuName.includes("apple") ? "metal" : gpuName.includes("nvidia") || gpuName.includes("tegra") ? "nvidia" : "unknown";
+const KDOT_TABLE = {intel: {13: "v3", 23: "v3b", 14: "v3", 12: "v3"}, amd: {13: "r8", 23: "r1", 14: "r8", 12: "r8"}, metal: {13: "v3b", 23: "v3b", 14: "v3b", 12: "v3b"}, nvidia: {13: "v3", 23: "v3b", 14: "v3", 12: "v3"}, unknown: {13: "r1", 23: "r1", 14: "r1", 12: "r1"}};
+const kdotFor = (type) => { const n = (Deno.env.get("NEX_KDOT") ?? KDOT_TABLE[backend][type]) || "r1"; return {name: n, pipe: KDOT[n], groups: (rows) => n === "r1" ? rows : Math.ceil(rows / 8)}; };
+const kdotPipe = KDOT.r1; const moePipe = KDOT.r1; // identities used by the profiler's class detection
+log("backend", backend, "kdot table", KDOT_TABLE[backend], Deno.env.get("NEX_KDOT") ? `(forced ${Deno.env.get("NEX_KDOT")})` : "");
 const dnPipe = device.createComputePipeline({layout: "auto", compute: {module: await mod("deltanet_step.wgsl"), entryPoint: "main"}});
 const opsMod = await mod("nex_ops.wgsl");
 const bgl = device.createBindGroupLayout({entries: [
@@ -151,12 +163,12 @@ log(`weights uploaded: ${(uploaded / 1e9).toFixed(2)} GB`);
 const zeroIds = gbuf(16); device.queue.writeBuffer(zeroIds, 0, new Uint32Array([0, 0, 0, 0]));
 // plain matvec: expert 0 of a 1-expert tensor = the tensor itself; xin is an f32 buffer (or [buf, off, size])
 const kdotBG = (W, xin, out, rows, cols, outOffsetBytes = 0, weightOffsetBytes = 0, weightBytes = null) => {
-  const m = meta8(rows, cols, W.t.type, 1, 0, 0, 0, 0);
+  const k = kdotFor(W.t.type); const m = meta8(rows, cols, W.t.type, 1, 0, 0, 0, 0);
   const wres = weightBytes ? [W.buf, weightOffsetBytes, weightBytes] : W.buf;
   const ores = outOffsetBytes ? [out, outOffsetBytes, rows * 4] : out;
-  return {bg: device.createBindGroup({layout: kdotPipe.getBindGroupLayout(0), entries: ent([m, wres, xin, ores, zeroIds])}), rows};
+  return {bg: device.createBindGroup({layout: k.pipe.getBindGroupLayout(0), entries: ent([m, wres, xin, ores, zeroIds])}), rows, pipe: k.pipe, gx: k.groups(rows)};
 };
-const moeBG = (W, xin, out, rowsPerExpert, cols, perExpertInput) => ({bg: device.createBindGroup({layout: moePipe.getBindGroupLayout(0), entries: ent([meta8(rowsPerExpert, cols, W.t.type, H.nExpertUsed, perExpertInput ? 1 : 0, 0, 0, 0), W.buf, xin, out, A.topIds])}), rows: rowsPerExpert});
+const moeBG = (W, xin, out, rowsPerExpert, cols, perExpertInput) => { const k = kdotFor(W.t.type); return {bg: device.createBindGroup({layout: k.pipe.getBindGroupLayout(0), entries: ent([meta8(rowsPerExpert, cols, W.t.type, H.nExpertUsed, perExpertInput ? 1 : 0, 0, 0, 0), W.buf, xin, out, A.topIds])}), rows: rowsPerExpert, pipe: k.pipe, gx: k.groups(rowsPerExpert)}; };
 const opBG = (metaBuf, a, b, c, o, s, ids) => device.createBindGroup({layout: bgl, entries: ent([metaBuf, a, b ?? dummies[0], c ?? dummies[1], o, s ?? dummies[2], ids ?? dummies[3]])});
 const kdotOutBytes = 0;
 for (const L of layers) {
@@ -214,47 +226,56 @@ const wgN = (n) => Math.ceil(n / 256);
 // layer. WebGPU allows copyBufferToBuffer between compute passes in one command buffer, so the step
 // is one command buffer with 10 short pass breaks (one per attention layer), still one submit.
 const DEBUG_LAYERS = Number(Deno.env.get("NEX_DEBUG_LAYERS") ?? 0);
+// Profiling: PROFILE_ONLY selects which dispatch classes are recorded so a token's time can be
+// split by ablation (everything else is skipped; results are then garbage, only timing matters).
+let PROFILE_ONLY = null; // null = all; "kdot" = plain K-quant matvecs; "moe" = expert gathers; "lmhead"; "ops" = nex_ops + deltanet; "none" = no dispatch (submit/readback floor)
+let dispatchCount = 0;
 function encodeToken(enc, position) {
-  let p = enc.beginComputePass();
+  let rawPass = enc.beginComputePass();
+  const wrap = (pass) => { let cls = "ops"; return {
+    setPipeline(pl) { cls = Object.values(KDOT).includes(pl) ? "kdot" : "ops"; pass.setPipeline(pl); },
+    setBindGroup(i, bg) { pass.setBindGroup(i, bg); },
+    dispatchWorkgroups(x, y = 1, z = 1) { let c = cls; if (c === "kdot" && y > 1) c = "moe"; if (c === "kdot" && currentLm) c = "lmhead"; dispatchCount++; if (PROFILE_ONLY === null || PROFILE_ONLY === c) pass.dispatchWorkgroups(x, y, z); },
+    end() { pass.end(); } }; };
+  let currentLm = false;
+  let p = wrap(rawPass);
   for (const L of (DEBUG_LAYERS ? layers.slice(0, DEBUG_LAYERS) : layers)) {
     p.setPipeline(OPS.rmsnorm); p.setBindGroup(0, L.bg.attnNorm); p.dispatchWorkgroups(1);
     if (L.recr) {
-      p.setPipeline(kdotPipe);
-      for (const k of [L.bg.qkv, L.bg.z, L.bg.alpha, L.bg.beta]) { p.setBindGroup(0, k.bg); p.dispatchWorkgroups(k.rows, 1, 1); }
+      for (const k of [L.bg.qkv, L.bg.z, L.bg.alpha, L.bg.beta]) { p.setPipeline(k.pipe); p.setBindGroup(0, k.bg); p.dispatchWorkgroups(k.gx, 1, 1); }
       p.setPipeline(OPS.gate_decay); p.setBindGroup(0, L.bg.gateDecay); p.dispatchWorkgroups(1);
       p.setPipeline(OPS.conv1d_step); p.setBindGroup(0, L.bg.conv); p.dispatchWorkgroups(wgN(QKV));
       p.setPipeline(OPS.l2norm); p.setBindGroup(0, L.bg.qn); p.dispatchWorkgroups(H.nKHeads); p.setBindGroup(0, L.bg.kn); p.dispatchWorkgroups(H.nKHeads);
       p.setPipeline(dnPipe); p.setBindGroup(0, L.bg.dn); p.dispatchWorkgroups(H.nVHeads);
       p.setPipeline(OPS.gated_rmsnorm); p.setBindGroup(0, L.bg.gnorm); p.dispatchWorkgroups(H.nVHeads);
-      p.setPipeline(kdotPipe); p.setBindGroup(0, L.bg.out.bg); p.dispatchWorkgroups(L.bg.out.rows, 1, 1);
+      p.setPipeline(L.bg.out.pipe); p.setBindGroup(0, L.bg.out.bg); p.dispatchWorkgroups(L.bg.out.gx, 1, 1);
     } else {
-      p.setPipeline(kdotPipe);
-      for (const k of [L.bg.q, L.bg.k, L.bg.v]) { p.setBindGroup(0, k.bg); p.dispatchWorkgroups(k.rows, 1, 1); }
+      for (const k of [L.bg.q, L.bg.k, L.bg.v]) { p.setPipeline(k.pipe); p.setBindGroup(0, k.bg); p.dispatchWorkgroups(k.gx, 1, 1); }
       p.setPipeline(OPS.rmsnorm); p.setBindGroup(0, L.bg.qNorm); p.dispatchWorkgroups(H.nHead); p.setBindGroup(0, L.bg.kNorm); p.dispatchWorkgroups(H.nHeadKv);
       p.setPipeline(OPS.rope_neox); p.setBindGroup(0, L.bg.ropeQ); p.dispatchWorkgroups(H.nHead); p.setBindGroup(0, L.bg.ropeK); p.dispatchWorkgroups(H.nHeadKv);
       p.end();
       const kvBytes = H.nHeadKv * H.headDim * 4;
       enc.copyBufferToBuffer(A.kRope, 0, L.kCache, position * kvBytes, kvBytes);
       enc.copyBufferToBuffer(A.vProj, 0, L.vCache, position * kvBytes, kvBytes);
-      p = enc.beginComputePass();
+      p = wrap(enc.beginComputePass());
       p.setPipeline(OPS.attn_decode); p.setBindGroup(0, L.bg.attn); p.dispatchWorkgroups(H.nHead);
-      p.setPipeline(kdotPipe); p.setBindGroup(0, L.bg.o.bg); p.dispatchWorkgroups(L.bg.o.rows, 1, 1);
+      p.setPipeline(L.bg.o.pipe); p.setBindGroup(0, L.bg.o.bg); p.dispatchWorkgroups(L.bg.o.gx, 1, 1);
     }
     p.setPipeline(OPS.add); p.setBindGroup(0, L.bg.resid); p.dispatchWorkgroups(wgN(E));
     p.setPipeline(OPS.rmsnorm); p.setBindGroup(0, L.bg.postNorm); p.dispatchWorkgroups(1);
     p.setPipeline(OPS.f32_matvec); p.setBindGroup(0, L.bg.router); p.dispatchWorkgroups(H.nExpert); p.setBindGroup(0, L.bg.shLogit); p.dispatchWorkgroups(1);
     p.setPipeline(OPS.softmax_topk); p.setBindGroup(0, L.bg.topk); p.dispatchWorkgroups(1);
-    p.setPipeline(moePipe); p.setBindGroup(0, L.bg.gateE.bg); p.dispatchWorkgroups(H.nFfExp, H.nExpertUsed); p.setBindGroup(0, L.bg.upE.bg); p.dispatchWorkgroups(H.nFfExp, H.nExpertUsed);
+    p.setPipeline(L.bg.gateE.pipe); p.setBindGroup(0, L.bg.gateE.bg); p.dispatchWorkgroups(L.bg.gateE.gx, H.nExpertUsed); p.setPipeline(L.bg.upE.pipe); p.setBindGroup(0, L.bg.upE.bg); p.dispatchWorkgroups(L.bg.upE.gx, H.nExpertUsed);
     p.setPipeline(OPS.silu_mul); p.setBindGroup(0, L.bg.actE); p.dispatchWorkgroups(wgN(H.nExpertUsed * H.nFfExp));
-    p.setPipeline(moePipe); p.setBindGroup(0, L.bg.downE.bg); p.dispatchWorkgroups(E, H.nExpertUsed);
-    p.setPipeline(kdotPipe); p.setBindGroup(0, L.bg.shGate.bg); p.dispatchWorkgroups(H.nFfShexp, 1, 1); p.setBindGroup(0, L.bg.shUp.bg); p.dispatchWorkgroups(H.nFfShexp, 1, 1);
+    p.setPipeline(L.bg.downE.pipe); p.setBindGroup(0, L.bg.downE.bg); p.dispatchWorkgroups(L.bg.downE.gx, H.nExpertUsed);
+    p.setPipeline(L.bg.shGate.pipe); p.setBindGroup(0, L.bg.shGate.bg); p.dispatchWorkgroups(L.bg.shGate.gx, 1, 1); p.setPipeline(L.bg.shUp.pipe); p.setBindGroup(0, L.bg.shUp.bg); p.dispatchWorkgroups(L.bg.shUp.gx, 1, 1);
     p.setPipeline(OPS.silu_mul); p.setBindGroup(0, L.bg.shAct); p.dispatchWorkgroups(wgN(H.nFfShexp));
-    p.setPipeline(kdotPipe); p.setBindGroup(0, L.bg.shDown.bg); p.dispatchWorkgroups(E, 1, 1);
+    p.setPipeline(L.bg.shDown.pipe); p.setBindGroup(0, L.bg.shDown.bg); p.dispatchWorkgroups(L.bg.shDown.gx, 1, 1);
     p.setPipeline(OPS.weighted_sum); p.setBindGroup(0, L.bg.wsum); p.dispatchWorkgroups(wgN(E));
     p.setPipeline(OPS.add); p.setBindGroup(0, L.bg.resid2); p.dispatchWorkgroups(wgN(E));
   }
   p.setPipeline(OPS.rmsnorm); p.setBindGroup(0, finalBG.norm); p.dispatchWorkgroups(1);
-  p.setPipeline(kdotPipe); for (const c of finalBG.lmChunks) { p.setBindGroup(0, c.bg); p.dispatchWorkgroups(c.rows, 1, 1); }
+  currentLm = true; for (const c of finalBG.lmChunks) { p.setPipeline(c.pipe); p.setBindGroup(0, c.bg); p.dispatchWorkgroups(c.gx, 1, 1); } currentLm = false;
   p.setPipeline(OPS.argmax_partial); p.setBindGroup(0, finalBG.amaxP); p.dispatchWorkgroups(finalBG.parts);
   p.setPipeline(OPS.argmax_final); p.setBindGroup(0, finalBG.amaxF); p.dispatchWorkgroups(1);
   p.end();
@@ -298,6 +319,12 @@ async function step(tokenId, position) {
   return {next: ids[finalBG.parts], ms: performance.now() - t0};
 }
 
+// ---------------- profile mode ----------------
+if (Deno.env.get("NEX_PROFILE")) {
+  const variants = [null, "kdot", "moe", "lmhead", "ops", "none"]; const out = {gpu: adapter.info?.description};
+  for (const v of variants) { PROFILE_ONLY = v; dispatchCount = 0; await step(760, 0); const ms = []; for (let i = 0; i < 5; i++) { dispatchCount = 0; ms.push((await step(760, i + 1)).ms); } ms.sort((a, b) => a - b); out[v ?? "all"] = {medianMs: +ms[2].toFixed(1), minMs: +ms[0].toFixed(1), dispatches: dispatchCount}; }
+  console.log(JSON.stringify(out)); Deno.exit(0);
+}
 // ---------------- run ----------------
 const generated = []; const times = [];
 let position = 0; let next = null;
