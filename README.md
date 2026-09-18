@@ -86,6 +86,25 @@ This is CPU-bound recompute-from-scratch (no KV-cache — see
 `kotodama.inference.decode`'s docstring) against the model's full real layer
 count, so it is slow (see the PR that introduced it for observed tokens/sec).
 
+## Kernel: workgroup-per-row K-quant dot (`shaders/ggml_kdot_wg.wgsl`)
+
+`shaders/ggml_kdot.wgsl` is the ggml reference laid out one thread per output
+row; `shaders/ggml_kdot_wg.wgsl` is the same arithmetic laid out one 64-thread
+workgroup per row with word loads and a shared-memory reduction. Same bindings
+and `Meta`, different dispatch (`(rows, positions, 1)`). Parity and timing:
+
+```sh
+deno run --unstable-webgpu --allow-read verify/kdot_wg_parity.js [rows] [blocks]
+```
+
+Measured 2026-09-18 on `[10240 x 2560]` Q4_K (kernel time from 21 dispatches in
+one command buffer, because a single submit on Deno/wgpu pays a 13–18 ms round
+trip that has nothing to do with the kernel): Intel Arc Pro B70 (wgpu→Vulkan)
+reference 0.80 ms / workgroup 0.147 ms = 100 GB/s; Apple M1 Max (Metal)
+reference 1.60 ms / workgroup 0.288 ms = 51 GB/s. Oracle and pseudo-random
+parity within 2e-5. The generation host (`host/metal_kdot.cljk`) still
+dispatches the reference kernel; wiring this one in is root ADR-2609181800 M2.
+
 ## Stable JVM production entry point (`kotodama.inference.host.jvm`)
 
 Downstream JVM hosts (e.g. `kotoba-lang/murakumo-studio`) should call the
