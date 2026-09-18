@@ -152,6 +152,15 @@ GPU buffer — the router's top-k never returns to the host. Verified on the rea
 250} in shared-input and per-expert-input modes (`verify/nex_moe_gather_parity.js`,
 gate `:nex-moe-gather-parity`): maxAbs 3.6e-7, identical on M1 Max / B70 / AMD.
 
+`shaders/deltanet_step.wgsl` is the gated delta-net recurrence for one decode
+token (Nex's 30 linear-attention layers): one workgroup per value head, one
+thread per state column, state updated in place on the GPU. `verify/
+deltanet_step_parity.js` carries state across 16 tokens against an f64
+reference of the FLA recurrent gated delta rule: worst relative error 5e-7 on
+M1 Max / B70 / AMD; 30 layers step in 2.1–3.1 ms per token (gate
+`:deltanet-step-parity`). The conv1d, q/k L2 norms and gated output norm around
+it are the next kernels.
+
 ## Stable JVM production entry point (`kotodama.inference.host.jvm`)
 
 Downstream JVM hosts (e.g. `kotoba-lang/murakumo-studio`) should call the
