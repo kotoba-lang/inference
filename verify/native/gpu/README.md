@@ -62,10 +62,43 @@ four packed words), and a live `VkDevice` at process exit segfaults in the
 driver's atexit path (amu #1028 tears down in order). Xavier is still far from
 its 54 GB/s f32 number — its own layout is the next co-scientist item.
 
-What this is not yet: the composed decode step. The matvec kernels are ported;
-delta-net, `nex_ops` (norms, rope, softmax-topk, gate) and the MoE gather are the
-remaining WGSL → GLSL ports, then the 40-layer decode step as a `.kotoba` program
-issuing ~20 dispatches per token (the intended end is amu's accelerator KIR
-emitting SPIR-V). Xavier
+## One whole recurrent layer on the native path (2026-09-19)
+
+`nex_ops.comp` (15 entry points, `-DOP=<name>`, GLSL twin of `shaders/nex_ops.wgsl`
+plus `gate_decay2` and an input offset for `l2norm`) and `deltanet_step.comp`
+complete the kernel set for a gated-delta-net layer. `gen_layer0_guest.cljk`
+reads the GGUF directory and writes the guest: 20 tensors `MAP`ped by file
+offset, 37 buffers, 27 metas written, then **27 dispatches in ONE command
+buffer** (`BEGIN … SUBMIT`) — rmsnorm → qkv/gate/alpha/beta kdots → gate_decay
+→ conv1d → q/k l2norm → delta-net → gated rmsnorm → out kdot → add_rmsnorm →
+router → softmax-top8 → 8-expert gate/up kdots (one dispatch each, `positions=8`)
+→ silu·up → 8-expert down → shared expert → weighted sum → residual.
+`layer0_ref.py` is the f64 numpy port of the retired Deno reference; token 9707,
+position 0, `blk.0`:
+
+| box | command buffer (27 dispatches) | x_out vs f64 | top-8 experts |
+|---|---|---|---|
+| B70 (ANV) | **0.93 ms** | rel 1.1e-6 | identical |
+| K16 iGPU (RADV) | **1.55 ms** | rel 1.1e-6 | identical |
+| Xavier (nvgpu, aarch64 kexe) | 48.9 ms | rel 1.0e-6 | identical |
+
+Every intermediate read back (h, qkv, g/β, conv, delta-net out, resid, router,
+top-k weights) matches to f32 precision. Estimate from this: 30 recurrent layers
+at ~1 ms + 10 attention layers + the 417 MB lm_head ≈ 35–40 ms/token on B70
+before any tuning (~25 tok/s class; llama.cpp Vulkan 60, vLLM 103); K16 ~16
+tok/s class (llama.cpp CPU-only there: 11); Xavier needs its own kernel layout
+(the small kdots are 10× slower than on Mesa).
+
+Found on the way, now refused by the loader: a `WRITE`/`MAP`/`READ` while a
+`BEGIN` is open reuses the one command buffer and silently discards the
+recorded dispatches (the first layer run answered zeros) — amu #1028 refuses
+them by name, and the generator hoists every constant write before `BEGIN`.
+
+What this is not yet: the composed decode step. All kernels are ported and one
+recurrent layer is verified; remaining: the attention layer (rope, KV cache,
+attn_decode — kernels ported, not yet composed), the 40-layer chain with state
+carry across tokens, embedding lookup and lm_head + argmax on the GPU, the token
+loop, and the per-backend kernel layouts (Xavier). The intended end is amu's
+accelerator KIR emitting SPIR-V. Xavier
 runs this path instead of CUDA (JetPack 5.1.2 cannot run a vLLM that knows
 Nex; owner 2026-09-18).

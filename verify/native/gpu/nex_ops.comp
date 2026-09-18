@@ -1,0 +1,202 @@
+#version 450
+// The small per-token ops of a Nex-N2.5-mini (qwen35moe) decode step -- the
+// GLSL twin of kotoba-lang/inference shaders/nex_ops.wgsl for the native
+// :gpu/compute path (root ADR-2609182400 C). One entry per compile:
+//   glslangValidator -V -DOP=rmsnorm nex_ops.comp -o nex_rmsnorm.spv
+// Semantics are llama.cpp's (see the WGSL header). Seven storage bindings,
+// Meta at 0 (the loader binds everything as storage):
+//   n rows aux aux2 : u32   eps scale p0 p1 : f32
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer Meta { uint n; uint rows; uint aux; uint aux2; float eps; float scale; float p0; float p1; } P;
+layout(std430, binding = 1) readonly buffer A { float a[]; };
+layout(std430, binding = 2) readonly buffer B { float b[]; };
+layout(std430, binding = 3) readonly buffer C { float c[]; };
+layout(std430, binding = 4) buffer O { float o[]; };
+layout(std430, binding = 5) buffer S { float s[]; };
+layout(std430, binding = 6) buffer I { uint ids[]; };
+
+shared float red[256];
+shared uint redi[256];
+
+float silu(float x) { return x / (1.0 + exp(-x)); }
+float sigmoid(float x) { return 1.0 / (1.0 + exp(-x)); }
+float softplus(float x) { return x > 20.0 ? x : log(1.0 + exp(x)); }
+
+float wg_sum(uint t, float v) {
+  red[t] = v;
+  barrier();
+  for (uint st = 128u; st > 0u; st >>= 1u) { if (t < st) red[t] += red[t + st]; barrier(); }
+  float r = red[0];
+  barrier();
+  return r;
+}
+
+void op_rmsnorm() {
+  uint r = gl_WorkGroupID.x, t = gl_LocalInvocationID.x, n = P.n; uint stride = (P.aux == 0u) ? n : P.aux;
+  uint ibase = r * stride, obase = r * n;
+  float ss = 0.0;
+  for (uint i = t; i < n; i += 256u) { float x = a[ibase + i]; ss += x * x; }
+  float tot = wg_sum(t, ss);
+  float inv = inversesqrt(tot / float(n) + P.eps);
+  for (uint i = t; i < n; i += 256u) o[obase + i] = a[ibase + i] * inv * b[i];
+}
+// aux2 = input element offset (the q / k heads sit at 0 / 2048 inside the
+// conv output; the native path has no buffer-range bindings, so the offset is
+// in Meta). Output is contiguous from 0.
+void op_l2norm() {
+  uint r = gl_WorkGroupID.x, t = gl_LocalInvocationID.x, n = P.n, base = r * n, ibase = P.aux2 + r * n;
+  float ss = 0.0;
+  for (uint i = t; i < n; i += 256u) { float x = a[ibase + i]; ss += x * x; }
+  float tot = wg_sum(t, ss);
+  float inv = inversesqrt(tot + P.eps) * ((P.scale == 0.0) ? 1.0 : P.scale);
+  for (uint i = t; i < n; i += 256u) o[base + i] = a[ibase + i] * inv;
+}
+void op_gated_rmsnorm() {
+  uint r = gl_WorkGroupID.x, t = gl_LocalInvocationID.x, n = P.n, base = r * n;
+  float ss = 0.0;
+  for (uint i = t; i < n; i += 256u) { float x = a[base + i]; ss += x * x; }
+  float tot = wg_sum(t, ss);
+  float inv = inversesqrt(tot / float(n) + P.eps);
+  for (uint i = t; i < n; i += 256u) o[base + i] = a[base + i] * inv * b[i] * silu(c[base + i]);
+}
+void op_silu_mul() {
+  uint i = gl_GlobalInvocationID.x; if (i >= P.n) return;
+  o[i] = silu(a[i]) * b[i];
+}
+void op_conv1d_step() {
+  uint ch = gl_GlobalInvocationID.x; if (ch >= P.n) return;
+  uint n = P.n;
+  float x0 = s[ch], x1 = s[n + ch], x2 = s[2u * n + ch], x3 = a[ch];
+  float y = b[ch * 4u] * x0 + b[ch * 4u + 1u] * x1 + b[ch * 4u + 2u] * x2 + b[ch * 4u + 3u] * x3;
+  o[ch] = silu(y);
+  s[ch] = x1; s[n + ch] = x2; s[2u * n + ch] = x3;
+}
+void op_softmax_topk() {
+  uint t = gl_LocalInvocationID.x, n = P.n, k = P.aux;
+  float x = (t < n) ? a[t] : -1e30;
+  red[t] = x; barrier();
+  for (uint st = 128u; st > 0u; st >>= 1u) { if (t < st) red[t] = max(red[t], red[t + st]); barrier(); }
+  float m = red[0]; barrier();
+  float e = (t < n) ? exp(x - m) : 0.0;
+  float denom = wg_sum(t, e);
+  float p = e / denom;
+  float wsum = 0.0;
+  for (uint round = 0u; round < k; round++) {
+    red[t] = p; redi[t] = t; barrier();
+    for (uint st = 128u; st > 0u; st >>= 1u) {
+      if (t < st) {
+        float other = red[t + st];
+        if (other > red[t] || (other == red[t] && redi[t + st] < redi[t])) { red[t] = other; redi[t] = redi[t + st]; }
+      }
+      barrier();
+    }
+    uint best = redi[0]; float bp = red[0];
+    barrier();
+    if (t == 0u) { ids[round] = best; o[round] = bp; }
+    if (t == best) p = -1.0;
+    wsum += bp;
+    barrier();
+  }
+  memoryBarrierBuffer(); barrier();
+  if (t < k) o[t] = o[t] / wsum * P.scale;
+}
+void op_gate_decay() {
+  uint h = gl_GlobalInvocationID.x; if (h >= P.rows) return;
+  o[h] = softplus(a[h] + b[h]) * c[h];
+  o[P.aux + h] = sigmoid(a[P.aux2 + h]);
+}
+// gate_decay with the two projections in SEPARATE buffers (the native path
+// MAPs ssm_alpha and ssm_beta as two tensors): a = alpha logits [rows],
+// b = dt_bias, c = ssm_a, s = beta logits [rows] -> o[h] = g, o[aux + h] = beta.
+void op_gate_decay2() {
+  uint h = gl_GlobalInvocationID.x; if (h >= P.rows) return;
+  o[h] = softplus(a[h] + b[h]) * c[h];
+  o[P.aux + h] = sigmoid(s[h]);
+}
+void op_weighted_sum() {
+  uint i = gl_GlobalInvocationID.x; if (i >= P.n) return;
+  float acc = 0.0;
+  for (uint e = 0u; e < P.aux; e++) acc += b[e] * a[e * P.n + i];
+  o[i] = acc + c[i] * sigmoid(s[0]);
+}
+void op_rope_neox() {
+  uint h = gl_WorkGroupID.x, t = gl_LocalInvocationID.x, n = P.n, nrot = P.aux, hlf = nrot / 2u, base = h * n;
+  for (uint i = t; i < n; i += 256u) {
+    if (i >= nrot) { o[base + i] = a[base + i]; continue; }
+    uint pair = (i >= hlf) ? i - hlf : i;
+    float theta = float(P.aux2) * pow(P.scale, -2.0 * float(pair) / float(nrot));
+    float cs = cos(theta), sn = sin(theta);
+    float x0 = a[base + pair], x1 = a[base + pair + hlf];
+    o[base + i] = (i >= hlf) ? (x0 * sn + x1 * cs) : (x0 * cs - x1 * sn);
+  }
+}
+void op_attn_decode() {
+  uint h = gl_WorkGroupID.x, t = gl_LocalInvocationID.x, d = P.n, T = P.aux; uint hkv = h / (P.rows / P.aux2);
+  float sc = -1e30;
+  if (t < T) {
+    float dt = 0.0;
+    for (uint i = 0u; i < d; i++) dt += a[h * d + i] * b[(t * P.aux2 + hkv) * d + i];
+    sc = dt * P.scale;
+  }
+  red[t] = sc; barrier();
+  for (uint st = 128u; st > 0u; st >>= 1u) { if (t < st) red[t] = max(red[t], red[t + st]); barrier(); }
+  float m = red[0]; barrier();
+  float e = (t < T) ? exp(sc - m) : 0.0;
+  float denom = wg_sum(t, e);
+  float p = e / denom;
+  red[t] = p; barrier();
+  for (uint i = t; i < d; i += 256u) {
+    float acc = 0.0;
+    for (uint tt = 0u; tt < T; tt++) acc += red[tt] * c[(tt * P.aux2 + hkv) * d + i];
+    uint gi = (P.eps < 0.0) ? ((h * 2u + 1u) * d + i) : (h * d + i);
+    o[h * d + i] = acc * sigmoid(s[gi]);
+  }
+}
+void op_argmax_partial() {
+  uint t = gl_LocalInvocationID.x, n = P.n, start = gl_WorkGroupID.x * 4096u;
+  float bv = -1e30; uint bi = 0u;
+  for (uint i = start + t; i < min(start + 4096u, n); i += 256u) { float v = a[i]; if (v > bv || (v == bv && i < bi)) { bv = v; bi = i; } }
+  red[t] = bv; redi[t] = bi; barrier();
+  for (uint st = 128u; st > 0u; st >>= 1u) {
+    if (t < st) { float ov = red[t + st]; uint oi = redi[t + st]; if (ov > red[t] || (ov == red[t] && oi < redi[t])) { red[t] = ov; redi[t] = oi; } }
+    barrier();
+  }
+  if (t == 0u) { s[gl_WorkGroupID.x] = red[0]; ids[gl_WorkGroupID.x] = redi[0]; }
+}
+void op_argmax_final() {
+  uint t = gl_LocalInvocationID.x, parts = P.aux;
+  float bv = -1e30; uint bi = 0u;
+  for (uint i = t; i < parts; i += 256u) { float v = s[i]; uint ix = ids[i]; if (v > bv || (v == bv && ix < bi)) { bv = v; bi = ix; } }
+  red[t] = bv; redi[t] = bi; barrier();
+  for (uint st = 128u; st > 0u; st >>= 1u) {
+    if (t < st) { float ov = red[t + st]; uint oi = redi[t + st]; if (ov > red[t] || (ov == red[t] && oi < redi[t])) { red[t] = ov; redi[t] = oi; } }
+    barrier();
+  }
+  if (t == 0u) { ids[parts] = redi[0]; o[0] = red[0]; }
+}
+void op_add() {
+  uint i = gl_GlobalInvocationID.x; if (i >= P.n) return;
+  o[i] = a[i] + b[i];
+}
+void op_f32_matvec() {
+  uint r = gl_WorkGroupID.x, t = gl_LocalInvocationID.x, n = P.n, base = r * n;
+  float acc = 0.0;
+  for (uint i = t; i < n; i += 256u) acc += a[base + i] * b[i];
+  float tot = wg_sum(t, acc);
+  if (t == 0u) o[r] = tot;
+}
+void op_add_rmsnorm() {
+  uint t = gl_LocalInvocationID.x, n = P.n;
+  float ss = 0.0;
+  for (uint i = t; i < n; i += 256u) { float v = a[i] + b[i]; o[i] = v; ss += v * v; }
+  float tot = wg_sum(t, ss);
+  float inv = inversesqrt(tot / float(n) + P.eps);
+  for (uint i = t; i < n; i += 256u) s[i] = o[i] * inv * c[i];
+}
+
+#ifndef OP
+#error "compile with -DOP=<rmsnorm|l2norm|gated_rmsnorm|silu_mul|conv1d_step|softmax_topk|gate_decay|gate_decay2|weighted_sum|rope_neox|attn_decode|argmax_partial|argmax_final|add|f32_matvec|add_rmsnorm>"
+#endif
+#define CAT2(a, b) a##b
+#define CAT(a, b) CAT2(a, b)
+void main() { CAT(op_, OP)(); }
