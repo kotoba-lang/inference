@@ -7,7 +7,7 @@
 //   l2norm         build_gdn_l2_norm: y = x / sqrt(sum(x^2) + eps)                    (rows x n)
 //   gated_rmsnorm  build_norm_gated: rmsnorm(x, w) * silu(z)                          (rows x n)
 //   silu_mul       LLM_FFN_SILU / LLM_FFN_PAR: y = silu(gate) * up                    (n)
-//   conv1d_step    ggml_ssm_conv for ONE token: y[c] = sum_{t<4} K[t][c] * x[t][c],
+//   conv1d_step    ggml_ssm_conv for ONE token: y[c] = sum_{t<4} K[c][t] * x[t][c],
 //                  x[3] = current token, x[0..2] = the three previous (ring on GPU),
 //                  then silu (conv_output_silu). Also shifts the ring.
 //   softmax_topk   build_moe_ffn SOFTMAX + norm_w: p = softmax(logits) over 256,
@@ -20,6 +20,9 @@
 //   attn_decode    build_attn for one query token over T cached positions, GQA,
 //                  scale 1/sqrt(head_dim), then * sigmoid(gate) (qwen35 attn gate)
 //   argmax         greedy token over n logits (two-stage: per-workgroup then final)
+//   add            residual: o = a + b                                                (n)
+//   f32_matvec     o[r] = sum_i w[r*n + i] * x[i] for f32 weights (router ffn_gate_inp
+//                  [256 x 2048], shared-expert gate [1 x 2048]); one workgroup per row
 
 struct Meta {
   n: u32,          // row length / element count
@@ -56,15 +59,18 @@ fn wg_sum(t: u32, v: f32) -> f32 {
   return r;
 }
 
-// a = x [rows x n], b = w [n] -> o
+// a = x [rows x n], b = w [n] -> o [rows x n]. aux = input row stride in elements (0 -> n):
+// the qwen35 attention q projection interleaves [q_h(256) gate_h(256)] per head, so the per-head
+// q norm reads rows of 256 at stride 512 and writes them contiguous.
 @compute @workgroup_size(256)
 fn rmsnorm(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-  let r = wg.x; let t = lid.x; let n = P.n; let base = r * n;
+  let r = wg.x; let t = lid.x; let n = P.n; let stride = select(P.aux, n, P.aux == 0u);
+  let ibase = r * stride; let obase = r * n;
   var ss = 0.0;
-  for (var i = t; i < n; i += 256u) { let x = a[base + i]; ss += x * x; }
+  for (var i = t; i < n; i += 256u) { let x = a[ibase + i]; ss += x * x; }
   let tot = wg_sum(t, ss);
   let inv = inverseSqrt(tot / f32(n) + P.eps);
-  for (var i = t; i < n; i += 256u) { o[base + i] = a[base + i] * inv * b[i]; }
+  for (var i = t; i < n; i += 256u) { o[obase + i] = a[ibase + i] * inv * b[i]; }
 }
 
 // a = x [rows x n] -> o = x / sqrt(sum x^2 + eps)
@@ -96,14 +102,16 @@ fn silu_mul(@builtin(global_invocation_id) gid: vec3<u32>) {
   o[i] = silu(a[i]) * b[i];
 }
 
-// a = x_t [n] (current qkv_mixed), b = K [4 x n] (ssm_conv1d, t-major: K[t*n + c]),
-// s = ring [3 x n] of the previous three inputs (s[0] oldest) -> o = silu(conv), ring shifted
+// a = x_t [n] (current qkv_mixed), b = ssm_conv1d as stored in the GGUF: dims [4, n], ne0 = 4, i.e.
+// CHANNEL-major, the four taps of channel c contiguous at b[c*4 .. c*4+3] with tap 0 on the oldest
+// input (ggml_ssm_conv); s = ring [3 x n] of the previous three inputs (s[0] oldest) -> o = silu(conv),
+// ring shifted
 @compute @workgroup_size(256)
 fn conv1d_step(@builtin(global_invocation_id) gid: vec3<u32>) {
   let ch = gid.x; if ch >= P.n { return; }
   let n = P.n;
   let x0 = s[ch]; let x1 = s[n + ch]; let x2 = s[2u * n + ch]; let x3 = a[ch];
-  let y = b[ch] * x0 + b[n + ch] * x1 + b[2u * n + ch] * x2 + b[3u * n + ch] * x3;
+  let y = b[ch * 4u] * x0 + b[ch * 4u + 1u] * x1 + b[ch * 4u + 2u] * x2 + b[ch * 4u + 3u] * x3;
   o[ch] = silu(y);
   s[ch] = x1; s[n + ch] = x2; s[2u * n + ch] = x3;
 }
@@ -143,12 +151,13 @@ fn softmax_topk(@builtin(local_invocation_id) lid: vec3<u32>) {
   if t < k { o[t] = o[t] / wsum * P.scale; }
 }
 
-// a = x_alpha [rows], b = dt_bias [rows], c = ssm_a [rows], s = x_beta [rows] -> o = g, ids unused, beta into o[rows..2rows)
+// a = x_alpha [rows], b = dt_bias [rows], c = ssm_a [rows], s = x_beta [rows] -> o = g (log decay),
+// s = sigmoid(s) in place (beta), so both feed deltanet_step from their own buffers.
 @compute @workgroup_size(256)
 fn gate_decay(@builtin(global_invocation_id) gid: vec3<u32>) {
   let h = gid.x; if h >= P.rows { return; }
   o[h] = softplus(a[h] + b[h]) * c[h];
-  o[P.rows + h] = sigmoid(s[h]);
+  s[h] = sigmoid(s[h]);
 }
 
 // a = expert_out [k x n], b = weights [k], c = shexp_out [n], s[0] = shared gate logit -> o [n]
@@ -198,7 +207,9 @@ fn attn_decode(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_i
   for (var i = t; i < d; i += 256u) {
     var acc = 0.0;
     for (var tt = 0u; tt < T; tt++) { acc += red[tt] * c[(tt * P.aux2 + hkv) * d + i]; }
-    o[h * d + i] = acc * sigmoid(s[h * d + i]);
+    // gate: contiguous [heads x d] when eps == 0, or interleaved q_full layout [h][q(d) gate(d)] when eps < 0
+    let gi = select(h * d + i, (h * 2u + 1u) * d + i, P.eps < 0.0);
+    o[h * d + i] = acc * sigmoid(s[gi]);
   }
 }
 
@@ -226,4 +237,21 @@ fn argmax_final(@builtin(local_invocation_id) lid: vec3<u32>) {
     workgroupBarrier();
   }
   if t == 0u { ids[parts] = redi[0]; o[0] = red[0]; }
+}
+
+// a = x [n], b = y [n] -> o = x + y
+@compute @workgroup_size(256)
+fn add(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x; if i >= P.n { return; }
+  o[i] = a[i] + b[i];
+}
+
+// a = w [rows x n] f32, b = x [n] -> o [rows]; one workgroup per row
+@compute @workgroup_size(256)
+fn f32_matvec(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let r = wg.x; let t = lid.x; let n = P.n; let base = r * n;
+  var acc = 0.0;
+  for (var i = t; i < n; i += 256u) { acc += a[base + i] * b[i]; }
+  let tot = wg_sum(t, acc);
+  if t == 0u { o[r] = tot; }
 }

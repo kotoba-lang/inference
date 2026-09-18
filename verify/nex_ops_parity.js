@@ -16,7 +16,7 @@ const bgl = device.createBindGroupLayout({entries: [
   {binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: {type: "storage"}},
   {binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: {type: "storage"}}]});
 const layout = device.createPipelineLayout({bindGroupLayouts: [bgl]});
-const pipes = {}; for (const e of ["rmsnorm","l2norm","gated_rmsnorm","silu_mul","conv1d_step","softmax_topk","gate_decay","weighted_sum","rope_neox","attn_decode","argmax_partial","argmax_final"]) pipes[e] = device.createComputePipeline({layout, compute: {module, entryPoint: e}});
+const pipes = {}; for (const e of ["rmsnorm","l2norm","gated_rmsnorm","silu_mul","conv1d_step","softmax_topk","gate_decay","weighted_sum","rope_neox","attn_decode","argmax_partial","argmax_final","add","f32_matvec"]) pipes[e] = device.createComputePipeline({layout, compute: {module, entryPoint: e}});
 const SU = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST, UU = GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST;
 const fbuf = (arr) => { const b = device.createBuffer({size: Math.max(16, arr.byteLength), usage: SU}); device.queue.writeBuffer(b, 0, arr); return b; };
 const meta = (n, rows, aux, aux2, eps, scale) => { const b = device.createBuffer({size: 32, usage: UU}); const u = new ArrayBuffer(32), dv = new DataView(u); dv.setUint32(0, n, true); dv.setUint32(4, rows, true); dv.setUint32(8, aux, true); dv.setUint32(12, aux2, true); dv.setFloat32(16, eps, true); dv.setFloat32(20, scale, true); device.queue.writeBuffer(b, 0, u); return b; };
@@ -61,7 +61,7 @@ const EPS = 1e-6;
   await run("conv1d_step", [meta(n, 1, 0, 0, 0, 0), fbuf(x1), Kb, dummy3, ob, sb, dummyU], [Math.ceil(n / 256), 1, 1]);
   const ms = await run("conv1d_step", [meta(n, 1, 0, 0, 0, 0), fbuf(x2), Kb, dummy3, ob, sb, dummyU], [Math.ceil(n / 256), 1, 1]);
   // reference of step 2: inputs = ring[1], ring[2], x1, x2
-  const ref = new Float64Array(n); for (let c = 0; c < n; c++) { const y = K[c] * ring[n + c] + K[n + c] * ring[2 * n + c] + K[2 * n + c] * x1[c] + K[3 * n + c] * x2[c]; ref[c] = y / (1 + Math.exp(-y)); }
+  const ref = new Float64Array(n); for (let c = 0; c < n; c++) { const y = K[c * 4] * ring[n + c] + K[c * 4 + 1] * ring[2 * n + c] + K[c * 4 + 2] * x1[c] + K[c * 4 + 3] * x2[c]; ref[c] = y / (1 + Math.exp(-y)); }
   results.push({...cmp(await read(ob, n), ref, "conv1d_step 8192 (2nd step, ring shifted)"), ms: +ms.toFixed(3)}); }
 // softmax_topk: 256 logits -> top 8 normalised
 { const lg = F(256, () => gauss(2)); const ob = fbuf(new Float32Array(8)), ib = device.createBuffer({size: 32, usage: SU});
@@ -72,10 +72,10 @@ const EPS = 1e-6;
   const idsOk = order.every((v, i) => v[1] === gotIds[i]);
   results.push({...cmp(gotW, order.map((v) => v[0] / wsum), "softmax_topk weights"), idsMatch: idsOk, pass: idsOk && cmp(gotW, order.map((v) => v[0] / wsum), "").pass, ids: gotIds}); }
 // gate_decay: 32 heads
-{ const xa = F(32), dt = F(32), A = F(32, () => -Math.exp(gauss())), xb = F(32); const ob = fbuf(new Float32Array(64));
-  await run("gate_decay", [meta(0, 32, 0, 0, 0, 0), fbuf(xa), fbuf(dt), fbuf(A), ob, fbuf(xb), dummyU], [1, 1, 1]);
-  const got = await read(ob, 64); const ref = new Float64Array(64); for (let h = 0; h < 32; h++) { ref[h] = Math.log1p(Math.exp(xa[h] + dt[h])) * A[h]; ref[32 + h] = 1 / (1 + Math.exp(-xb[h])); }
-  results.push(cmp(got, ref, "gate_decay 32 (g, beta)")); }
+{ const xa = F(32), dt = F(32), A = F(32, () => -Math.exp(gauss())), xb = F(32); const ob = fbuf(new Float32Array(32)), sb = fbuf(xb);
+  await run("gate_decay", [meta(0, 32, 0, 0, 0, 0), fbuf(xa), fbuf(dt), fbuf(A), ob, sb, dummyU], [1, 1, 1]);
+  const got = Float32Array.from([...(await read(ob, 32)), ...(await read(sb, 32))]); const ref = new Float64Array(64); for (let h = 0; h < 32; h++) { ref[h] = Math.log1p(Math.exp(xa[h] + dt[h])) * A[h]; ref[32 + h] = 1 / (1 + Math.exp(-xb[h])); }
+  results.push(cmp(got, ref, "gate_decay 32 (g, beta in place)")); }
 // weighted_sum: 8 experts x 2048 + shared
 { const eo = F(8 * 2048), w = F(8, () => rnd()), sh = F(2048), gl = F(1); const ob = fbuf(new Float32Array(2048));
   await run("weighted_sum", [meta(2048, 1, 8, 0, 0, 0), fbuf(eo), fbuf(w), fbuf(sh), ob, fbuf(gl), dummyU], [8, 1, 1]);
@@ -97,6 +97,20 @@ const EPS = 1e-6;
   const m2 = await run("argmax_final", [meta(n, 1, parts, 0, 0, 0), lb, dummy2, dummy3, ob, sb, ib], [1, 1, 1]);
   const got = (await read(ib, parts + 1, true))[parts]; let ref = 0; for (let i = 1; i < n; i++) if (lg[i] > lg[ref]) ref = i;
   results.push({name: "argmax 248320", got, ref, pass: got === ref, ms: +(m1 + m2).toFixed(3)}); }
+// add 2048
+{ const x = F(2048), y = F(2048); const ob = fbuf(new Float32Array(2048));
+  await run("add", [meta(2048, 1, 0, 0, 0, 0), fbuf(x), fbuf(y), dummy3, ob, dummyS, dummyU], [8, 1, 1]);
+  results.push(cmp(await read(ob, 2048), x.map((v, i) => v + y[i]), "add 2048")); }
+// f32_matvec: router [256 x 2048]
+{ const w = F(256 * 2048, () => gauss(0.05)), x = F(2048); const ob = fbuf(new Float32Array(256));
+  await run("f32_matvec", [meta(2048, 256, 0, 0, 0, 0), fbuf(w), fbuf(x), dummy3, ob, dummyS, dummyU], [256, 1, 1]);
+  const ref = new Float64Array(256); for (let r = 0; r < 256; r++) { let acc = 0; for (let i = 0; i < 2048; i++) acc += w[r * 2048 + i] * x[i]; ref[r] = acc; }
+  results.push(cmp(await read(ob, 256), ref, "f32_matvec 256x2048", {abs: 2e-5, rel: 2e-5})); }
+// strided rmsnorm: 16 heads of 256 at stride 512 (q_full layout)
+{ const x = F(16 * 512), w = F(256, () => Math.fround(0.5 + rnd())); const ob = fbuf(new Float32Array(16 * 256));
+  await run("rmsnorm", [meta(256, 16, 512, 0, EPS, 0), fbuf(x), fbuf(w), dummy3, ob, dummyS, dummyU], [16, 1, 1]);
+  const ref = new Float64Array(16 * 256); for (let h = 0; h < 16; h++) { let ss = 0; for (let i = 0; i < 256; i++) ss += x[h * 512 + i] ** 2; ss /= 256; for (let i = 0; i < 256; i++) ref[h * 256 + i] = x[h * 512 + i] / Math.sqrt(ss + EPS) * w[i]; }
+  results.push(cmp(await read(ob, 16 * 256), ref, "rmsnorm strided 16x256@512")); }
 const validation = await device.popErrorScope(); if (validation) report.validation = validation.message;
 report.results = results; report["kotodama/nex-ops-parity"] = results.every((r) => r.pass) && !validation ? "ok" : "FAIL";
 console.log(JSON.stringify(report));
