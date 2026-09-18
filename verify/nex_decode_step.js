@@ -65,10 +65,12 @@ const mod = async (f) => device.createShaderModule({code: await src(f)});
 //   AMD 8060S : Q5_K r8 151 / r1 92 ; IQ4_XS r1 51-81 / v3b 53-60
 //   M1 Max    : Q5_K v3b 29 / r8 26 ; IQ4_XS v3b 40 / v3 34 / r1 13-19
 // so the host picks per (backend, type). Owner 2026-09-18: every backend properly, none is the reference.
-const KDOT = {}; for (const [n, f] of [["r1", "ggml_kdot_f32.wgsl"], ["r8", "ggml_kdot_f32_r8.wgsl"], ["v3", "ggml_kdot_f32_v3.wgsl"], ["v3b", "ggml_kdot_f32_v3b.wgsl"]]) KDOT[n] = device.createComputePipeline({layout: "auto", compute: {module: await mod(f), entryPoint: "main"}});
+const KDOT = {}; for (const [n, f] of [["r1", "ggml_kdot_f32.wgsl"], ["r8", "ggml_kdot_f32_r8.wgsl"], ["v3", "ggml_kdot_f32_v3.wgsl"], ["v3b", "ggml_kdot_f32_v3b.wgsl"], ["v3c", "ggml_kdot_f32_v3c.wgsl"]]) KDOT[n] = device.createComputePipeline({layout: "auto", compute: {module: await mod(f), entryPoint: "main"}});
 const gpuName = (adapter.info?.description ?? "").toLowerCase();
 const backend = gpuName.includes("intel") ? "intel" : gpuName.includes("radeon") || gpuName.includes("amd") ? "amd" : gpuName.includes("apple") ? "metal" : gpuName.includes("nvidia") || gpuName.includes("tegra") ? "nvidia" : "unknown";
-const KDOT_TABLE = {intel: {13: "v3", 23: "v3b", 14: "v3", 12: "v3"}, amd: {13: "r8", 23: "r1", 14: "r8", 12: "r8"}, metal: {13: "v3b", 23: "v3b", 14: "v3b", 12: "v3b"}, nvidia: {13: "v3", 23: "v3b", 14: "v3", 12: "v3"}, unknown: {13: "r1", 23: "r1", 14: "r1", 12: "r1"}};
+// re-measured with 40 dispatches per command buffer (iteration 4): Intel Q5_K v3 224 GB/s, IQ4_XS v3c 54-72;
+// AMD Q5_K r8 136, IQ4_XS r8 65-117; Metal IQ4_XS v3b 38-40, Q5_K v3 23.
+const KDOT_TABLE = {intel: {13: "v3", 23: "v3c", 14: "v3", 12: "v3"}, amd: {13: "r8", 23: "r8", 14: "r8", 12: "r8"}, metal: {13: "v3", 23: "v3b", 14: "v3b", 12: "v3b"}, nvidia: {13: "v3", 23: "v3c", 14: "v3", 12: "v3"}, unknown: {13: "r1", 23: "r1", 14: "r1", 12: "r1"}};
 const kdotFor = (type) => { const n = (Deno.env.get("NEX_KDOT") ?? KDOT_TABLE[backend][type]) || "r1"; return {name: n, pipe: KDOT[n], groups: (rows) => n === "r1" ? rows : Math.ceil(rows / 8)}; };
 const kdotPipe = KDOT.r1; const moePipe = KDOT.r1; // identities used by the profiler's class detection
 log("backend", backend, "kdot table", KDOT_TABLE[backend], Deno.env.get("NEX_KDOT") ? `(forced ${Deno.env.get("NEX_KDOT")})` : "");
@@ -83,7 +85,7 @@ const bgl = device.createBindGroupLayout({entries: [
   {binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: {type: "storage"}},
   {binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: {type: "storage"}}]});
 const opsLayout = device.createPipelineLayout({bindGroupLayouts: [bgl]});
-const OPS = {}; for (const e of ["rmsnorm", "l2norm", "gated_rmsnorm", "silu_mul", "conv1d_step", "softmax_topk", "gate_decay", "weighted_sum", "rope_neox", "attn_decode", "argmax_partial", "argmax_final", "add", "f32_matvec"]) OPS[e] = device.createComputePipeline({layout: opsLayout, compute: {module: opsMod, entryPoint: e}});
+const OPS = {}; for (const e of ["rmsnorm", "l2norm", "gated_rmsnorm", "silu_mul", "conv1d_step", "softmax_topk", "gate_decay", "weighted_sum", "rope_neox", "attn_decode", "argmax_partial", "argmax_final", "add", "f32_matvec", "add_rmsnorm"]) OPS[e] = device.createComputePipeline({layout: opsLayout, compute: {module: opsMod, entryPoint: e}});
 const SU = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST, UU = GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST;
 const gbuf = (bytes, usage = SU) => device.createBuffer({size: Math.max(16, Math.ceil(bytes / 4) * 4), usage});
 const f32buf = (n) => gbuf(n * 4);
@@ -107,6 +109,16 @@ async function upload(name) {
   device.queue.submit([]);
   uploaded += bytes; return {buf: b, t};
 }
+// several same-type, same-width tensors uploaded back to back into ONE buffer (rows concatenated), so one
+// dispatch computes them all: fewer dispatches, same bytes. Returns {buf, t: {type, dims: [cols, rows]}}.
+async function uploadConcat(names) {
+  const ts = names.map((n) => tensors[n]); const type = ts[0].type, cols = ts[0].dims[0];
+  for (const t of ts) if (t.type !== type || t.dims[0] !== cols) throw new Error("uploadConcat: mixed type/width " + names);
+  const sizes = ts.map(tensorBytes); const total = sizes.reduce((a, b) => a + b, 0); const b = gbuf(total); let off = 0;
+  for (let k = 0; k < ts.length; k++) { const CH = 64 << 20; for (let o = 0; o < sizes[k]; o += CH) { const n = Math.min(CH, sizes[k] - o); const chunk = await readAt(dataOff + ts[k].off + o, n); device.queue.writeBuffer(b, off + o, chunk, 0, n); } off += sizes[k]; device.queue.submit([]); }
+  uploaded += total; const rows = ts.reduce((a, t) => a + t.dims.slice(1).reduce((x, y) => x * y, 1), 0);
+  return {buf: b, t: {type, dims: [cols, rows], off: -1}};
+}
 // f32 tensor to a JS array (small ones)
 async function f32Tensor(name) { const t = tensors[name]; const bytes = tensorBytes(t); const raw = await readAt(dataOff + t.off, bytes); return new Float32Array(raw.buffer, raw.byteOffset, bytes / 4); }
 // IQ4_XS row dequant (token embedding)
@@ -126,9 +138,9 @@ async function embedRow(id) {
 const E = H.nEmbd, QKV = 2 * H.nKHeads * H.dState + H.nVHeads * H.dState, VD = H.nVHeads * H.dState, KD = H.nKHeads * H.dState;
 const A = {
   x: f32buf(E), h: f32buf(E), q8x: gbuf((E / 256) * 292), resid: f32buf(E), h2: f32buf(E), q8h2: gbuf((E / 256) * 292), ffnOut: f32buf(E), hn: f32buf(E), q8hn: gbuf((E / 256) * 292),
-  qkv: f32buf(QKV), z: f32buf(VD), alpha: f32buf(H.nVHeads), beta: f32buf(H.nVHeads), g: f32buf(H.nVHeads), conv: f32buf(QKV), qn: f32buf(KD), kn: f32buf(KD), dnOut: f32buf(VD), gnorm: f32buf(VD), q8vd: gbuf((VD / 256) * 292), attnOut: f32buf(E),
-  router: f32buf(H.nExpert), topIds: gbuf(H.nExpertUsed * 4), topW: f32buf(H.nExpertUsed), gateE: f32buf(H.nExpertUsed * H.nFfExp), upE: f32buf(H.nExpertUsed * H.nFfExp), actE: f32buf(H.nExpertUsed * H.nFfExp), q8e: gbuf(H.nExpertUsed * (H.nFfExp / 256) * 292), downE: f32buf(H.nExpertUsed * E),
-  shGate: f32buf(H.nFfShexp), shUp: f32buf(H.nFfShexp), shAct: f32buf(H.nFfShexp), q8sh: gbuf((H.nFfShexp / 256) * 292), shDown: f32buf(E), shLogit: f32buf(1),
+  qkv: f32buf(QKV), zab: f32buf(VD + 3 * H.nVHeads), g: f32buf(64 + H.nVHeads), /* g at 0, beta at element 64 (byte 256) */ conv: f32buf(QKV), qn: f32buf(KD), kn: f32buf(KD), dnOut: f32buf(VD), gnorm: f32buf(VD), q8vd: gbuf((VD / 256) * 292), attnOut: f32buf(E),
+  routerSh: f32buf(H.nExpert + 1), topIds: gbuf(H.nExpertUsed * 4), topW: f32buf(H.nExpertUsed), gateE: f32buf(H.nExpertUsed * H.nFfExp), upE: f32buf(H.nExpertUsed * H.nFfExp), actE: f32buf(H.nExpertUsed * H.nFfExp), q8e: gbuf(H.nExpertUsed * (H.nFfExp / 256) * 292), downE: f32buf(H.nExpertUsed * E),
+  shGU: f32buf(2 * H.nFfShexp), shAct: f32buf(H.nFfShexp), shDown: f32buf(E),
   qFull: f32buf(H.nHead * H.headDim * 2), kProj: f32buf(H.nHeadKv * H.headDim), vProj: f32buf(H.nHeadKv * H.headDim), qNorm: f32buf(H.nHead * H.headDim), kNorm: f32buf(H.nHeadKv * H.headDim), qRope: f32buf(H.nHead * H.headDim), kRope: f32buf(H.nHeadKv * H.headDim), attnO: f32buf(H.nHead * H.headDim), q8attn: gbuf(((H.nHead * H.headDim) / 256) * 292),
   logits: f32buf(H.vocab), amaxPart: f32buf(Math.ceil(H.vocab / 4096)), amaxIds: gbuf((Math.ceil(H.vocab / 4096) + 1) * 4), amaxVal: f32buf(4),
 };
@@ -142,16 +154,18 @@ for (let il = 0; il < H.nLayer; il++) {
   const w = async (suffix) => await upload(`blk.${il}.${suffix}`);
   L.attnNorm = await w("attn_norm.weight"); L.postNorm = await w("post_attention_norm.weight");
   if (L.recr) {
-    L.qkv = await w("attn_qkv.weight"); L.gate = await w("attn_gate.weight"); L.alpha = await w("ssm_alpha.weight"); L.beta = await w("ssm_beta.weight");
+    L.qkv = await w("attn_qkv.weight");
+    // z (4096 rows) | alpha (32) | alpha again (32 rows of padding so beta lands 256-byte aligned) | beta (32)
+    L.zab = await uploadConcat([`blk.${il}.attn_gate.weight`, `blk.${il}.ssm_alpha.weight`, `blk.${il}.ssm_alpha.weight`, `blk.${il}.ssm_beta.weight`]);
     L.conv1d = await w("ssm_conv1d.weight"); L.dt = await w("ssm_dt.bias"); L.ssmA = await w("ssm_a"); L.ssmNorm = await w("ssm_norm.weight"); L.out = await w("ssm_out.weight");
     L.convRing = f32buf(3 * QKV); zero(L.convRing, 3 * QKV); L.state = f32buf(H.nVHeads * H.dState * H.dState); zero(L.state, H.nVHeads * H.dState * H.dState);
   } else {
     L.q = await w("attn_q.weight"); L.k = await w("attn_k.weight"); L.v = await w("attn_v.weight"); L.o = await w("attn_output.weight"); L.qNormW = await w("attn_q_norm.weight"); L.kNormW = await w("attn_k_norm.weight");
     L.kCache = f32buf(T_MAX * H.nHeadKv * H.headDim); L.vCache = f32buf(T_MAX * H.nHeadKv * H.headDim);
   }
-  L.gateInp = await w("ffn_gate_inp.weight"); L.gateInpSh = await w("ffn_gate_inp_shexp.weight");
+  L.routerSh = await uploadConcat([`blk.${il}.ffn_gate_inp.weight`, `blk.${il}.ffn_gate_inp_shexp.weight`]); // f32 [256 + 1] x 2048
   L.gateExps = await w("ffn_gate_exps.weight"); L.upExps = await w("ffn_up_exps.weight"); L.downExps = await w("ffn_down_exps.weight");
-  L.gateSh = await w("ffn_gate_shexp.weight"); L.upSh = await w("ffn_up_shexp.weight"); L.downSh = await w("ffn_down_shexp.weight");
+  L.gateUpSh = await uploadConcat([`blk.${il}.ffn_gate_shexp.weight`, `blk.${il}.ffn_up_shexp.weight`]); L.downSh = await w("ffn_down_shexp.weight");
   layers.push(L);
   if (il % 5 === 4) { await device.queue.onSubmittedWorkDone(); log(`layer ${il} uploaded, ${(uploaded / 1e9).toFixed(2)} GB so far`); }
 }
@@ -175,14 +189,14 @@ for (const L of layers) {
   L.bg = {};
   L.bg.attnNorm = opBG(opsMeta(E, 1, 0, 0, H.eps, 0), A.x, L.attnNorm.buf, null, A.h);
     if (L.recr) {
-    L.bg.qkv = kdotBG(L.qkv, A.h, A.qkv, QKV, E); L.bg.z = kdotBG(L.gate, A.h, A.z, VD, E);
-    L.bg.alpha = kdotBG(L.alpha, A.h, A.alpha, H.nVHeads, E); L.bg.beta = kdotBG(L.beta, A.h, A.beta, H.nVHeads, E);
-    L.bg.gateDecay = opBG(opsMeta(0, H.nVHeads, 0, 0, 0, 0), A.alpha, L.dt.buf, L.ssmA.buf, A.g, A.beta);
+    L.bg.qkv = kdotBG(L.qkv, A.h, A.qkv, QKV, E); L.bg.zab = kdotBG(L.zab, A.h, A.zab, VD + 3 * H.nVHeads, E);
+    const abSlice = [A.zab, VD * 4, 3 * H.nVHeads * 4]; // alpha | alpha(pad) | beta
+    L.bg.gateDecay = opBG(opsMeta(0, H.nVHeads, 64, 2 * H.nVHeads, 0, 0), abSlice, L.dt.buf, L.ssmA.buf, A.g);
     L.bg.conv = opBG(opsMeta(QKV, 1, 0, 0, 0, 0), A.qkv, L.conv1d.buf, null, A.conv, L.convRing);
     L.bg.qn = opBG(opsMeta(H.dState, H.nKHeads, 0, 0, H.eps, 1 / Math.sqrt(H.dState)), [A.conv, 0, KD * 4], null, null, A.qn); // q * 1/sqrt(S_k) as in delta-net-base.cpp
     L.bg.kn = opBG(opsMeta(H.dState, H.nKHeads, 0, 0, H.eps, 0), [A.conv, KD * 4, KD * 4], null, null, A.kn);
-    L.bg.dn = device.createBindGroup({layout: dnPipe.getBindGroupLayout(0), entries: ent([meta4(H.nVHeads, H.dState, H.dState, H.nKHeads), A.qn, A.kn, [A.conv, 2 * KD * 4, VD * 4], A.g, A.beta, L.state, A.dnOut])});
-    L.bg.gnorm = opBG(opsMeta(H.dState, H.nVHeads, 0, 0, H.eps, 0), A.dnOut, L.ssmNorm.buf, A.z, A.gnorm);
+    L.bg.dn = device.createBindGroup({layout: dnPipe.getBindGroupLayout(0), entries: ent([meta4(H.nVHeads, H.dState, H.dState, H.nKHeads), A.qn, A.kn, [A.conv, 2 * KD * 4, VD * 4], [A.g, 0, H.nVHeads * 4], [A.g, 256, H.nVHeads * 4], L.state, A.dnOut])});
+    L.bg.gnorm = opBG(opsMeta(H.dState, H.nVHeads, 0, 0, H.eps, 0), A.dnOut, L.ssmNorm.buf, [A.zab, 0, VD * 4], A.gnorm);
     L.bg.out = kdotBG(L.out, A.gnorm, A.attnOut, E, VD);
   } else {
     L.bg.q = kdotBG(L.q, A.h, A.qFull, H.nHead * H.headDim * 2, E); L.bg.k = kdotBG(L.k, A.h, A.kProj, H.nHeadKv * H.headDim, E); L.bg.v = kdotBG(L.v, A.h, A.vProj, H.nHeadKv * H.headDim, E);
@@ -194,22 +208,21 @@ for (const L of layers) {
     L.bg.attn = opBG(L.attnMeta, A.qRope, L.kCache, L.vCache, A.attnO, A.qFull);
     L.bg.o = kdotBG(L.o, A.attnO, A.attnOut, E, H.nHead * H.headDim);
   }
-  L.bg.resid = opBG(opsMeta(E, 1, 0, 0, 0, 0), A.x, A.attnOut, null, A.resid);
-  L.bg.postNorm = opBG(opsMeta(E, 1, 0, 0, H.eps, 0), A.resid, L.postNorm.buf, null, A.h2);
-  L.bg.router = opBG(opsMeta(E, H.nExpert, 0, 0, 0, 0), L.gateInp.buf, A.h2, null, A.router);
-  L.bg.shLogit = opBG(opsMeta(E, 1, 0, 0, 0, 0), L.gateInpSh.buf, A.h2, null, A.shLogit);
-  L.bg.topk = opBG(opsMeta(H.nExpert, 1, H.nExpertUsed, 0, 0, 1.0), A.router, null, null, A.topW, null, A.topIds);
+  L.bg.residPost = opBG(opsMeta(E, 1, 0, 0, H.eps, 0), A.x, A.attnOut, L.postNorm.buf, A.resid, A.h2); // add_rmsnorm
+  L.bg.routerSh = opBG(opsMeta(E, H.nExpert + 1, 0, 0, 0, 0), L.routerSh.buf, A.h2, null, A.routerSh);
+  L.bg.topk = opBG(opsMeta(H.nExpert, 1, H.nExpertUsed, 0, 0, 1.0), [A.routerSh, 0, H.nExpert * 4], null, null, A.topW, null, A.topIds);
   L.bg.gateE = moeBG(L.gateExps, A.h2, A.gateE, H.nFfExp, E, false); L.bg.upE = moeBG(L.upExps, A.h2, A.upE, H.nFfExp, E, false);
   L.bg.actE = opBG(opsMeta(H.nExpertUsed * H.nFfExp, 1, 0, 0, 0, 0), A.gateE, A.upE, null, A.actE);
   L.bg.downE = moeBG(L.downExps, A.actE, A.downE, E, H.nFfExp, true);
-  L.bg.shGate = kdotBG(L.gateSh, A.h2, A.shGate, H.nFfShexp, E); L.bg.shUp = kdotBG(L.upSh, A.h2, A.shUp, H.nFfShexp, E);
-  L.bg.shAct = opBG(opsMeta(H.nFfShexp, 1, 0, 0, 0, 0), A.shGate, A.shUp, null, A.shAct);
+  L.bg.shGU = kdotBG(L.gateUpSh, A.h2, A.shGU, 2 * H.nFfShexp, E);
+  L.bg.shAct = opBG(opsMeta(H.nFfShexp, 1, 0, 0, 0, 0), [A.shGU, 0, H.nFfShexp * 4], [A.shGU, H.nFfShexp * 4, H.nFfShexp * 4], null, A.shAct);
   L.bg.shDown = kdotBG(L.downSh, A.shAct, A.shDown, E, H.nFfShexp);
-  L.bg.wsum = opBG(opsMeta(E, 1, H.nExpertUsed, 0, 0, 0), A.downE, A.topW, A.shDown, A.ffnOut, A.shLogit);
-  L.bg.resid2 = opBG(opsMeta(E, 1, 0, 0, 0, 0), A.resid, A.ffnOut, null, A.x);
+  L.bg.wsum = opBG(opsMeta(E, 1, H.nExpertUsed, 0, 0, 0), A.downE, A.topW, A.shDown, A.ffnOut, [A.routerSh, H.nExpert * 4, 4]);
+  // x = resid + ffnOut, and the NEXT layer's attn_norm (or the final output_norm) in the same dispatch
+  L.bg.resid2 = null; // built after all layers exist (needs layer il+1's norm weight)
 }
+for (let il = 0; il < H.nLayer; il++) { const L = layers[il]; const nw = il + 1 < H.nLayer ? layers[il + 1].attnNorm.buf : outNorm.buf; const dst = il + 1 < H.nLayer ? A.h : A.hn; L.bg.resid2 = opBG(opsMeta(E, 1, 0, 0, H.eps, 0), A.resid, A.ffnOut, nw, A.x, dst); }
 const finalBG = {
-  norm: opBG(opsMeta(E, 1, 0, 0, H.eps, 0), A.x, outNorm.buf, null, A.hn),
   lmChunks: [], parts: Math.ceil(H.vocab / 4096),
 };
 { const CH = 62080; const rb = rowBytes(outW.t); for (let r0 = 0; r0 < H.vocab; r0 += CH) { const rows = Math.min(CH, H.vocab - r0); finalBG.lmChunks.push(kdotBG(outW, A.hn, A.logits, rows, E, r0 * 4, r0 * rb, rows * rb)); } }
@@ -240,9 +253,9 @@ function encodeToken(enc, position) {
   let currentLm = false;
   let p = wrap(rawPass);
   for (const L of (DEBUG_LAYERS ? layers.slice(0, DEBUG_LAYERS) : layers)) {
-    p.setPipeline(OPS.rmsnorm); p.setBindGroup(0, L.bg.attnNorm); p.dispatchWorkgroups(1);
+    if (L.il === 0) { p.setPipeline(OPS.rmsnorm); p.setBindGroup(0, L.bg.attnNorm); p.dispatchWorkgroups(1); } // later layers get h from the previous add_rmsnorm
     if (L.recr) {
-      for (const k of [L.bg.qkv, L.bg.z, L.bg.alpha, L.bg.beta]) { p.setPipeline(k.pipe); p.setBindGroup(0, k.bg); p.dispatchWorkgroups(k.gx, 1, 1); }
+      for (const k of [L.bg.qkv, L.bg.zab]) { p.setPipeline(k.pipe); p.setBindGroup(0, k.bg); p.dispatchWorkgroups(k.gx, 1, 1); }
       p.setPipeline(OPS.gate_decay); p.setBindGroup(0, L.bg.gateDecay); p.dispatchWorkgroups(1);
       p.setPipeline(OPS.conv1d_step); p.setBindGroup(0, L.bg.conv); p.dispatchWorkgroups(wgN(QKV));
       p.setPipeline(OPS.l2norm); p.setBindGroup(0, L.bg.qn); p.dispatchWorkgroups(H.nKHeads); p.setBindGroup(0, L.bg.kn); p.dispatchWorkgroups(H.nKHeads);
@@ -261,20 +274,18 @@ function encodeToken(enc, position) {
       p.setPipeline(OPS.attn_decode); p.setBindGroup(0, L.bg.attn); p.dispatchWorkgroups(H.nHead);
       p.setPipeline(L.bg.o.pipe); p.setBindGroup(0, L.bg.o.bg); p.dispatchWorkgroups(L.bg.o.gx, 1, 1);
     }
-    p.setPipeline(OPS.add); p.setBindGroup(0, L.bg.resid); p.dispatchWorkgroups(wgN(E));
-    p.setPipeline(OPS.rmsnorm); p.setBindGroup(0, L.bg.postNorm); p.dispatchWorkgroups(1);
-    p.setPipeline(OPS.f32_matvec); p.setBindGroup(0, L.bg.router); p.dispatchWorkgroups(H.nExpert); p.setBindGroup(0, L.bg.shLogit); p.dispatchWorkgroups(1);
+    p.setPipeline(OPS.add_rmsnorm); p.setBindGroup(0, L.bg.residPost); p.dispatchWorkgroups(1);
+    p.setPipeline(OPS.f32_matvec); p.setBindGroup(0, L.bg.routerSh); p.dispatchWorkgroups(H.nExpert + 1);
     p.setPipeline(OPS.softmax_topk); p.setBindGroup(0, L.bg.topk); p.dispatchWorkgroups(1);
     p.setPipeline(L.bg.gateE.pipe); p.setBindGroup(0, L.bg.gateE.bg); p.dispatchWorkgroups(L.bg.gateE.gx, H.nExpertUsed); p.setPipeline(L.bg.upE.pipe); p.setBindGroup(0, L.bg.upE.bg); p.dispatchWorkgroups(L.bg.upE.gx, H.nExpertUsed);
     p.setPipeline(OPS.silu_mul); p.setBindGroup(0, L.bg.actE); p.dispatchWorkgroups(wgN(H.nExpertUsed * H.nFfExp));
     p.setPipeline(L.bg.downE.pipe); p.setBindGroup(0, L.bg.downE.bg); p.dispatchWorkgroups(L.bg.downE.gx, H.nExpertUsed);
-    p.setPipeline(L.bg.shGate.pipe); p.setBindGroup(0, L.bg.shGate.bg); p.dispatchWorkgroups(L.bg.shGate.gx, 1, 1); p.setPipeline(L.bg.shUp.pipe); p.setBindGroup(0, L.bg.shUp.bg); p.dispatchWorkgroups(L.bg.shUp.gx, 1, 1);
+    p.setPipeline(L.bg.shGU.pipe); p.setBindGroup(0, L.bg.shGU.bg); p.dispatchWorkgroups(L.bg.shGU.gx, 1, 1);
     p.setPipeline(OPS.silu_mul); p.setBindGroup(0, L.bg.shAct); p.dispatchWorkgroups(wgN(H.nFfShexp));
     p.setPipeline(L.bg.shDown.pipe); p.setBindGroup(0, L.bg.shDown.bg); p.dispatchWorkgroups(L.bg.shDown.gx, 1, 1);
     p.setPipeline(OPS.weighted_sum); p.setBindGroup(0, L.bg.wsum); p.dispatchWorkgroups(wgN(E));
-    p.setPipeline(OPS.add); p.setBindGroup(0, L.bg.resid2); p.dispatchWorkgroups(wgN(E));
+    p.setPipeline(OPS.add_rmsnorm); p.setBindGroup(0, L.bg.resid2); p.dispatchWorkgroups(1);   // x += ffnOut ; h (next layer) or hn (final)
   }
-  p.setPipeline(OPS.rmsnorm); p.setBindGroup(0, finalBG.norm); p.dispatchWorkgroups(1);
   currentLm = true; for (const c of finalBG.lmChunks) { p.setPipeline(c.pipe); p.setBindGroup(0, c.bg); p.dispatchWorkgroups(c.gx, 1, 1); } currentLm = false;
   p.setPipeline(OPS.argmax_partial); p.setBindGroup(0, finalBG.amaxP); p.dispatchWorkgroups(finalBG.parts);
   p.setPipeline(OPS.argmax_final); p.setBindGroup(0, finalBG.amaxF); p.dispatchWorkgroups(1);
@@ -295,7 +306,7 @@ async function dumpU32(buf, n) { const st = device.createBuffer({size: n * 4, us
 async function debugDump() {
   const L = layers[DEBUG_LAYERS - 1];
   if (Deno.env.get("NEX_DEBUG_JSON")) {
-    const d = {xout: await dumpF32(A.x, E), h: await dumpF32(A.h, E), qFull: await dumpF32(A.qFull, H.nHead * H.headDim * 2), kProj: await dumpF32(A.kProj, H.nHeadKv * H.headDim), vProj: await dumpF32(A.vProj, H.nHeadKv * H.headDim), qNorm: await dumpF32(A.qNorm, H.nHead * H.headDim), qRope: await dumpF32(A.qRope, H.nHead * H.headDim), kRope: await dumpF32(A.kRope, H.nHeadKv * H.headDim), attnO: await dumpF32(A.attnO, H.nHead * H.headDim), qkv: await dumpF32(A.qkv, QKV), z: await dumpF32(A.z, VD), alpha: await dumpF32(A.alpha, H.nVHeads), g: await dumpF32(A.g, H.nVHeads), beta: await dumpF32(A.beta, H.nVHeads), conv: await dumpF32(A.conv, QKV), qn: await dumpF32(A.qn, KD), kn: await dumpF32(A.kn, KD), dnOut: await dumpF32(A.dnOut, VD), gnorm: await dumpF32(A.gnorm, VD), attnOut: await dumpF32(A.attnOut, E), resid: await dumpF32(A.resid, E), h2: await dumpF32(A.h2, E), router: await dumpF32(A.router, H.nExpert), topIds: await dumpU32(A.topIds, H.nExpertUsed), topW: await dumpF32(A.topW, H.nExpertUsed), gateE: await dumpF32(A.gateE, H.nExpertUsed * H.nFfExp), actE: await dumpF32(A.actE, H.nExpertUsed * H.nFfExp), downE: await dumpF32(A.downE, H.nExpertUsed * E), shDown: await dumpF32(A.shDown, E), shLogit: await dumpF32(A.shLogit, 1), ffnOut: await dumpF32(A.ffnOut, E)};
+    const d = {xout: await dumpF32(A.x, E), h: await dumpF32(A.h, E), qFull: await dumpF32(A.qFull, H.nHead * H.headDim * 2), kProj: await dumpF32(A.kProj, H.nHeadKv * H.headDim), vProj: await dumpF32(A.vProj, H.nHeadKv * H.headDim), qNorm: await dumpF32(A.qNorm, H.nHead * H.headDim), qRope: await dumpF32(A.qRope, H.nHead * H.headDim), kRope: await dumpF32(A.kRope, H.nHeadKv * H.headDim), attnO: await dumpF32(A.attnO, H.nHead * H.headDim), qkv: await dumpF32(A.qkv, QKV), z: (await dumpF32(A.zab, VD + 3 * H.nVHeads)).slice(0, VD), alpha: (await dumpF32(A.zab, VD + 3 * H.nVHeads)).slice(VD, VD + H.nVHeads), g: await dumpF32(A.g, H.nVHeads), beta: (await dumpF32(A.g, 64 + H.nVHeads)).slice(64), conv: await dumpF32(A.conv, QKV), qn: await dumpF32(A.qn, KD), kn: await dumpF32(A.kn, KD), dnOut: await dumpF32(A.dnOut, VD), gnorm: await dumpF32(A.gnorm, VD), attnOut: await dumpF32(A.attnOut, E), resid: await dumpF32(A.resid, E), h2: await dumpF32(A.h2, E), router: (await dumpF32(A.routerSh, H.nExpert + 1)).slice(0, H.nExpert), topIds: await dumpU32(A.topIds, H.nExpertUsed), topW: await dumpF32(A.topW, H.nExpertUsed), gateE: await dumpF32(A.gateE, H.nExpertUsed * H.nFfExp), actE: await dumpF32(A.actE, H.nExpertUsed * H.nFfExp), downE: await dumpF32(A.downE, H.nExpertUsed * E), shDown: await dumpF32(A.shDown, E), shLogit: (await dumpF32(A.routerSh, H.nExpert + 1)).slice(H.nExpert), ffnOut: await dumpF32(A.ffnOut, E)};
     // NOTE: A.x has been overwritten by the layer output at this point; the layer input is resid - attnOut
     if (DEBUG_LAYERS >= H.nLayer) { const lg = await dumpF32(A.logits, H.vocab); const top = Array.from(lg.keys()).sort((a, b) => lg[b] - lg[a]).slice(0, 8).map((i) => [i, +lg[i].toFixed(3)]); d.top8 = top; console.error("GPU top-8 logits", JSON.stringify(top)); }
     await Deno.writeTextFile(Deno.env.get("NEX_DEBUG_JSON"), JSON.stringify(d)); console.error("wrote", Deno.env.get("NEX_DEBUG_JSON"));
@@ -303,10 +314,10 @@ async function debugDump() {
   console.error("attn_norm tensor", L.attnNorm.t, "bytes", tensorBytes(L.attnNorm.t));
   await stats("attnNormW", L.attnNorm.buf, E); await stats("postNormW", L.postNorm.buf, E); await stats("outNormW", outNorm.buf, E);
   await stats("x(in)", A.x, E); await stats("h(norm)", A.h, E);
-  if (L.recr) { await stats("qkv", A.qkv, QKV); await stats("z", A.z, VD); await stats("alpha", A.alpha, H.nVHeads); await stats("g", A.g, H.nVHeads); await stats("beta", A.beta, H.nVHeads); await stats("conv", A.conv, QKV); await stats("qn", A.qn, KD); await stats("kn", A.kn, KD); await stats("dnOut", A.dnOut, VD); await stats("gnorm", A.gnorm, VD); }
+  if (L.recr) { await stats("qkv", A.qkv, QKV); await stats("zab", A.zab, VD + 3 * H.nVHeads); await stats("g", A.g, H.nVHeads); await stats("conv", A.conv, QKV); await stats("qn", A.qn, KD); await stats("kn", A.kn, KD); await stats("dnOut", A.dnOut, VD); await stats("gnorm", A.gnorm, VD); }
   else { await stats("qFull", A.qFull, H.nHead * H.headDim * 2); await stats("qRope", A.qRope, H.nHead * H.headDim); await stats("kRope", A.kRope, H.nHeadKv * H.headDim); await stats("attnO", A.attnO, H.nHead * H.headDim); }
-  await stats("attnOut", A.attnOut, E); await stats("resid", A.resid, E); await stats("h2", A.h2, E); await stats("router", A.router, H.nExpert); await stats("topIds", A.topIds, H.nExpertUsed, true); await stats("topW", A.topW, H.nExpertUsed);
-  await stats("gateE", A.gateE, H.nExpertUsed * H.nFfExp); await stats("actE", A.actE, H.nExpertUsed * H.nFfExp); await stats("downE", A.downE, H.nExpertUsed * E); await stats("shDown", A.shDown, E); await stats("shLogit", A.shLogit, 1); await stats("ffnOut", A.ffnOut, E); await stats("x(out)", A.x, E);
+  await stats("attnOut", A.attnOut, E); await stats("resid", A.resid, E); await stats("h2", A.h2, E); await stats("routerSh", A.routerSh, H.nExpert + 1); await stats("topIds", A.topIds, H.nExpertUsed, true); await stats("topW", A.topW, H.nExpertUsed);
+  await stats("gateE", A.gateE, H.nExpertUsed * H.nFfExp); await stats("actE", A.actE, H.nExpertUsed * H.nFfExp); await stats("downE", A.downE, H.nExpertUsed * E); await stats("shDown", A.shDown, E); await stats("ffnOut", A.ffnOut, E); await stats("x(out)", A.x, E);
   await stats("hn", A.hn, E); await stats("logits", A.logits, H.vocab);
 }
 async function step(tokenId, position) {
@@ -324,6 +335,24 @@ if (Deno.env.get("NEX_PROFILE")) {
   const variants = [null, "kdot", "moe", "lmhead", "ops", "none"]; const out = {gpu: adapter.info?.description};
   for (const v of variants) { PROFILE_ONLY = v; dispatchCount = 0; await step(760, 0); const ms = []; for (let i = 0; i < 5; i++) { dispatchCount = 0; ms.push((await step(760, i + 1)).ms); } ms.sort((a, b) => a - b); out[v ?? "all"] = {medianMs: +ms[2].toFixed(1), minMs: +ms[0].toFixed(1), dispatches: dispatchCount}; }
   console.log(JSON.stringify(out)); Deno.exit(0);
+}
+// ---------------- GPU-only time: N prompt tokens in ONE command buffer ----------------
+// The single-token step pays a host submit -> mapAsync round trip (~14 ms on Deno/wgpu). Prompt
+// tokens are known in advance, so they can be recorded back to back in one command buffer with each
+// token's embedding copied in from a staging buffer; the per-token GPU time is then (total)/N.
+if (Deno.env.get("NEX_GPU_TIME")) {
+  const N = promptIds.length; const embStage = f32buf(N * E);
+  for (let i = 0; i < N; i++) device.queue.writeBuffer(embStage, i * E * 4, await embedRow(promptIds[i]));
+  for (const L of layers) if (!L.recr) { setOpsMeta(L.attnMeta, H.headDim, H.nHead, N, H.nHeadKv, -1.0, 1 / Math.sqrt(H.headDim)); } // attention over the full prompt (approximation for timing only)
+  const runN = async () => {
+    const enc = device.createCommandEncoder();
+    for (let i = 0; i < N; i++) { enc.copyBufferToBuffer(embStage, i * E * 4, A.x, 0, E * 4); encodeToken(enc, i); }
+    const t0 = performance.now(); device.queue.submit([enc.finish()]); await idStaging.mapAsync(GPUMapMode.READ); idStaging.unmap(); return performance.now() - t0;
+  };
+  await runN(); const ms = []; for (let i = 0; i < 5; i++) ms.push(await runN()); ms.sort((a, b) => a - b);
+  const one = []; for (let i = 0; i < 3; i++) one.push((await step(promptIds[0], 0)).ms); one.sort((a, b) => a - b);
+  console.log(JSON.stringify({gpu: adapter.info?.description, backend, tokensPerCommandBuffer: N, msPerCommandBuffer: +ms[2].toFixed(1), gpuMsPerToken: +(ms[2] / N).toFixed(1), singleTokenMs: +one[1].toFixed(1), hostFloorMsEstimate: +(one[1] - ms[2] / N).toFixed(1), "gpu-tok/s": +(1000 / (ms[2] / N)).toFixed(1)}));
+  Deno.exit(0);
 }
 // ---------------- run ----------------
 const generated = []; const times = [];
