@@ -145,6 +145,13 @@ types Nex-N2.5-mini adds (attn_qkv is Q5_K; 391 of 733 tensors are IQ4_XS).
 generic reference dots: 2026-09-18 maxAbs 6e-7 / 1.2e-6, identical on M1 Max,
 Intel B70 and AMD 8060S. Gate `:nex-kdot-parity`.
 
+`shaders/ggml_kdot_moe.wgsl` is the same dot over a **packed expert tensor**
+(`ffn_*_exps` [cols, rows, 256]) with the eight selected expert ids read from a
+GPU buffer — the router's top-k never returns to the host. Verified on the real
+`blk.0.ffn_gate_exps.weight` (142.6 MB) for experts {0, 255, 7, 64, 128, 199, 31,
+250} in shared-input and per-expert-input modes (`verify/nex_moe_gather_parity.js`,
+gate `:nex-moe-gather-parity`): maxAbs 3.6e-7, identical on M1 Max / B70 / AMD.
+
 ## Stable JVM production entry point (`kotodama.inference.host.jvm`)
 
 Downstream JVM hosts (e.g. `kotoba-lang/murakumo-studio`) should call the
