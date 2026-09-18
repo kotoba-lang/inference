@@ -94,11 +94,40 @@ Found on the way, now refused by the loader: a `WRITE`/`MAP`/`READ` while a
 recorded dispatches (the first layer run answered zeros) — amu #1028 refuses
 them by name, and the generator hoists every constant write before `BEGIN`.
 
-What this is not yet: the composed decode step. All kernels are ported and one
-recurrent layer is verified; remaining: the attention layer (rope, KV cache,
-attn_decode — kernels ported, not yet composed), the 40-layer chain with state
-carry across tokens, embedding lookup and lm_head + argmax on the GPU, the token
-loop, and the per-backend kernel layouts (Xavier). The intended end is amu's
+## The decode step through N layers, one command buffer (2026-09-19)
+
+`gen_decode_guest.cljk <gguf> <layers> <dir> <out>` generalises the layer
+generator: every tensor of layers `0..N-1` MAPped once, recurrent AND attention
+layers (q/k/v kdots → per-head rmsnorm → NEOX rope → `attn_decode` with the
+T = 1 cache → output kdot), then output norm → Q6_K lm_head (r8) → two-stage
+argmax — all recorded into **one command buffer**. `decode_ref.py` is the f64
+oracle (token 9707, position 0), `decode_check.py` compares the last hidden
+state and the argmax. Depth is bounded by what the device can hold beside the
+box's serving process (the full 40 layers are 18.7 GB):
+
+| box | layers (of 40) | dispatches | command buffer | x vs f64 | argmax |
+|---|---|---|---|---|---|
+| B70 (ANV; vLLM holds 27 of 30 GB) | 4 (3 recurrent + 1 attention) + lm_head | 125 | **3.94 ms** | rel 2.9e-6 | 59315 = ref, logit 8.50742 = ref |
+| K16 iGPU (RADV) | 12 + lm_head | 349 | **28.96 ms** | rel 4.6e-6 | 163967 = ref, logit 12.82849 = ref |
+| Xavier (nvgpu, aarch64 kexe) | 16 + lm_head | 462 | 140.5 ms | rel 6.5e-6 | 204887 = ref, logit 13.07352 = ref |
+
+Straight-line extrapolation to 40 layers (untuned kernels, position 0):
+B70 ≈ 40 ms/token (~25 tok/s; llama.cpp Vulkan 60, vLLM 103), K16 iGPU ≈ 70 ms
+(~14 tok/s; llama.cpp CPU-only there 11), Xavier ≈ 350 ms (~3 tok/s; llama.cpp
+CUDA 18 — the nvgpu kernel layout is the open item).
+
+Three bounds surfaced by name on the way and raised (amu #1028): 64 → 2048
+dispatches per command buffer, 256 → 4096 buffers, the 1 MiB SOURCE bound that
+`extract-native` applied to a 1.09 MB artifact (now the 8 MiB EDN bound); and
+the guest needs `KEXE_PAIRS=1048576` (one pair per string) beyond ~300 requests.
+
+What this is not yet: the composed decode step over TOKENS. One token at
+position 0 runs end to end (embedding row → N layers → lm_head → argmax); remaining:
+the full 40 layers on a device with room (the serving process owns the memory on
+all three boxes today), the KV-cache append and rope position for tokens > 0,
+embedding lookup on the GPU (dequant the argmax'd row), the token loop in
+`.kotoba` (position as a per-token meta write), distribution parity with
+llama.cpp over a prompt, and the per-backend kernel layouts (Xavier). The intended end is amu's
 accelerator KIR emitting SPIR-V. Xavier
 runs this path instead of CUDA (JetPack 5.1.2 cannot run a vLLM that knows
 Nex; owner 2026-09-18).
