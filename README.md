@@ -107,6 +107,15 @@ pseudo-random parity within 2e-5 on all four. murakumo is not Metal-first: a
 kernel gate carries all four backends or it is red for the missing one. The generation host (`host/metal_kdot.cljk`) still
 dispatches the reference kernel; wiring this one in is root ADR-2609181800 M2.
 
+`verify/decode_step_bench.js [layers]` streams one Gemma4 e4b decode step's
+weights (42 × 7 projections + the 262144 × 2560 Q6_K lm_head, 3.0 GB) through
+the same kernel in three submit shapes. 2026-09-18: per-projection submit +
+readback (today's host shape) 3.9 s/token on B70, 3.7 s on AMD 8060S, 4.4 s on
+M1 Max; one command buffer per token 40.5 / 39.9 (per-layer) / 71.8 ms — a
+62–97× difference that is the whole of the recorded 8.4 s/token. It is a
+weight-stream floor (24.7 tok/s on B70), not a generation rate. Needs ~8 GB
+free GPU memory; do not run the full size on a serving node.
+
 ## Stable JVM production entry point (`kotodama.inference.host.jvm`)
 
 Downstream JVM hosts (e.g. `kotoba-lang/murakumo-studio`) should call the
