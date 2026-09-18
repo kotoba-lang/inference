@@ -124,6 +124,20 @@ included), so a decode step never brings the hidden state back to the host.
 bound, 1 ulp Metal / 2 ulp Intel and AMD) and feeds both streams through
 `ggml_kdot_wg.wgsl`. 2026-09-18: 10240-wide × 3 rows in 0.006–0.018 ms.
 
+## Nex-N2.5-mini admission (JVM-free)
+
+```sh
+kbb --backend sci verify/gguf_inventory.cljk <Nex-N2.5-mini-Uncensored-IQ4_XS.gguf>
+```
+
+Reads the GGUF header on node fs (no JVM) and prints the architecture inventory:
+`qwen35moe`, 40 blocks (30 gated-delta-net linear-attention + 10 GQA), 256 experts
+top-8 + shared expert, IQ4_XS / Q5_K / Q6_K weights, 248,320-token gpt2-style
+tokenizer with the chat template embedded. Gate `:nex-n25-mini-gguf-admission`
+pins the expected values. Owner 2026-09-18: Nex is the verification target and
+the finished path is Kotoba + amu native only; the Gemma4/JVM host is the
+correctness oracle's history, not the road.
+
 ## Stable JVM production entry point (`kotodama.inference.host.jvm`)
 
 Downstream JVM hosts (e.g. `kotoba-lang/murakumo-studio`) should call the
