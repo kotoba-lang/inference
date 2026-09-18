@@ -195,6 +195,13 @@ the first two greedy tokens equal the B70 Vulkan control host's (" Paris", ".").
 queued `writeBuffer`s must be flushed with a submit per tensor or wgpu drops the
 small ones.
 
+Four layouts of the f32-activation dot exist — `ggml_kdot_f32` (r1), `_r8`,
+`_v3`, `_v3b` — same arithmetic, different work layout; `verify/kdot_f32_bench.js`
+times them on real Nex tensors. The fastest one depends on backend **and** type
+(Intel: Q5_K v3 162 GB/s, IQ4_XS v3b; AMD: Q5_K r8 151, IQ4_XS r1; Metal: v3b),
+so the decode harness carries a (backend, type) → layout table. Gate
+`:kdot-f32-layouts`. M1 Max composed step: 68 → 54 ms/token.
+
 ## Stable JVM production entry point (`kotodama.inference.host.jvm`)
 
 Downstream JVM hosts (e.g. `kotoba-lang/murakumo-studio`) should call the
