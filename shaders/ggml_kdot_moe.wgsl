@@ -1,58 +1,37 @@
-// ggml K-quant dot, workgroup-per-row form (M1 of root ADR-2609181800).
+// ggml K-quant dot over a PACKED expert tensor with an in-kernel expert gather
+// (Nex-N2.5-mini MoE: ffn_{gate,up,down}_exps are [cols, rows_per_expert, 256]
+// with each expert's rows contiguous). Root ADR-2609182100 D1 / co-scientist
+// iteration 2 hypothesis N3: the router's top-k ids stay on the GPU -- this
+// kernel reads them from a storage buffer, so a decode step never returns to
+// the host to pick bind groups for the chosen experts.
 //
-// Same arithmetic as ggml_kdot.wgsl (ggml's vec_dot_q4_K_q8_K / vec_dot_q6_K_q8_K
-// reference: exact i32 accumulation inside each 256-element block, one f32
-// multiply per block), but the WORK is laid out for a GPU instead of a CPU:
-//
-//   ggml_kdot.wgsl     : 1 thread = 1 output row, walks 256 values x blocks
-//                        byte by byte. Kernel time on Intel Arc Pro B70 (wgpu
-//                        -> Vulkan) 2026-09-18, [10240 x 2560] Q4_K: 0.80 ms =
-//                        18 GB/s of weights (45 GB/s at 59 MB). The 17 ms that
-//                        verify/metal_kdot.js prints is NOT this kernel: a
-//                        single submit -> onSubmittedWorkDone round trip on
-//                        Deno/wgpu costs 13-18 ms on that box at ANY size, so
-//                        kdot_wg_parity.js times K dispatches in one command
-//                        buffer and divides.
-//   this file          : 1 workgroup (64 threads) = 1 output row. Thread t owns
-//                        values t*4 .. t*4+3 of every block, which are four
-//                        consecutive bytes of the same nibble half in Q4_K and
-//                        four consecutive lanes of the same ql/qh words in
-//                        Q6_K -- so each thread does ONE u32 load from the
-//                        weight buffer and ONE from q8 per block instead of
-//                        eight byte loads, and 64 threads stream a row
-//                        together. Partials are reduced through workgroup
-//                        memory. The float sum order across blocks and lanes
-//                        differs from the reference, which is why the parity
-//                        gate compares with a tolerance (2e-5) and not bitwise;
-//                        the integer part inside a block is still exact.
-//                        Kernel time on the same B70 and shape: 0.147 ms =
-//                        100 GB/s (110 GB/s at 59 MB), 5.4x the reference; on an
-//                        Apple M1 Max (Metal) 0.288 ms = 51 GB/s, 5.6x. Oracle:
-//                        q4 -3.695018768310547 / q6 -3.704854965209961 against
-//                        the ggml values -3.695021629333496 / -3.70485520362854.
-//
-// Bindings and Meta are identical to ggml_kdot.wgsl so the host can swap the
-// module without touching bind groups. Dispatch: (rows, positions, 1)
-// workgroups, NOT ceil(rows/64) -- one workgroup per row.
-//
-// tensor_type (ggml enum): 12 Q4_K (144 B/block), 13 Q5_K (176 B), 14 Q6_K
-// (210 B), 23 IQ4_XS (136 B). Q5_K and IQ4_XS were added for Nex-N2.5-mini
-// (qwen35moe: attn_qkv is Q5_K, 391 of 733 tensors are IQ4_XS -- root
-// ADR-2609182100, gate :nex-n25-mini-gguf-admission); their reference is
-// ggml-cpu/quants.c ggml_vec_dot_{q5_K,iq4_xs}_q8_K_generic.
+// Same dequant arithmetic and helpers as ggml_kdot_wg.wgsl (Q4_K 12, Q5_K 13,
+// Q6_K 14, IQ4_XS 23). Differences:
+//   Meta.rows            = rows per expert (512 for gate/up, 2048 for down)
+//   Meta.positions       = n_selected experts (8)
+//   Meta.input_per_expert: 0 -> every expert reads q8 row 0 (gate/up share the
+//                          block input); 1 -> expert slot e reads q8 row e (down
+//                          reads each expert's own activation)
+//   binding 4 expert_ids : u32[n_selected], produced by the top-k kernel
+//   output[e * rows + row], e = selection slot (not expert id)
+// Dispatch: (rows, n_selected, 1) workgroups.
 
 struct Meta {
   rows: u32,
   cols: u32,
   tensor_type: u32,
   positions: u32,
+  input_per_expert: u32,
+  _pad0: u32,
+  _pad1: u32,
+  _pad2: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: Meta;
 @group(0) @binding(1) var<storage, read> weights: array<u32>;
 @group(0) @binding(2) var<storage, read> q8: array<u32>;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
-
+@group(0) @binding(4) var<storage, read> expert_ids: array<u32>;
 var<workgroup> partial: array<f32, 64>;
 
 fn weight_byte(offset: u32) -> u32 {
@@ -145,10 +124,7 @@ fn q6_word_values(base: u32, index: u32) -> vec4<i32> {
     i32(((ql >> (24u + ql_shift)) & 15u) | (((qh >> (24u + qh_shift)) & 3u) << 4u)) - 32);
 }
 
-// IQ4_XS non-linear codebook (ggml-common.h kvalues_iq4nl), packed as 16 signed
-// bytes in four u32 constants so the lookup is shifts, not a memory-backed
-// array: on Intel ANV a var<private> array indexed dynamically cost +30%
-// (0.367 -> 0.284 ms on blk.0.attn_gate, 2026-09-18).
+// IQ4_XS non-linear codebook (ggml-common.h kvalues_iq4nl).
 // codebook packed as 16 signed bytes in four u32 words; lookup = shift + sign-extend (no memory).
 fn kv_lookup(n: u32) -> i32 {
   let w = select(select(0xBFAD9881u, 0xF6EADDCFu, n >= 4u), select(0x26190D01u, 0x71594535u, n >= 12u), n >= 8u);
@@ -210,8 +186,10 @@ fn block_bytes_of(t: u32) -> u32 {
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
   let row = wg.x;
-  let position = wg.y;
+  let position = wg.y;            // selection slot e
   let t = lid.x;
+  let expert = expert_ids[position];
+  let in_row = select(0u, position, params.input_per_expert == 1u);
   let blocks = params.cols / 256u;
   let tt = params.tensor_type;
   let block_bytes = block_bytes_of(tt);
@@ -222,8 +200,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
 
   if row < params.rows && position < params.positions {
     for (var block = 0u; block < blocks; block++) {
-      let wb = row * row_bytes + block * block_bytes;
-      let yb = (position * blocks + block) * 292u;
+      let wb = (expert * params.rows + row) * row_bytes + block * block_bytes;
+      let yb = (in_row * blocks + block) * 292u;
       let yd = q8_float(yb);
       let y = q8_word_i8(yb + 4u + index);
       if tt == 12u || tt == 13u {
