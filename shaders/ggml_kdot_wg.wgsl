@@ -34,6 +34,12 @@
 // Bindings and Meta are identical to ggml_kdot.wgsl so the host can swap the
 // module without touching bind groups. Dispatch: (rows, positions, 1)
 // workgroups, NOT ceil(rows/64) -- one workgroup per row.
+//
+// tensor_type (ggml enum): 12 Q4_K (144 B/block), 13 Q5_K (176 B), 14 Q6_K
+// (210 B), 23 IQ4_XS (136 B). Q5_K and IQ4_XS were added for Nex-N2.5-mini
+// (qwen35moe: attn_qkv is Q5_K, 391 of 733 tensors are IQ4_XS -- root
+// ADR-2609182100, gate :nex-n25-mini-gguf-admission); their reference is
+// ggml-cpu/quants.c ggml_vec_dot_{q5_K,iq4_xs}_q8_K_generic.
 
 struct Meta {
   rows: u32,
@@ -141,14 +147,71 @@ fn q6_word_values(base: u32, index: u32) -> vec4<i32> {
   return out;
 }
 
+// IQ4_XS non-linear codebook (ggml-common.h kvalues_iq4nl).
+var<private> kvalues_iq4nl: array<i32, 16> = array<i32, 16>(-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113);
+
+// Four consecutive Q5_K values for `index .. index+3`: Q4_K nibbles (qs @48,
+// 32 bytes per 64-group) plus the fifth bit from qh (@16, one byte per lane,
+// bit 2*group for the low-nibble half and 2*group+1 for the high half).
+fn q5_word_values(base: u32, index: u32) -> vec4<i32> {
+  let group = index / 64u;
+  let within = index & 63u;
+  let lane = within & 31u;
+  let hi_half = within >= 32u;
+  let qs = weights[(base + 48u + group * 32u + lane) >> 2u];
+  let qh = weights[(base + 16u + lane) >> 2u];
+  let shift = select(0u, 4u, hi_half);
+  let bit = 2u * group + select(0u, 1u, hi_half);
+  var out: vec4<i32>;
+  for (var b = 0u; b < 4u; b++) {
+    let nib = (qs >> (b * 8u + shift)) & 15u;
+    let h = ((qh >> (b * 8u + bit)) & 1u) << 4u;
+    out[b] = i32(nib | h);
+  }
+  return out;
+}
+
+// Four consecutive IQ4_XS codebook values for `index .. index+3`: sub-block
+// ib = index/32 owns qs[ib*16 .. ib*16+15] (@8); values 0..15 of the sub-block
+// are the low nibbles, 16..31 the high nibbles of the same 16 bytes.
+fn iq4xs_word_values(base: u32, index: u32) -> vec4<i32> {
+  let ib = index / 32u;
+  let within = index & 31u;
+  let hi = within >= 16u;
+  let w = weights[(base + 8u + ib * 16u + select(within, within - 16u, hi)) >> 2u];
+  let shift = select(0u, 4u, hi);
+  return vec4<i32>(
+    kvalues_iq4nl[(w >> shift) & 15u],
+    kvalues_iq4nl[(w >> (8u + shift)) & 15u],
+    kvalues_iq4nl[(w >> (16u + shift)) & 15u],
+    kvalues_iq4nl[(w >> (24u + shift)) & 15u]);
+}
+
+// IQ4_XS 6-bit sub-block scale, before the -32.
+fn iq4xs_scale(base: u32, ib: u32) -> i32 {
+  let scales_h = weights[base >> 2u] >> 16u;               // u16 @2 (d is @0 in the same word)
+  let scales_l = weight_byte(base + 4u + ib / 2u);
+  return i32(((scales_l >> (4u * (ib & 1u))) & 15u) | (((scales_h >> (2u * ib)) & 3u) << 4u));
+}
+
+fn block_bytes_of(t: u32) -> u32 {
+  switch t {
+    case 12u: { return 144u; }
+    case 13u: { return 176u; }
+    case 14u: { return 210u; }
+    case 23u: { return 136u; }
+    default: { return 0u; }
+  }
+}
+
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
   let row = wg.x;
   let position = wg.y;
   let t = lid.x;
   let blocks = params.cols / 256u;
-  let is_q4 = params.tensor_type == 12u;
-  let block_bytes = select(210u, 144u, is_q4);
+  let tt = params.tensor_type;
+  let block_bytes = block_bytes_of(tt);
   let row_bytes = blocks * block_bytes;
   let index = t * 4u;                 // this thread's four values inside every block
   var acc = 0.0;                      // sum over blocks of d*yd*aux (thread's share)
@@ -160,16 +223,23 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
       let yb = (position * blocks + block) * 292u;
       let yd = q8_float(yb);
       let y = q8_word_i8(yb + 4u + index);
-      if is_q4 {
+      if tt == 12u || tt == 13u {
+        // Q4_K and Q5_K share d/dmin/scales; Q5_K adds the fifth bit.
         let j = index / 32u;
         let scale = q4_scale(wb, j);
-        let q = q4_word_values(wb, index);
+        let q = select(q4_word_values(wb, index), q5_word_values(wb, index), tt == 13u);
         let aux = scale * (y.x * q.x + y.y * q.y + y.z * q.z + y.w * q.w);
         acc += weight_half(wb) * yd * f32(aux);
         if t < 16u {
           // ggml: sumi = sum_j bsums[j] * mins[j/2]; sixteen terms, one per thread.
           mins += weight_half(wb + 2u) * yd * f32(signed_i16_q8(yb + 260u + t * 2u) * q4_min(wb, t / 2u));
         }
+      } else if tt == 23u {
+        let ib = index / 32u;
+        let ls = iq4xs_scale(wb, ib) - 32;
+        let q = iq4xs_word_values(wb, index);
+        let sumi = y.x * q.x + y.y * q.y + y.z * q.z + y.w * q.w;
+        acc += weight_half(wb) * yd * f32(ls) * f32(sumi);
       } else {
         let j = index / 16u;
         let sb = weight_byte(wb + 192u + j);
