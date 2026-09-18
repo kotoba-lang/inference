@@ -35,9 +35,37 @@ the f64 twin; the f32 tree in the shader is the order). Single small dispatch
 (16 MiB): B70 0.68 ms, K16 0.80 ms, Xavier 2.47 ms — launch-bound, which is
 why the serving path records one command buffer per token (ADR-2609182100 D1).
 
-What this is not yet: the Nex kernels. `shaders/*.wgsl` are the quantized
-kernels measured under the legacy Deno harness; the port is WGSL → GLSL/SPIR-V
-(or, the intended end, amu's accelerator KIR emitting SPIR-V), then the 40-layer
-decode step as a `.kotoba` program issuing ~20 dispatches per token. Xavier
+## The Nex K-quant kernels on the same path (2026-09-19)
+
+`kdot_f32_r8.comp` / `kdot_f32_r1.comp` are the GLSL twins of
+`shaders/ggml_kdot_f32_r8.wgsl` / `ggml_kdot_f32.wgsl` (Q4_K 12 / Q5_K 13 /
+Q6_K 14 / IQ4_XS 23, f32 activations, five storage bindings). `gen_kdot_guest.cljk`
+reads a GGUF's tensor directory and writes a guest that `MAP`s the tensor by
+file offset; `kdot_ref.py` is the CPU dequant oracle (first 64 rows),
+`kdot_check.py` the comparison. All four formats agree with the oracle on all
+three boxes (max rel err ≤ 1.4e-5). Real Nex tensors, 10 dispatches in one
+command buffer:
+
+| tensor (type, bytes) | B70 r8 / r1 | K16 iGPU r8 / r1 | Xavier r8 / r1 |
+|---|---|---|---|
+| `blk.0.attn_qkv` (Q5_K, 11.5 MB) | 25 / **98** GB/s | **21** / 21 | **13** / 1.2 |
+| `blk.0.attn_gate` (IQ4_XS, 4.5 MB) | 14 / **57** | **17** / 13 | **11** / 4.4 |
+| `blk.0.ffn_gate_exps` expert 0 (IQ4_XS, 0.56 MB) | 2.2 / **16** | 6.5 / **16** | 4.8 / 3.6 |
+| `output` lm_head (Q6_K, 417 MB) | **135** / 107 | 38 / **43** | 6.7 / **12** |
+
+Read across: the best layout is per (backend, tensor) — the same finding the
+Deno-era table had — and the small tensors are launch-bound (B70 ≈ 0.1 ms per
+dispatch inside a buffer, Xavier ≈ 0.5). Two NVIDIA-specific fixes on the way:
+a dynamically indexed `ivec4`/constant array goes to local memory on nvgpu
+(Q5_K at 1 GB/s until the loops were written out and the IQ4_XS codebook became
+four packed words), and a live `VkDevice` at process exit segfaults in the
+driver's atexit path (amu #1028 tears down in order). Xavier is still far from
+its 54 GB/s f32 number — its own layout is the next co-scientist item.
+
+What this is not yet: the composed decode step. The matvec kernels are ported;
+delta-net, `nex_ops` (norms, rope, softmax-topk, gate) and the MoE gather are the
+remaining WGSL → GLSL ports, then the 40-layer decode step as a `.kotoba` program
+issuing ~20 dispatches per token (the intended end is amu's accelerator KIR
+emitting SPIR-V). Xavier
 runs this path instead of CUDA (JetPack 5.1.2 cannot run a vLLM that knows
 Nex; owner 2026-09-18).
