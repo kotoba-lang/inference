@@ -161,6 +161,18 @@ M1 Max / B70 / AMD; 30 layers step in 2.1–3.1 ms per token (gate
 `:deltanet-step-parity`). The conv1d, q/k L2 norms and gated output norm around
 it are the next kernels.
 
+`shaders/nex_ops.wgsl` holds every non-matvec op of a qwen35moe decode step
+(RMSNorm, L2 norm, gated RMSNorm, silu·up, conv1d step with GPU ring state,
+router softmax + top-8 + weight normalisation, delta-net gate/decay, weighted
+expert sum + shared gate, NEOX partial RoPE, one-query GQA attention with the
+attn gate, two-stage argmax over 248,320 logits) as one module with one entry
+point each and one 7-slot bind-group layout. `verify/nex_ops_parity.js` checks
+all eleven against f64 references of the llama.cpp graph at Nex shapes — all
+pass on M1 Max / Intel B70 / AMD 8060S (gate `:nex-ops-parity`). With the
+K-quant dots, the expert gather and the delta-net step, every kernel of a Nex
+decode step now exists; composing them into one command buffer against real
+weights needs a GPU that is not serving.
+
 ## Stable JVM production entry point (`kotodama.inference.host.jvm`)
 
 Downstream JVM hosts (e.g. `kotoba-lang/murakumo-studio`) should call the
