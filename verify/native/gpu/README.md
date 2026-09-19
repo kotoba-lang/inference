@@ -624,6 +624,22 @@ Session tally for B70's 4-layer token: 3.63 (tick 5) → 2.96; 40-layer estimate
 ≈ 40 × 0.315 + 1.7 ≈ **14 ms, ~70 tok/s**. Small-dispatch consolidation is
 closed as a B lever (ticks 19 and 23 both measured it at 0 to −1%).
 
+**Tick 24 (iteration 29): the memory floor, and the row sweep.** `mem_probe.comp`
++ `mem_probe.kotoba` stream 1 GiB with pure `vec4` loads (4096 workgroups × 256
+threads × 64 vec4, ten dispatches in one buffer): **B70 598 GB/s** (pinned),
+**K16 46 GB/s**, **Xavier 103 GB/s**. Against that floor the K-quant kdots sit
+at 28–44% on B70 (qkv 170, lm_head 261), 70–95% on K16 (bandwidth-bound, as
+tick 3 said) and ~20% on Xavier (instruction-bound, as tick 6 said). The token
+floor on B70 is 1.3 GB / 598 GB/s ≈ 2.2 ms — vLLM's 9.7 ms is far from it too.
+`kdot_f32_r8.comp` takes `-DROWS`; the sweep on B70 (pinned, GB/s): attn_qkv
+r1 120 / **r4 172** / r8 168 / r16 128 / r32 69; lm_head r1 152 / r4 256 /
+**r8 261** / r16 131 / r32 132 — rows in flight saturate at 4–8 and spill past
+16, so the remaining 2.3× to the floor on ANV is the per-value dequant
+arithmetic, the same wall Xavier hit at a lower height. `gen_kdot_guest.cljk`
+accepts `r1 | r4 | r8 | r16 | r32`. Next kernel: an r8-shaped packed-half kdot
+for ANV (h2's arithmetic, r8's rows in flight), with the 40-layer parity
+measurement before it can become the `anv` default.
+
 What this is not yet: the 40-layer model on a device with room (the serving
 processes own the memory), prompt-side prefill (tokens are fed one at a time),
 sampling other than argmax, distribution parity with llama.cpp over a real
