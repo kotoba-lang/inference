@@ -251,6 +251,77 @@ void op_sample_topp() {
     if (P.p1 != 0.0 && pos + 1u >= P.aux2) b[pos + 1u] = uintBitsToFloat(pick);
   }
 }
+// The multi-workgroup sampler (iteration 19): the same definition as sample_topp,
+// split so the 248k-element passes run on 61 workgroups. o is the scratch:
+// o[0..60] partial max, o[61..121] partial Z (relative to the partial max),
+// o[122] lo, o[123] hi, o[124..184] partial mass; s holds p_i.
+//   sample_part (61 wg) -> sample_probs (61 wg) -> 30 x (sample_bisect_part (61 wg), sample_bisect_step (1 wg)) -> sample_final (1 wg)
+void op_sample_part() {
+  uint t = gl_LocalInvocationID.x, w = gl_WorkGroupID.x, n = P.n; float invT = 1.0 / P.eps;
+  uint s0 = w * 4096u, s1 = min(n, s0 + 4096u);
+  float m = -1e30; for (uint i = s0 + t; i < s1; i += 256u) m = max(m, a[i] * invT);
+  sred[t] = m; barrier();
+  for (uint st = 128u; st > 0u; st >>= 1u) { if (t < st) sred[t] = max(sred[t], sred[t + st]); barrier(); }
+  m = sred[0]; barrier();
+  float z = 0.0; for (uint i = s0 + t; i < s1; i += 256u) z += exp(a[i] * invT - m);
+  float Z = wg_sum_s(t, z);
+  if (t == 0u) { o[w] = m; o[61u + w] = Z; }
+}
+void op_sample_probs() {
+  uint t = gl_LocalInvocationID.x, w = gl_WorkGroupID.x, n = P.n; float invT = 1.0 / P.eps;
+  uint parts = (n + 4095u) / 4096u;
+  if (t == 0u) {
+    float M = -1e30; for (uint k = 0u; k < parts; k++) M = max(M, o[k]);
+    float Z = 0.0; for (uint k = 0u; k < parts; k++) Z += o[61u + k] * exp(o[k] - M);
+    sred[0] = M; sred[1] = Z;
+    if (w == 0u) { o[122] = 0.0; o[123] = 1.0; }
+  }
+  barrier();
+  float M = sred[0], Z = sred[1];
+  uint s0 = w * 4096u, s1 = min(n, s0 + 4096u);
+  for (uint i = s0 + t; i < s1; i += 256u) s[i] = exp(a[i] * invT - M) / Z;
+}
+void op_sample_bisect_part() {
+  uint t = gl_LocalInvocationID.x, w = gl_WorkGroupID.x, n = P.n;
+  float mid = 0.5 * (o[122] + o[123]);
+  uint s0 = w * 4096u, s1 = min(n, s0 + 4096u);
+  float acc = 0.0; for (uint i = s0 + t; i < s1; i += 256u) { float pi = s[i]; if (pi >= mid) acc += pi; }
+  float mass = wg_sum_s(t, acc);
+  if (t == 0u) o[124u + w] = mass;
+}
+void op_sample_bisect_step() {
+  uint t = gl_LocalInvocationID.x; uint parts = (P.n + 4095u) / 4096u;
+  if (t == 0u) {
+    float mass = 0.0; for (uint k = 0u; k < parts; k++) mass += o[124u + k];
+    float lo = o[122], hi = o[123], mid = 0.5 * (lo + hi);
+    if (mass >= P.scale) o[122] = mid; else o[123] = mid;
+  }
+}
+void op_sample_final() {
+  uint t = gl_LocalInvocationID.x, n = P.n;
+  uint pos = (P.p1 != 0.0) ? floatBitsToUint(c[0]) : 0u;
+  uint seed = floatBitsToUint(P.p0);
+  float tau = o[122];
+  uint chunk = (n + 255u) / 256u, s0 = t * chunk, s1 = min(n, s0 + chunk);
+  float part = 0.0; for (uint i = s0; i < s1; i++) { float pi = s[i]; if (pi >= tau) part += pi; }
+  sred[t] = part; barrier();
+  if (t == 0u) { float run = 0.0; for (uint k = 0u; k < 256u; k++) { float v = sred[k]; sred[k] = run; run += v; } stot = run; }
+  barrier();
+  float total = stot; float before = sred[t]; barrier();
+  float u = float(mix32(seed ^ (pos * 0x9E3779B9u)) >> 8u) / 16777216.0;
+  float target = u * total;
+  if (target >= before && target < before + part) {
+    float run = before; uint pick = s1 - 1u;
+    for (uint i = s0; i < s1; i++) { float pi = s[i]; if (pi >= tau) { if (target < run + pi) { pick = i; break; } run += pi; } }
+    ids[P.aux] = pick;
+    if (P.p1 != 0.0 && pos + 1u >= P.aux2) b[pos + 1u] = uintBitsToFloat(pick);
+  }
+  if (t == 255u && target >= total) {
+    uint pick = 0u; for (uint i = n; i > 0u; i--) { if (s[i - 1u] >= tau) { pick = i - 1u; break; } }
+    ids[P.aux] = pick;
+    if (P.p1 != 0.0 && pos + 1u >= P.aux2) b[pos + 1u] = uintBitsToFloat(pick);
+  }
+}
 void op_pos_incr() { if (gl_GlobalInvocationID.x == 0u) ids[0] += 1u; }   // the position counter, once per token
 void op_add() {
   uint i = gl_GlobalInvocationID.x; if (i >= P.n) return;
@@ -273,7 +344,7 @@ void op_add_rmsnorm() {
 }
 
 #ifndef OP
-#error "compile with -DOP=<rmsnorm|l2norm|gated_rmsnorm|silu_mul|conv1d_step|softmax_topk|gate_decay|gate_decay2|copy_at|weighted_sum|rope_neox|attn_decode|argmax_partial|argmax_final|add|f32_matvec|add_rmsnorm|pos_incr|sample_topp>"
+#error "compile with -DOP=<rmsnorm|l2norm|gated_rmsnorm|silu_mul|conv1d_step|softmax_topk|gate_decay|gate_decay2|copy_at|weighted_sum|rope_neox|attn_decode|argmax_partial|argmax_final|add|f32_matvec|add_rmsnorm|pos_incr|sample_topp|sample_part|sample_probs|sample_bisect_part|sample_bisect_step|sample_final>"
 #endif
 #define CAT2(a, b) a##b
 #define CAT(a, b) CAT2(a, b)

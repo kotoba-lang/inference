@@ -432,8 +432,29 @@ the same hash: K16, T 0.8, top-p 0.95 — top-p set 14 tokens (mass 0.9523),
 `sample:T:top_p:seed`; `decode_tokens_ref.py … --sample T top_p seed` is the
 oracle) K16 12 L, 3 forced + 3 sampled: **6/6 tokens equal** (18171 / 84249 /
 236687 / 112516 / 21356 / 226585). Cost: the single-workgroup sampler is 4.8 ms
-per draw on K16 (27.5 → 32 ms/token) — multi-workgroup partial sums are the
-obvious next cut. Not implemented: top-k, repetition penalties, min-p.
+per draw on K16 (27.5 → 32 ms/token). Not implemented: top-k, repetition
+penalties, min-p.
+
+**Tick 14 (iteration 19): the sampler on 61 workgroups.** Same definition,
+split into `sample_part` (61 wg: partial max and partial Z relative to it) →
+`sample_probs` (61 wg: global max/Z from the 61 partials, `p_i` into a 1 MB
+scratch, lo/hi reset) → 30 × (`sample_bisect_part` (61 wg: mass of `p ≥ mid`
+per chunk) + `sample_bisect_step` (1 wg: sum, move lo or hi)) →
+`sample_final` (1 wg: index-order draw over the set). 63 dispatches, one
+scratch of 1 KB for partials + lo/hi and one for `p_i`. `sample_test.kotoba`
+now runs this chain (65 dispatches per draw, one command buffer per draw
+because of the 2048-dispatch cap): **256/256 draws equal the oracle**, same
+picks as the single-workgroup op, **1.25 ms** per draw command buffer (was
+4.8). In the token loop: K16 12 L 3 forced + 3 sampled 6/6, **28.6 ms/token**
+(greedy 27.5, single-workgroup sampler 32.0); Xavier 12 L with the exact
+kernels 6/6 at 49.7 ms (greedy 48.5); Xavier with the **h2** default 40.7 ms but
+the *sampled* tokens differ from the oracle from step 0 (18185 vs 18171 —
+neighbouring ids): at 12 layers the distribution is flat, the top-p set is
+huge, and h2's ~1e-3 probability shifts move the index-order draw to a nearby
+token. That is the format's numerics, not the sampler (the same SPIR-V picks
+256/256 on exact probabilities); sampled-output comparisons against an oracle
+must use the exact kernels or compare distributions, not token chains. The
+single-workgroup `sample_topp` stays in `nex_ops.comp` as the reference form.
 
 What this is not yet: the 40-layer model on a device with room (the serving
 processes own the memory), prompt-side prefill (tokens are fed one at a time),

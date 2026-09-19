@@ -139,7 +139,7 @@
 (defn fresh [prefix] (swap! counter inc) (str prefix @counter))
 ;; --- the plan ---
 (def zeros16 (alloc! 16))
-(def ops (into {} (for [op ["rmsnorm" "l2norm" "gated_rmsnorm" "silu_mul" "conv1d_step" "softmax_topk" "gate_decay2" "weighted_sum" "add" "f32_matvec" "add_rmsnorm" "rope_neox" "attn_decode" "argmax_partial" "argmax_final" "copy_at" "pos_incr" "sample_topp"]] [op (pipeline! (str "nex_" op ".spv") 7)])))
+(def ops (into {} (for [op ["rmsnorm" "l2norm" "gated_rmsnorm" "silu_mul" "conv1d_step" "softmax_topk" "gate_decay2" "weighted_sum" "add" "f32_matvec" "add_rmsnorm" "rope_neox" "attn_decode" "argmax_partial" "argmax_final" "copy_at" "pos_incr" "sample_part" "sample_probs" "sample_bisect_part" "sample_bisect_step" "sample_final"]] [op (pipeline! (str "nex_" op ".spv") 7)])))
 (def kdot-wide (pipeline! (:wide layouts) 5))
 (def kdot-narrow (pipeline! (:narrow layouts) 5))
 (def kdot-lm (pipeline! (:lm layouts) 5))
@@ -195,6 +195,8 @@
 (def m-incr (ops-meta! 1 1 0 0 0 0))
 ;; sampler meta: n rows aux(=ids slot 61) aux2(=prompt length) eps(=T) scale(=top_p) p0(=seed bits) p1(=1)
 (def m-sample (when sampling (let [m (alloc! 32)] (write! m (str (le32 248320) (le32 1) (le32 61) (le32 (count prompt)) (lef32 (:T sampling)) (lef32 (:top-p sampling)) (le32 (:seed sampling)) (lef32 1))) m)))
+(def sample-o (when sampling (alloc! 1024)))          ;; partial max / Z / mass, lo / hi
+(def sample-s (when sampling (alloc! (* 248320 4))))  ;; p_i
 (def rec-keys [:norm :post :router :shgate-inp :gate-exps :up-exps :down-exps :gate-sh :up-sh :down-sh :qkv :gate :alpha :beta :dt :a :conv :ssm-norm :out])
 (def att-keys [:norm :post :router :shgate-inp :gate-exps :up-exps :down-exps :gate-sh :up-sh :down-sh :q :k :v :qn :kn :o])
 (def tensor-name {:norm "attn_norm.weight" :post "post_attention_norm.weight" :router "ffn_gate_inp.weight" :shgate-inp "ffn_gate_inp_shexp.weight"
@@ -363,7 +365,12 @@
     (dispatch! (ops "rmsnorm") 1 1 1 m-norm x-final w-out-norm zeros16 hN zeros16 zeros16)
     (dispatch! kdot-lm (wg-of (:lm layouts) 248320) 1 1 m-lm w-lm hN logits zeros16)
     (if sampling
-      (dispatch! (ops "sample_topp") 1 1 1 m-sample logits tokbuf posbuf amax-s amax-s amax-ids)
+      ;; multi-workgroup sampler (iteration 19): 61-workgroup passes, 30 bisection rounds on tau, one final pass
+      (let [h [m-sample logits tokbuf posbuf sample-o sample-s amax-ids]]
+        (apply dispatch! (ops "sample_part") 61 1 1 h)
+        (apply dispatch! (ops "sample_probs") 61 1 1 h)
+        (dotimes [_ 30] (apply dispatch! (ops "sample_bisect_part") 61 1 1 h) (apply dispatch! (ops "sample_bisect_step") 1 1 1 h))
+        (apply dispatch! (ops "sample_final") 1 1 1 h))
       (do (dispatch! (ops "argmax_partial") 61 1 1 m-am1 logits zeros16 zeros16 zeros16 amax-s amax-ids)
           (dispatch! (ops "argmax_final") 1 1 1 m-am2-dyn amax-s tokbuf posbuf amax-s amax-s amax-ids)))
     (dispatch! (ops "pos_incr") 1 1 1 m-incr zeros16 zeros16 zeros16 zeros16 zeros16 posbuf)
