@@ -1170,3 +1170,31 @@ phase can use today, and it loses to the r8 / int8 / h2 decode layouts it replac
 per backend (positions inner loop on the r8 / x8r4 / i8 / h2 layouts) would put B=2 near 1.0× a decode step and
 the throughput near 2×. That, and the shell's scheduler (rows as slots), are the next items. Wall time in the
 harness includes the warm-up before the first message and is not the served figure.
+
+## Tick 47 (2026-09-20, C-4): where the batch step's time went — the lm_head read B times
+
+Profiling by diffing the decode and batch layer functions kernel-by-kernel (`recurrent-layer` vs
+`recurrent-layer-b`): the layers were equivalent per row; the difference was outside them. The batch step ran
+the lm_head — 248320 × 2048 Q6_K, **425 MB**, the largest tensor in the step — with the positions DISPATCH
+dimension (workgroup y = row), which reads it B times: on K16 (46 GB/s) that is 9.2 ms per extra row. Reading it
+once through the positions kernel (`kdot_f32_p<B>`, rows as the inner loop, `:lm-once` in the layout table for
+radv and nvgpu):
+
+| box | B | before | after | seq-tokens/s vs single |
+|---|---|---|---|---|
+| K16 | 2 | 49.2 ms | **36.9 ms** | 54.2 / 36.9 = **1.47×** |
+| K16 | 4 | 84.3 | **58.1** | 68.9 / 36.9 = **1.87×** |
+| Xavier | 2 | 77.4 | **60.8** | 32.9 / 27.3 = 1.20× |
+| Xavier | 4 | 135.3 | **88.9** | 45.0 / 27.3 = **1.65×** |
+| B70 | 2 | 7.84 | 8.62 (worse) | kept the positions dispatch: 255 / 200 = 1.28× |
+
+ANV is not bandwidth-bound on the lm_head; its int8 x8r4 read twice beats the f32 kernel read once, so the flag is
+per backend. All rows oracle-exact throughout (K16 4/4, Xavier 2/2 and 4/4, B70 2/2).
+
+Also tried: `kdot_f32_p` with `-DROWS=8` (the r8 shape with the positions inner loop, `kdot_f32_p<P>r8.spv`,
+`NEX_PROWS` / layout `:prows`): K16 B=2 50.3 vs 49.2 ms for the layer kdots, and 46.0 vs 36.9 when it also
+took the lm_head — the r1 shape wins on radv for this kernel; kept in the source as a measured negative, default
+`:prows 1`. What remains between the B=1 batch step (36.8) and a decode step (27.1) on K16: the MoE expert kdots
+at 8B positions (their weights differ per position, ~3 ms), the delta-net's per-row state traffic (~1.5 ms), and
+the rest of the row-doubled ops. Those are per-row costs, so they scale with B and cap the gain — B=4 at 1.87×
+is near what this shape gives on K16.
