@@ -54,7 +54,8 @@
 ;; on RADV r8 wins attn_gate and loses the experts, and s2 LOSES (one wave64 per
 ;; workgroup pays the barriers); on ANV r1 wins everything but the lm_head.
 (def layout-table
-  {"anv"   {:wide "kdot_f32_r8.spv" :narrow "kdot_f32_r1.spv" :lm "kdot_f32_r8.spv" :expert "kdot_f32_r8.spv"}   ;; wide -> r8 (iteration 25), experts -> r8 (iteration 27: 3.30 -> 3.06 ms; narrow on r8 loses, 3.15)
+  {"anv"   {:wide "kdot_f32_r8.spv" :narrow "kdot_f32_r1.spv" :lm "kdot_f32_r8.spv" :expert "kdot_f32_r8.spv" :out "kdot_f32_r1.spv"}   ;; wide -> r8 (iteration 25), experts -> r8 (iteration 27), out projections back to r1 (iteration 28: 256 workgroups starve r8)
+   "anv-dual" {:wide "kdot_f32_r8.spv" :narrow "kdot_f32_r1.spv" :lm "kdot_f32_r8.spv" :expert "kdot_f32_r8.spv" :expert-dual "kdot_f32_r8_dual.spv"}   ;; experiment: gate + up + silu in one dispatch (iteration 28)
    "radv"  {:wide "kdot_f32_r8.spv" :narrow "kdot_f32_r1.spv" :lm "kdot_f32_r1.spv"}
    ;; nvgpu default = packed-half dequant (kdot_h2_r1) since iteration 15: over all
    ;; 40 layers KL(oracle||h2) = 8.5e-4 nats and KL(llama.cpp||h2) = 0.0142, the same
@@ -148,6 +149,10 @@
 (def kdot-narrow (pipeline! (:narrow layouts) 5))
 (def kdot-lm (pipeline! (:lm layouts) 5))
 (def kdot-expert (if (:expert layouts) (pipeline! (:expert layouts) 5) kdot-narrow))   ;; the three 8-position expert kdots (iteration 27)
+(def kdot-expert-dual (when (:expert-dual layouts) (pipeline! (:expert-dual layouts) 6)))   ;; gate + up + silu in one dispatch (iteration 28)
+;; :out = the 2048-row x 4096-col output projections (ssm_out, attn_output): on r8 they get only 256 workgroups (iteration 28)
+(def kdot-out (if (:out layouts) (pipeline! (:out layouts) 5) kdot-wide))
+(def out-spv (or (:out layouts) (:wide layouts)))
 (defn wg-of [spv rows] (if (= spv "kdot_f32_r8.spv") (quot (+ rows 7) 8) rows))
 (def expert-spv (or (:expert layouts) (:narrow layouts)))
 (def deltanet (pipeline! "deltanet_step.spv" 8))
@@ -243,7 +248,7 @@
                 (dispatchc! (ops "l2norm") 16 1 1 m-l2k conv zeros16 zeros16 kn zeros16 zeros16)
                 (dispatch! deltanet 32 1 1 m-dn qn kn conv gb beta-only S dn)
                 (dispatch! (ops "gated_rmsnorm") 32 1 1 m-gn dn (:ssm-norm w) z gnorm zeros16 zeros16)))
-            (dispatch! kdot-wide (wg-of (:wide layouts) 2048) 1 1 m-out (:out w) gnorm attn-out zeros16))
+            (dispatch! kdot-out (wg-of out-spv 2048) 1 1 m-out (:out w) gnorm attn-out zeros16))
           (do
             (dispatch! kdot-wide (wg-of (:wide layouts) 8192) 1 1 m-q (:q w) h qfull zeros16)
             (dispatchc! kdot-narrow (wg-of (:narrow layouts) 512) 1 1 m-k (:k w) h kproj zeros16)
@@ -255,7 +260,7 @@
             (dispatchc! (ops "copy_at") 2 1 1 mcopy vproj zeros16 zeros16 vc zeros16 pb)
             (dispatch! (ops "copy_at") 2 1 1 mcopy krope zeros16 zeros16 kc zeros16 pb)
             (dispatch! (ops "attn_decode") 16 1 1 mattn qrope kc vc attno qfull pb)
-            (dispatch! kdot-wide (wg-of (:wide layouts) 2048) 1 1 m-attn-o (:o w) attno attn-out zeros16)))
+            (dispatch! kdot-out (wg-of out-spv 2048) 1 1 m-attn-o (:o w) attno attn-out zeros16)))
         (dispatch! (ops "add_rmsnorm") 1 1 1 m-addn xin attn-out (:post w) resid h2 zeros16)
         ;; barrier groups (DISPATCHC = independent of everything since the last DISPATCH)
         (dispatch! (ops "f32_matvec") 256 1 1 m-router (:router w) h2 zeros16 router zeros16 zeros16)
@@ -264,10 +269,13 @@
         (dispatchc! (ops "f32_matvec") 1 1 1 m-shlogit (:shgate-inp w) h2 zeros16 shlogit zeros16 zeros16)
         (dispatch! (ops "softmax_topk") 1 1 1 m-topk router zeros16 zeros16 topw zeros16 ids)
         (dispatchc! (ops "silu_mul") 2 1 1 m-silu-sh sg su zeros16 sact zeros16 zeros16)
-        (dispatch! kdot-expert (wg-of expert-spv 512) 8 1 m-gate-exps (:gate-exps w) h2 gateE ids)
-        (dispatchc! kdot-expert (wg-of expert-spv 512) 8 1 m-gate-exps (:up-exps w) h2 upE ids)
-        (dispatchc! kdot-narrow (wg-of (:narrow layouts) 2048) 1 1 m-down-sh (:down-sh w) sact shdown zeros16)
-        (dispatch! (ops "silu_mul") 16 1 1 m-silu8 gateE upE zeros16 actE zeros16 zeros16)
+        (if kdot-expert-dual
+          (do (dispatch! kdot-expert-dual (quot (+ 512 7) 8) 8 1 m-gate-exps (:gate-exps w) (:up-exps w) h2 actE ids)
+              (dispatchc! kdot-narrow (wg-of (:narrow layouts) 2048) 1 1 m-down-sh (:down-sh w) sact shdown zeros16))
+          (do (dispatch! kdot-expert (wg-of expert-spv 512) 8 1 m-gate-exps (:gate-exps w) h2 gateE ids)
+              (dispatchc! kdot-expert (wg-of expert-spv 512) 8 1 m-gate-exps (:up-exps w) h2 upE ids)
+              (dispatchc! kdot-narrow (wg-of (:narrow layouts) 2048) 1 1 m-down-sh (:down-sh w) sact shdown zeros16)
+              (dispatch! (ops "silu_mul") 16 1 1 m-silu8 gateE upE zeros16 actE zeros16 zeros16)))
         (dispatch! kdot-expert (wg-of expert-spv 2048) 8 1 m-down-exps (:down-exps w) actE downE ids)
         (dispatch! (ops "weighted_sum") 8 1 1 m-wsum downE topw shdown ffn shlogit zeros16)
         (dispatch! (ops "add") 8 1 1 m-add resid ffn zeros16 xout zeros16 zeros16))
