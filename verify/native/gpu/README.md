@@ -324,6 +324,39 @@ imported with a token list. The like-for-like llama.cpp comparison needs the
 40-layer guest, which needs per-layer MAP/FREE streaming on the K16's 13 GiB
 GTT — the next item.
 
+**Tick 9 (iteration 14): the whole model on the K16 iGPU, and llama.cpp parity.**
+`gen_decode_tokens_guest.cljk … radv stream` emits a *function-shaped* program:
+`recurrent-layer [xin xout ring S]` and `attention-layer [xin xout kc vc]`
+hold the layer's dispatches once; `layer-N [g]` MAPs its tensors, calls the
+body, FREEs them; `main` calls the 40 layer functions per token. Two ceilings
+forced that shape and both are real: the ABI allows **5 parameters** per
+function (kotoba-sema `max-parameters`) and a module **64 KiB of string
+literals** (`kotoba.kir.value/string-value-byte-limit`; the straight-line
+40 × 5 program was 589 KB of source). Two consequences: the position is now
+read on the device (`nex_ops.comp` `dyn_pos`: `p1 != 0` → `ids[0]` from a
+16-byte `posbuf` the guest WRITEs once per token; `rope_neox`, `attn_decode`,
+`copy_at`), so a layer's dispatches are the same request every token; and the
+weight handles are literal even though they are MAPped per layer per token —
+the loader hands out the lowest free slot, so every recurrent layer lands on
+the same 19 slots and every attention layer on the lowest 16 of them, which the
+generator simulates. The non-stream guest is unchanged in behaviour (K16 12 L
+re-verified with the new kernels).
+
+Result, K16 iGPU (RADV, GTT 13 GiB; the 17.4 GB GGUF is re-uploaded every
+token from the page cache), prompt "The capital of France is" = `760,6511,314,9338,369`:
+
+| | |
+|---|---|
+| 5 tokens × 40 layers, wall | 25.8 s (uploads; the lm_head buffer alone is 9.8 ms) |
+| every step vs f64 oracle | argmax 271 / 314 / 279 / 369 / **11751** all equal; `x rel` ≤ 1.7e-4 (step 0), ≤ 1.5e-5 after |
+| final logits vs oracle | max\|Δ\| 1.5e-5, KL(oracle‖gpu) 7e-13 nats |
+| **vs llama-server (same GGUF, CPU)** | top-1 **11751 " Paris"** on both; KL(llama‖gpu) over llama's top-40 = **0.0143 nats**; llama mass on its top-40 0.907, gpu 0.911; gpu top-10 ⊂ llama top-40 10/10; p(Paris) 0.549 vs 0.474 |
+
+So the native path computes the same model as llama.cpp; the 0.014 nats are
+the two engines' rounding (llama.cpp quantizes activations to Q8 per 32-block).
+`parity_check.py <loader output> <ref npz> <llama json>` prints all of the above.
+The single-token probe of tick 8 was indeed the input, not the model.
+
 What this is not yet: the 40-layer model on a device with room (the serving
 processes own the memory), prompt-side prefill (tokens are fed one at a time),
 sampling other than argmax, distribution parity with llama.cpp over a real
