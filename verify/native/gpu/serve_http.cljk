@@ -22,10 +22,13 @@
 ;;   curl -s localhost:8099/v1/completions -H 'Content-Type: application/json' -d '{"prompt":"The capital of France is","max_tokens":8}'
 (require '["http" :as http] '["child_process" :as cp] '["path" :as path] '[clojure.string :as str] '[nbb.core :refer [load-file]])
 (def args (vec *command-line-args*))
-(when (< (count args) 5) (println "usage: <kexe-loader> <resident.bin> <offset> <isa> <port> [allow-csv] [steps-per-life]") (js/process.exit 2))
+(when (< (count args) 5) (println "usage: <kexe-loader> <resident.bin> <offset> <isa> <port> [allow-csv] [steps-per-life] [prefill-bucket]") (js/process.exit 2))
 (def loader (args 0)) (def bin (args 1)) (def offset (args 2)) (def isa (args 3)) (def port (args 4))
 (def allow (or (get args 5) "42,33,41,37,39"))
 (def steps-per-life (js/parseInt (or (get args 6) "15000")))
+;; prefill bucket P of a `resident-replay … prefill:<P>` guest (iteration 49): the prompt goes in as chunks of P tokens
+;; per message ("t0,…,tP-1,flag"), the remainder one token per message; 0 = the guest has no prefill step.
+(def prefill-bucket (js/parseInt (or (get args 7) "0")))
 (load-file (path/join (path/dirname *file*) "tokenizer_core.cljk"))
 (def eog-ids (set (keep token->id ["<|im_end|>" "<|endoftext|>"])))
 (when (empty? eog-ids) (println "REFUSE the GGUF names no <|im_end|> / <|endoftext|>") (js/process.exit 2))
@@ -50,12 +53,12 @@
     (reset! guest g)
     g))
 (defn step!
-  "Feed one token; resolves to [ns argmax-id] or nil if the guest died."
+  "Feed one token (or a vector of exactly prefill-bucket tokens: one batched step); resolves to [ns argmax-id] or nil if the guest died."
   [g tok reset?]
   (js/Promise. (fn [resolve _]
                  (reset! (:waiter g) (fn [line] (swap! (:steps g) inc)
                                        (resolve (when line (let [[ns idhex] (str/split line #"\|")] [(js/parseInt ns) (.readUInt32LE (js/Buffer.from idhex "hex") 0)])))))
-                 (.write (.-stdin (:proc g)) (str tok "," (if reset? 1 0))))))
+                 (.write (.-stdin (:proc g)) (str (if (vector? tok) (str/join "," tok) tok) "," (if reset? 1 0))))))
 (defn ensure-guest! []
   (let [g @guest]
     (if (and g (< @(:steps g) steps-per-life)) g
@@ -65,16 +68,20 @@
   "Prompt ids -> promise of {:generated [...] :ns [...] :finish \"stop\"|\"length\"} (greedy: each argmax is the next input;
    an end-of-generation id ends the request and is not part of the answer)."
   [ids max-tokens & [on-token]]
-  (let [g (ensure-guest!) out (atom []) nss (atom [])]
+  (let [g (ensure-guest!) out (atom []) nss (atom []) P prefill-bucket]
     (letfn [(feed [i tok]
-              (.then (step! g tok (= i 0))
+              ;; i = index of the first token this message carries; a chunk of P prompt tokens when the bucket allows
+              (let [chunk? (and (pos? P) (not (vector? tok)) (<= (+ i P) (count ids)))
+                    msg (if chunk? (subvec ids i (+ i P)) tok)
+                    nxt (+ i (if chunk? P 1))]
+              (.then (step! g msg (= i 0))
                      (fn [r]
                        (if-not r {:error "guest died"}
                          (let [[ns am] r] (swap! nss conj ns)
-                           (cond (< (inc i) (count ids)) (feed (inc i) (ids (inc i)))       ;; still the prompt: the reply is not kept
+                           (cond (< nxt (count ids)) (feed nxt (ids nxt))       ;; still the prompt: the reply is not kept
                                  (contains? eog-ids am) {:generated @out :ns @nss :finish "stop"}
                                  :else (do (swap! out conj am) (when on-token (on-token am))
-                                           (if (< (count @out) max-tokens) (feed (inc i) am) {:generated @out :ns @nss :finish "length"}))))))))]
+                                           (if (< (count @out) max-tokens) (feed nxt am) {:generated @out :ns @nss :finish "length"})))))))))]
       (feed 0 (ids 0)))))
 (defn message-text
   "A message's content as text: a string, or the OpenAI parts array (text parts joined; an image part is refused --
@@ -199,4 +206,4 @@
              (do (.writeHead res 200 #js {"Content-Type" "application/json"}) (.end res (js/JSON.stringify #js {:object "list" :data #js [#js {:id "nex-n2.5-mini/kotoba-native" :object "model" :owned_by "kotoba-lang"}]})))
              :else (do (.writeHead res 404 #js {"Content-Type" "application/json"}) (.end res (js/JSON.stringify #js {:error "POST /v1/completions | /v1/chat/completions, GET /health | /slots | /v1/models"}))))))))
 (.listen server (js/parseInt port)
-         (fn [] (spawn-guest!) (println (str "SERVE\tnex kotoba-native resident\thttp://0.0.0.0:" port "/v1/{chat/,}completions\tguest " bin " @" offset "\tsteps-per-life " steps-per-life))))
+         (fn [] (spawn-guest!) (println (str "SERVE\tnex kotoba-native resident\thttp://0.0.0.0:" port "/v1/{chat/,}completions\tguest " bin " @" offset "\tsteps-per-life " steps-per-life "\tprefill-bucket " prefill-bucket))))

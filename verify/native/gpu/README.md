@@ -1069,3 +1069,42 @@ measured negative (not built).
 Xavier's 40-layer prefill is now 1.4× decode, so the prompt half of a chat request (21 tokens = 1.8 s fed
 one step each) can drop toward ~1.3 s with batched prefill once it is in the resident protocol — which is the
 next item, for all three boxes.
+
+## Tick 44 (2026-09-20, C-1 / C-3-8): prefill in the resident protocol — the prompt as P-token steps
+
+`… fn - resident-replay prefill:<P>`: the guest records TWO kept command buffers — 0 the decode step, 1 a
+prefill step of P rows — and its `serve-loop` tells the message kinds apart by the one parse it has,
+`WRITEDEC`'s word count: `"t,f"` (2 words) → `REPLAY 0`, `"t0,…,tP-1,f"` (P+1 words) → `REPLAY 1`. `ctl` now
+takes `P.n` tokens (`tokbuf[pos+i] = c[i]`, flag at `c[n]`; decode's meta has n = 1, so it is unchanged). To
+emit both, the generator's batch-dependent state became a PHASE: `PF`, `prefill?`, the kdot-p pipeline and
+the 19 metas that depend on the batch are dynamic vars bound by `with-phase`; every activation buffer is sized
+by `PMAX`; the layer bodies are emitted twice (`recurrent-layer-p` / `attention-layer-p` / `layers-p`). The
+legacy modes regenerate to the same programs (K16 replay 0.340 s, standalone prefill 61.6 ms, both oracle).
+`serve_http.cljk` takes `prefill-bucket` (arg 8) and feeds the prompt as chunks of P then single tokens;
+`resident_drive.py` / `resident_mix.py` take the bucket as their last argument.
+
+The bug the refactor exposed: `shlogit` (the shared-expert gate logit, one float per row) was still
+`max(16, 4·PF)` bytes with the emission-time PF = 1 — 16 bytes, room for 4 rows — so P = 4 was exact and P = 8
+read past the buffer (K16 `40923,56380` for the oracle's `4032,268`; the debug reply showed the tokens and
+the position landing correctly, which pointed at the compute, and a handle-by-handle comparison of the
+resident and standalone P = 8 programs found the one allocation that differed). Sized by PMAX now; the
+grep `alloc!.*\bPF\b` is empty.
+
+Measured (ids = oracle in every row; "steps" = messages):
+
+| box, guest | prompt | chunked | decode only |
+|---|---|---|---|
+| K16 12 L, P = 4 | France 5 + 8 | 9 steps, 270 ms GPU, **0.281 s** | 12 steps, 326 ms, 0.339 s |
+| K16 12 L, P = 4 | 12-token oracle prompt + 2 | 4 steps, 184 ms, **0.189 s** | 13 steps, 355 ms, 0.371 s |
+| K16 12 L, P = 8 | 12-token + 2 | 6 steps, 219 ms, **0.225 s** | 13 steps, 355 ms |
+| B70 12 L, P = 4 | France 5 + 8 | 9 steps, 49.1 ms, **0.052 s** | 12 steps, 60.7 ms, 0.065 s |
+| Xavier 40 L, P = 8 | 12-token 40-L oracle prompt + 2 | 6 steps, 871 ms, **0.877 s** | 13 steps, 1143 ms, 1.157 s |
+
+Mixed prompts with the bucket (K16, P = 4): 6/6. On a garbage prompt (`…,1,2,3,4`) the chunked and
+decode-only Xavier runs agree for 6 generated tokens and then diverge — the prefill kdot is f32 where decode
+is h2 (rows `x rel` ≤ 1.35e-2 at 40 L), so near-ties fall differently; on the oracle prompt they agree.
+
+**Xavier's unit now runs `rp40-nv.bin` with `prefill-bucket 8`** (:8090): chat "What is the capital of France?
+Answer in one word." (21 prompt tokens = 2 chunks + 5) → `"Paris"`, 11 steps, **1.65–1.70 s (tick 40: 2.26 s)**;
+the haiku (17 tokens) 163 steps in 15.0 s. Prompt cost per token on Xavier is now ~292/8 ≈ 37 ms in the
+chunks against 86 ms per decode step; a longer bucket (16) would take it further for long prompts.
