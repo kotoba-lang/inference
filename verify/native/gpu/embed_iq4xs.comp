@@ -6,10 +6,11 @@
 // its ids buffer. One workgroup: thread t < blocks*8 owns sub-block t (32 values).
 // Root ADR-2609182400 C.
 layout(local_size_x = 256) in;
-layout(std430, binding = 0) readonly buffer Meta { uint cols; uint slot; uint pad0; uint pad1; } P;
+layout(std430, binding = 0) readonly buffer Meta { uint cols; uint slot; uint dyn; uint pad1; } P;   // dyn != 0: slot = pos[0] (binding 4), the device-side position (iteration 16)
 layout(std430, binding = 1) readonly buffer W { uint weights[]; };     // IQ4_XS rows, 136 B per 256 values
 layout(std430, binding = 2) readonly buffer I { uint ids[]; };
 layout(std430, binding = 3) buffer O { float o[]; };
+layout(std430, binding = 4) readonly buffer Pos { uint pos[]; };
 uint weight_byte(uint offset) { return (weights[offset >> 2u] >> ((offset & 3u) * 8u)) & 255u; }
 float weight_half(uint offset) { vec2 pr = unpackHalf2x16(weights[offset >> 2u]); return ((offset & 2u) != 0u) ? pr.y : pr.x; }
 int kvalue(uint i) {
@@ -20,7 +21,7 @@ void main() {
   uint t = gl_LocalInvocationID.x;
   uint blocks = P.cols / 256u;
   if (t >= blocks * 8u) return;
-  uint tok = ids[P.slot];
+  uint tok = ids[(P.dyn != 0u) ? pos[0] : P.slot];
   uint blk = t / 8u, ib = t & 7u;
   uint base = (tok * blocks + blk) * 136u;
   float d = weight_half(base);
