@@ -10,7 +10,7 @@
 // measured at 3e-2 drift over 12 layers; this form halves the f16 roundings). The Xavier kdot ceiling is instruction issue, ~25 per value
 // (iteration 11), so this trades precision for issue slots: the f64-oracle
 // error is measured and budgeted in the README (iteration 12). Q4_K / Q5_K /
-// IQ4_XS take the half path; Q6_K keeps the f32 path of s4. Below: "s4": the
+// IQ4_XS take the half path; Q6_K does under -DQ6_HALF (kdot_h2q6_r1.spv, iteration 21). Below: "s4": the
 // s3 dequant (vec4 activation, subgroupAdd reduction) with ALL of the row's
 // block headers staged into shared memory up front behind ONE barrier, and the
 // block loop taking two blocks per iteration -- so no barrier sits between
@@ -133,6 +133,23 @@ void codes_to_halfs(uint codes, out f16vec2 lo, out f16vec2 hi) {
   lo = unpackFloat2x16(w0) - f16vec2(1024.0hf);
   hi = unpackFloat2x16(w1) - f16vec2(1024.0hf);
 }
+// Q6_K: the four 6-bit codes of index..index+3 as one byte-per-code word (before the -32)
+uint q6_codes(uint base, uint index) {
+  uint group = index / 128u; uint within = index & 127u; uint lane = within & 31u;
+  uint quarter = within / 32u;
+  uint qh = weight_u32_at(base + 128u + group * 32u + lane);
+  uint ql = weight_u32_at(base + group * 64u + (((quarter & 1u) == 1u) ? 32u : 0u) + lane);
+  uint nib = ((quarter >= 2u) ? (ql >> 4u) : ql) & 0x0F0F0F0Fu;
+  uint h = ((qh >> (quarter * 2u)) & 0x03030303u) << 4u;
+  return nib | h;
+}
+// codes 0..63 -> halves of (code - 32): 0x6400 | c is the half 1024 + c
+void codes6_to_halfs(uint codes, out f16vec2 lo, out f16vec2 hi) {
+  uint w0 = 0x64006400u | (codes & 0x3Fu) | ((codes << 8u) & 0x003F0000u);
+  uint w1 = 0x64006400u | ((codes >> 16u) & 0x3Fu) | ((codes >> 8u) & 0x003F0000u);
+  lo = unpackFloat2x16(w0) - f16vec2(1056.0hf);
+  hi = unpackFloat2x16(w1) - f16vec2(1056.0hf);
+}
 // Q4_K: the four nibbles of index..index+3 as one byte-per-code word
 uint q4_codes(uint base, uint index) {
   uint group = index / 64u; uint within = index & 63u;
@@ -172,8 +189,18 @@ float term(uint b, uint wb, uint tt, uint index, vec4 y, float ysum, f16vec2 ylo
   } else {
     uint j = index / 16u;
     float scale = float(bitfieldExtract(int(hdr[b][j >> 2u]), int((j & 3u) * 8u), 8));
+#ifdef Q6_HALF
+    // Q6_K on the half path (iteration 21, -DQ6_HALF -> kdot_h2q6_r1.spv, the lm_head row):
+    // codes as bytes, exponent trick, products summed in f32. Built SEPARATELY because
+    // having this arm in the same binary as the Q5_K / IQ4_XS arms cost them ~5 ms per
+    // 40-layer token on nvgpu (register pressure across the uniform branch).
+    f16vec2 qlo, qhi; codes6_to_halfs(q6_codes(wb, index), qlo, qhi);
+    f16vec2 p0 = qlo * ylo, p1 = qhi * yhi;
+    return unpackHalf2x16(hdr[b][4]).x * scale * (float(p0.x) + float(p0.y) + float(p1.x) + float(p1.y));
+#else
     ivec4 q = q6_word_values(wb, index);
     return unpackHalf2x16(hdr[b][4]).x * scale * dot(vec4(q), y);
+#endif
   }
 }
 

@@ -56,7 +56,7 @@
    ;; 40 layers KL(oracle||h2) = 8.5e-4 nats and KL(llama.cpp||h2) = 0.0142, the same
    ;; as the exact kernel's 0.0167 -- llama.cpp itself is ~0.015 from the f64 oracle.
    ;; 12L x 3T 48.5 -> 39.3 ms/token. "nvgpu-exact" keeps the f32 path (s4).
-   "nvgpu"       {:wide "kdot_h2_r1.spv" :narrow "kdot_h2_r1.spv" :lm "kdot_s4_r1.spv"}
+   "nvgpu"       {:wide "kdot_h2_r1.spv" :narrow "kdot_h2_r1.spv" :lm "kdot_h2q6_r1.spv"}   ;; lm_head on the Q6_K half path (separate binary) since iteration 21
    "nvgpu-exact" {:wide "kdot_s4_r1.spv" :narrow "kdot_s4_r1.spv" :lm "kdot_s4_r1.spv"}})
 (def layouts (or (layout-table backend) (do (println "REFUSE unknown backend" backend) (js/process.exit 2))))
 ;; --- GGUF directory (header only) ---
@@ -406,6 +406,6 @@
               (when fn-mode? (str fn-rec-src fn-att-src fn-layers-src fn-token-src))
               "(defn main [] :string\n"
               "    (do\n" (str/join "\n" (map #(str "      (gpu " % ")") const-steps)) "\n"
-              (if fn-mode? (str "      (token-step 0 " ntok " \"\")") (emit-tokens token-steps @ans-binds @token-answers)) "))\n"))
+              (if fn-mode? (str "      (string-concat (token-step 0 " ntok " \"\") (string-concat \"|\" (gpu \"READ " logits " 0 " (* 248320 4) "\")))") (emit-tokens token-steps @ans-binds @token-answers)) "))\n"))
 (fs/writeFileSync out src)
 (println (str "wrote " out ": " (if fn-mode? (str (count const-steps) " constant requests + a token-step function") (str (count @lines) " requests")) ", layers " layers " tokens " ntok " buffers " (dec @next-buffer) " pipelines " (dec @next-pipeline) " backend " backend " layouts " (pr-str layouts) (when stream? " STREAM (per-layer MAP/FREE; last token answers its full logits)")))

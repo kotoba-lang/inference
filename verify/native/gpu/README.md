@@ -474,6 +474,24 @@ extrapolation said (1.8 ms/layer × 40 + 18 ms lm_head). The token budget is
 72 ms of layers (kdot at the nvgpu instruction-issue ceiling) + 18 ms of
 Q6_K lm_head on the f32 path; those two are the A items that follow.
 
+**Tick 16 (iteration 21, A-2): the Q6_K lm_head on the half path — and a
+regression caught by A/B.** `kdot_h2_r1.comp -DQ6_HALF` → `kdot_h2q6_r1.spv`:
+the 6-bit codes as bytes (ql nibble | qh 2 bits), exponent trick with 1056,
+packed multiplies, f32 sums. Bench (Xavier, lm_head Q6_K): s4 23.7 → **26.6
+GB/s** (17.7 → 15.9 ms per dispatch; Q6_K's 210-byte blocks keep it
+unaligned-load bound), max rel err 3.4e-3 on random x. The first attempt put
+the arm into the same binary as the Q5_K / IQ4_XS arms, and the 40-layer
+token went 88.9 → **94.7 ms** although the lm_head itself got faster: the extra
+arm raised the register pressure of the whole uniform-branch kernel and cost
+the other formats ~5 ms per token. Caught only because the previous guest was
+re-run in the same session (89.5 → 94.7 with the *same* guest binary, since it
+names the `.spv` by path). So the Q6 arm is a separate binary
+(`kdot_h2q6_r1.spv`, the `:lm` row), the wide/narrow binary is byte-identical
+to tick 15, and the resident 40-layer token is **88.9 → 86.9 ms (11.5 tok/s)**,
+12/12 oracle, KL(oracle‖gpu) 1e-7 at the last step. `fn`-mode guests now
+append the final logits to the last token's answer, so `parity_check.py` works
+on them too (needs `KEXE_STRING_POOL` ≥ 8 MiB).
+
 What this is not yet: the 40-layer model on a device with room (the serving
 processes own the memory), prompt-side prefill (tokens are fed one at a time),
 sampling other than argmax, distribution parity with llama.cpp over a real
