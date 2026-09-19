@@ -36,7 +36,10 @@ float wg_sum(uint t, float v) {
 // conv1d step + silu for channel c, reading ring slot p; returns the activation, writes slot 1-p if `own`
 float conv_step(uint c, uint p, bool own, uint qoff) {
   uint n = P.n, rb = p * 3u * n, wb = (1u - p) * 3u * n;
-  float x0 = ring[rb + c], x1 = ring[rb + n + c], x2 = ring[rb + 2u * n + c], x3 = qkv[qoff + c];
+  // position 0 has no history (iteration 43): a resident guest rewinds the position to 0 for a new
+  // request and never zeroes the ring or the state, so both read as zero when pos[0] == 0.
+  bool fresh = pos[0] == 0u;
+  float x0 = fresh ? 0.0 : ring[rb + c], x1 = fresh ? 0.0 : ring[rb + n + c], x2 = fresh ? 0.0 : ring[rb + 2u * n + c], x3 = qkv[qoff + c];
   float y = convw[c * 4u] * x0 + convw[c * 4u + 1u] * x1 + convw[c * 4u + 2u] * x2 + convw[c * 4u + 3u] * x3;
   if (own) { ring[wb + c] = x1; ring[wb + n + c] = x2; ring[wb + 2u * n + c] = x3; }
   return silu(y);
@@ -64,7 +67,8 @@ void main() {
   // delta rule on the head's state (K_ x V_): this thread owns column j, keys [i0, i1)
   uint sbase = h * K_ * V_, quarter = K_ / 4u, i0 = part * quarter, i1 = i0 + quarter;
   float kv_mem = 0.0;
-  for (uint i = i0; i < i1; i++) { float s_ = state[sbase + i * V_ + j] * decay; state[sbase + i * V_ + j] = s_; kv_mem += s_ * sk[i]; }
+  bool fresh = pos[0] == 0u;   // no history at position 0 (iteration 43)
+  for (uint i = i0; i < i1; i++) { float s_ = (fresh ? 0.0 : state[sbase + i * V_ + j]) * decay; state[sbase + i * V_ + j] = s_; kv_mem += s_ * sk[i]; }
   part4[part][j] = kv_mem; barrier();
   float delta = (vc - (part4[0][j] + part4[1][j] + part4[2][j] + part4[3][j])) * b;
   barrier();
