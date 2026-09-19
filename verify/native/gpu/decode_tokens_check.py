@@ -5,7 +5,7 @@ if not m: print("TRAP:", out[:400].replace("\n"," ")); sys.exit(1)
 ref=np.load("decode_tokens_ref.npz"); toks=ref["tokens"]; xs=ref["xs"]; am=ref["argmaxes"]
 ok=True
 for i,part in enumerate(bytes.fromhex(m.group(1)).decode().split("#")):
-    ns,hx,hid=part.split("|")
+    ns,hx,hid=part.split("|")[:3]   # fn-mode guests append the final logits as a 4th field of the last part
     got=np.frombuffer(bytes.fromhex(hx),dtype=np.float32).astype(np.float64); tok=int(np.frombuffer(bytes.fromhex(hid),dtype=np.uint32)[0])
     r=xs[i]; rel=np.max(np.abs(got-r))/np.sqrt(np.mean(r*r))
     ok = ok and tok==int(am[i])

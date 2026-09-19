@@ -544,6 +544,24 @@ lm_head). Remaining B levers, in order: fusing the ~20 element-wise dispatches
 per layer into the kdots (the other half of the barrier cost), expert kdot
 bandwidth (90 → 200+ GB/s), qkv at 128 GB/s.
 
+**Tick 19 (iteration 24, B-2): the fused delta-net step — correct, and
+neutral.** `deltanet_fused.comp` does, per head, in one dispatch of 128
+threads: conv1d + silu on the head's q / k / v channels (the conv ring is
+double-buffered by the position's parity, because q / k channels are shared by
+two heads), the l2 norms, the gate and beta from alpha / betaL / dt / a, the
+delta rule on S, and the gated rmsnorm × silu(z) — seven dispatches and four
+barriers of the recurrent path become one (27 → 21 dispatches per recurrent
+layer; 13 bindings, so amu #1032 raises the cap to 16). Oracle-exact on both
+boxes. Timing, A/B twice each: B70 4 L × 3 T **3.51 → 3.49 ms/token**; Xavier
+12 L × 3 T **37.3 → 37.3 ms**. So the "barriers are 40% of a B70 layer" reading
+of tick 18 was the floor probe's artefact: between *real* dispatches the drain
+overlaps with work and a removed barrier is worth ~1 µs, not 6.6. Fusion is
+the default (`<mode>-nofuse` keeps the seven-dispatch path for A/B) because it
+is simpler and never slower, but it is not a B lever; the B70 layer's ~0.46 ms
+is kernel time plus launch gaps of small dispatches, and the next B levers are
+the kdots themselves (expert kdots at ~90 GB/s and qkv at ~130 on a ≥ 260 GB/s
+device).
+
 What this is not yet: the 40-layer model on a device with room (the serving
 processes own the memory), prompt-side prefill (tokens are fed one at a time),
 sampling other than argmax, distribution parity with llama.cpp over a real
