@@ -14,13 +14,19 @@
 ;; Root ADR-2609182400 C.
 (require '["fs" :as fs] '[clojure.string :as str])
 (def args (vec *command-line-args*))
-(when-not (<= 6 (count args) 8) (println "usage: <file.gguf> <layers> <tokens> <prompt-token-id[,id...]> <dir-on-box> <out.kotoba> [anv|radv|nvgpu|nvgpu-exact] [stream]") (js/process.exit 2))
+(when-not (<= 6 (count args) 8) (println "usage: <file.gguf> <layers> <tokens> <prompt-token-id[,id...]> <dir-on-box> <out.kotoba> [anv|radv|nvgpu|nvgpu-exact] [stream|flat]") (js/process.exit 2))
 ;; stream: the layer weights are MAPped per layer per token and FREEd after the
 ;; layer's command buffer, so the whole 40-layer model runs on a device that
 ;; cannot hold it (K16 GTT 13 GiB vs 17.4 GB of weights) -- for parity, not
 ;; speed (every token re-uploads the weights). The loader hands out the lowest
 ;; free slot, so the generator keeps the same free list (iteration 14).
 (def stream? (= "stream" (get args 7)))
+;; flat: the 2026-09-19 straight-line program (every request a literal, one copy
+;; per token). Default since iteration 16 is the FUNCTION program: handles are
+;; computed on the device side of the string (string-from-i64), layers and
+;; tokens are recursions, the position and the token buffer live on the device.
+(def flat? (= "flat" (get args 7)))
+(def fn-mode? (not (or stream? flat?)))
 (def gguf (args 0)) (def layers (js/parseInt (args 1))) (def ntok (js/parseInt (args 2))) (def box (args 4)) (def out (args 5))
 ;; <prompt-token-id> may be a comma-separated list: the first P steps are FORCED to
 ;; these tokens (prefill at decode speed, one command buffer per prompt token) and
@@ -130,13 +136,13 @@
 (defn fresh [prefix] (swap! counter inc) (str prefix @counter))
 ;; --- the plan ---
 (def zeros16 (alloc! 16))
-(def ops (into {} (for [op ["rmsnorm" "l2norm" "gated_rmsnorm" "silu_mul" "conv1d_step" "softmax_topk" "gate_decay2" "weighted_sum" "add" "f32_matvec" "add_rmsnorm" "rope_neox" "attn_decode" "argmax_partial" "argmax_final" "copy_at"]] [op (pipeline! (str "nex_" op ".spv") 7)])))
+(def ops (into {} (for [op ["rmsnorm" "l2norm" "gated_rmsnorm" "silu_mul" "conv1d_step" "softmax_topk" "gate_decay2" "weighted_sum" "add" "f32_matvec" "add_rmsnorm" "rope_neox" "attn_decode" "argmax_partial" "argmax_final" "copy_at" "pos_incr"]] [op (pipeline! (str "nex_" op ".spv") 7)])))
 (def kdot-wide (pipeline! (:wide layouts) 5))
 (def kdot-narrow (pipeline! (:narrow layouts) 5))
 (def kdot-lm (pipeline! (:lm layouts) 5))
 (defn wg-of [spv rows] (if (= spv "kdot_f32_r8.spv") (quot (+ rows 7) 8) rows))
 (def deltanet (pipeline! "deltanet_step.spv" 8))
-(def embed (pipeline! "embed_iq4xs.spv" 4))
+(def embed (pipeline! "embed_iq4xs.spv" 5))
 (def w-embd (map-tensor! "token_embd.weight"))
 (def prompt-ids (alloc! (max 16 (* 4 (count prompt)))))
 (def x (alloc! 8192))
@@ -179,15 +185,25 @@
 (def posbuf (alloc! 16))
 (def m-ropeq-dyn (ops-meta-dyn! 256 16 nrot 0 0 rope-base)) (def m-ropek-dyn (ops-meta-dyn! 256 2 nrot 0 0 rope-base))
 (def m-attn-dyn (ops-meta-dyn! 256 16 0 2 -1.0 (/ 1.0 16.0))) (def m-copy-dyn (ops-meta-dyn! 512 1 0 512 0 0))
+;; fn mode: the token buffer holds the prompt, then argmax_final appends each next token; embed reads slot pos
+(def tokbuf (let [b (alloc! (max 16 (* 4 (+ ntok 1))))] (write! b (apply str (map le32 prompt))) b))
+(def m-embed-dyn (let [m (alloc! 16)] (write! m (str (le32 2048) (le32 0) (le32 1) (le32 0))) m))
+(def m-am2-dyn (let [m (alloc! 32)] (write! m (str (le32 248320) (le32 1) (le32 61) (le32 (count prompt)) (lef32 0) (lef32 0) (lef32 0) (lef32 1))) m))
+(def m-incr (ops-meta! 1 1 0 0 0 0))
+(def rec-keys [:norm :post :router :shgate-inp :gate-exps :up-exps :down-exps :gate-sh :up-sh :down-sh :qkv :gate :alpha :beta :dt :a :conv :ssm-norm :out])
+(def att-keys [:norm :post :router :shgate-inp :gate-exps :up-exps :down-exps :gate-sh :up-sh :down-sh :q :k :v :qn :kn :o])
+(def tensor-name {:norm "attn_norm.weight" :post "post_attention_norm.weight" :router "ffn_gate_inp.weight" :shgate-inp "ffn_gate_inp_shexp.weight"
+                  :gate-exps "ffn_gate_exps.weight" :up-exps "ffn_up_exps.weight" :down-exps "ffn_down_exps.weight" :gate-sh "ffn_gate_shexp.weight" :up-sh "ffn_up_shexp.weight" :down-sh "ffn_down_shexp.weight"
+                  :qkv "attn_qkv.weight" :gate "attn_gate.weight" :alpha "ssm_alpha.weight" :beta "ssm_beta.weight" :dt "ssm_dt.bias" :a "ssm_a" :conv "ssm_conv1d.weight" :ssm-norm "ssm_norm.weight" :out "ssm_out.weight"
+                  :q "attn_q.weight" :k "attn_k.weight" :v "attn_v.weight" :qn "attn_q_norm.weight" :kn "attn_k_norm.weight" :o "attn_output.weight"})
 (defn layer-weights! [il]
-  (let [p (str "blk." il ".") m (fn [nm] (map-tensor! (str p nm)))]
-    (merge {:norm (m "attn_norm.weight") :post (m "post_attention_norm.weight") :router (m "ffn_gate_inp.weight") :shgate-inp (m "ffn_gate_inp_shexp.weight")
-            :gate-exps (m "ffn_gate_exps.weight") :up-exps (m "ffn_up_exps.weight") :down-exps (m "ffn_down_exps.weight")
-            :gate-sh (m "ffn_gate_shexp.weight") :up-sh (m "ffn_up_shexp.weight") :down-sh (m "ffn_down_shexp.weight")}
-           (if (= 1 (recurrent il))
-             {:qkv (m "attn_qkv.weight") :gate (m "attn_gate.weight") :alpha (m "ssm_alpha.weight") :beta (m "ssm_beta.weight") :dt (m "ssm_dt.bias") :a (m "ssm_a")
-              :conv (m "ssm_conv1d.weight") :ssm-norm (m "ssm_norm.weight") :out (m "ssm_out.weight")}
-             {:q (m "attn_q.weight") :k (m "attn_k.weight") :v (m "attn_v.weight") :qn (m "attn_q_norm.weight") :kn (m "attn_k_norm.weight") :o (m "attn_output.weight")}))))
+  ;; MAP in rec-keys / att-keys order -- a map LITERAL with more than 8 entries is
+  ;; evaluated in hash order under nbb (the MAP lines came out scrambled, iteration
+  ;; 16), and fn mode addresses handle(il, k) = W0 + 19 il + index(k).
+  (let [p (str "blk." il ".") rec? (= 1 (recurrent il)) keys (if rec? rec-keys att-keys)
+        w (into {} (mapv (fn [k] [k (map-tensor! (str p (tensor-name k)))]) keys))]
+    (when (and fn-mode? (not rec?)) (dotimes [_ 3] (alloc! 16)))   ;; pad to 19 handles per layer
+    w))
 (def layer-w (if stream? nil (vec (for [il (range layers)] (layer-weights! il)))))
 ;; --- T tokens, one command buffer each; the answer is per-token "ns|x hex|argmax hex" joined by "#" ---
 (def token-answers (atom []))
@@ -250,10 +266,10 @@
       (swap! ans-binds conj (cond-> [[ns (q "SUBMIT")] [xr (q (str "READ " x-final " 0 8192"))] [idr (q (str "READ " amax-ids " 244 4"))]]
                               (and stream? last?) (conj [lg (q (str "READ " logits " 0 " (* 248320 4)))])))
       (swap! token-answers conj (if (and stream? last?) (cat ns (q "|") xr (q "|") idr (q "|") lg) (cat ns (q "|") xr (q "|") idr))))))
-(when-not stream?
+(when flat?
   (doseq [pos (range ntok)]
     (step! (q "BEGIN"))
-    (dispatch! embed 1 1 1 (if (< pos (count prompt)) (m-embedP pos) m-embed1) w-embd (if (< pos (count prompt)) prompt-ids amax-ids) x)
+    (dispatch! embed 1 1 1 (if (< pos (count prompt)) (m-embedP pos) m-embed1) w-embd (if (< pos (count prompt)) prompt-ids amax-ids) x zeros16)
     (let [rec-index (atom 0) att-index (atom 0)]
       (doseq [il (range layers)]
         (let [w (layer-w il) xin (if (zero? il) x (if (odd? il) xa xb)) xout (if (odd? il) xb xa)
@@ -274,12 +290,6 @@
 ;; dyn_pos), so a layer's dispatches are identical every token; the two layer
 ;; bodies take only (xin xout ring S) / (xin xout kc vc), and each layer
 ;; function takes the MAP prefix.
-(def rec-keys [:norm :post :router :shgate-inp :gate-exps :up-exps :down-exps :gate-sh :up-sh :down-sh :qkv :gate :alpha :beta :dt :a :conv :ssm-norm :out])
-(def att-keys [:norm :post :router :shgate-inp :gate-exps :up-exps :down-exps :gate-sh :up-sh :down-sh :q :k :v :qn :kn :o])
-(def tensor-name {:norm "attn_norm.weight" :post "post_attention_norm.weight" :router "ffn_gate_inp.weight" :shgate-inp "ffn_gate_inp_shexp.weight"
-                  :gate-exps "ffn_gate_exps.weight" :up-exps "ffn_up_exps.weight" :down-exps "ffn_down_exps.weight" :gate-sh "ffn_gate_shexp.weight" :up-sh "ffn_up_shexp.weight" :down-sh "ffn_down_shexp.weight"
-                  :qkv "attn_qkv.weight" :gate "attn_gate.weight" :alpha "ssm_alpha.weight" :beta "ssm_beta.weight" :dt "ssm_dt.bias" :a "ssm_a" :conv "ssm_conv1d.weight" :ssm-norm "ssm_norm.weight" :out "ssm_out.weight"
-                  :q "attn_q.weight" :k "attn_k.weight" :v "attn_v.weight" :qn "attn_q_norm.weight" :kn "attn_k_norm.weight" :o "attn_output.weight"})
 (def const-lines-snapshot (vec (take-while #(not= % (q "BEGIN")) @lines)))
 ;; the slot sets: simulate one recurrent and one attention layer's MAP/FREE on the free list as it stands after the constant phase
 (defn simulate-slots! [keys] (let [hs (mapv (fn [_] (str (alloc-slot!))) keys)] (doseq [h hs] (swap! free-slots conj (js/parseInt h))) (zipmap keys hs)))
@@ -308,14 +318,58 @@
   (doseq [pos (range ntok)]
     (write! posbuf (le32 pos))
     (step! (q "BEGIN"))
-    (dispatch! embed 1 1 1 (if (< pos (count prompt)) (m-embedP pos) m-embed1) w-embd (if (< pos (count prompt)) prompt-ids amax-ids) x)
+    (dispatch! embed 1 1 1 (if (< pos (count prompt)) (m-embedP pos) m-embed1) w-embd (if (< pos (count prompt)) prompt-ids amax-ids) x zeros16)
     (step! (q "SUBMIT"))
     (doseq [il (range layers)] (step! (str "(layer-" il " \"MAP " box "/nex.gguf\")")))
     (step! (q "BEGIN"))
     (emit-lm-head! pos)))
+
+;; --- fn mode (default): computed handles, layer recursion, token recursion ---
+(def W0 (when fn-mode? (js/parseInt (:norm (layer-w 0)))))
+(def R0 (when fn-mode? (if (seq rings) (js/parseInt (first rings)) 0))) (def S0 (when fn-mode? (if (seq states) (js/parseInt (first states)) 0)))
+(def K0 (when fn-mode? (if (seq kcaches) (js/parseInt (first kcaches)) 0))) (def V0 (when fn-mode? (if (seq vcaches) (js/parseInt (first vcaches)) 0)))
+(defn hexpr [e] (str "$(string-from-i64 " e ")"))
+(defn fn-body-src [fname keys rec?]
+  (reset! lines [])
+  (let [w (into {} (map-indexed (fn [i k] [k (hexpr (str "(+ w0 " i ")"))]) keys))]
+    (emit-layer! (if rec? 0 3) w (hexpr "xin") (hexpr "xout") (when rec? (hexpr "ring")) (when rec? (hexpr "S")) (when-not rec? (hexpr "kc")) (when-not rec? (hexpr "vc")) m-ropeq-dyn m-ropek-dyn m-attn-dyn m-copy-dyn posbuf))
+  (let [params (concat ["w0" "xin" "xout"] (if rec? ["ring" "S"] ["kc" "vc"])) body @lines]
+    (str "(defn " fname " [" (str/join " " (map #(str % " :i64") params)) "] :string\n"
+         "  (do\n" (str/join "\n" (map #(str "    (gpu " % ")") body)) "))\n")))
+(def fn-rec-src (when fn-mode? (fn-body-src "recurrent-layer" rec-keys true)))
+(def fn-att-src (when fn-mode? (fn-body-src "attention-layer" att-keys false)))
+(def fn-layers-src (when fn-mode? (str
+  ";; layer il: attention when (il + 1) mod 4 = 0; xin/xout alternate x, xa, xb; state index = il - il/4 (recurrent) or il/4 (attention)\n"
+  "(defn xin-of [il :i64] :i64 (if (= il 0) " x " (if (= 1 (bit-and il 1)) " xa " " xb ")))\n"
+  "(defn xout-of [il :i64] :i64 (if (= 1 (bit-and il 1)) " xb " " xa "))\n"
+  "(defn layers [il :i64 n :i64] :i64\n"
+  "  (if (< il n)\n"
+  "    (do (if (= 3 (bit-and il 3))\n"
+  "          (attention-layer (+ " W0 " (* il 19)) (xin-of il) (xout-of il) (+ " K0 " (quot il 4)) (+ " V0 " (quot il 4)))\n"
+  "          (recurrent-layer (+ " W0 " (* il 19)) (xin-of il) (xout-of il) (+ " R0 " (- il (quot il 4))) (+ " S0 " (- il (quot il 4)))))\n"
+  "        (layers (+ il 1) n))\n"
+  "    il))\n")))
+(def fn-token-src (when fn-mode?
+  (reset! lines [])
+  (let [x-final (if (odd? (dec layers)) xb xa)]
+    (step! (q "BEGIN"))
+    (dispatch! embed 1 1 1 m-embed-dyn w-embd tokbuf x posbuf)
+    (step! (str "(layers 0 " layers ")"))
+    (dispatch! (ops "rmsnorm") 1 1 1 m-norm x-final w-out-norm zeros16 hN zeros16 zeros16)
+    (dispatch! kdot-lm (wg-of (:lm layouts) 248320) 1 1 m-lm w-lm hN logits zeros16)
+    (dispatch! (ops "argmax_partial") 61 1 1 m-am1 logits zeros16 zeros16 zeros16 amax-s amax-ids)
+    (dispatch! (ops "argmax_final") 1 1 1 m-am2-dyn amax-s tokbuf posbuf amax-s amax-s amax-ids)
+    (dispatch! (ops "pos_incr") 1 1 1 m-incr zeros16 zeros16 zeros16 zeros16 zeros16 posbuf)
+    (str ";; one token: embed(tokbuf[pos]) -> layers -> lm_head -> argmax (appends tokbuf[pos+1]) -> pos+1; answers accumulate as ns|x|id joined by #\n"
+         "(defn token-step [pos :i64 n :i64 acc :string] :string\n"
+         "  (if (< pos n)\n    (do\n"
+         (str/join "\n" (map #(if (str/starts-with? % "(layers") (str "      " %) (str "      (gpu " % ")")) @lines)) "\n"
+         "      (let [ns (gpu \"SUBMIT\")\n            xr (gpu \"READ " x-final " 0 8192\")\n            idr (gpu \"READ " amax-ids " 244 4\")]\n"
+         "        (token-step (+ pos 1) n (string-concat acc (string-concat (if (= pos 0) \"\" \"#\") (string-concat ns (string-concat \"|\" (string-concat xr (string-concat \"|\" idr)))))))))\n"
+         "    acc))\n"))))
 ;; --- emit: the constant phase is one let; each token's SUBMIT/READs are nested lets ---
-(def const-steps (if stream? const-lines-snapshot (vec (take-while #(not= % (q "BEGIN")) @lines))))
-(def token-steps (if stream? (vec @lines) (vec (drop (count const-steps) @lines))))
+(def const-steps (if flat? (vec (take-while #(not= % (q "BEGIN")) @lines)) const-lines-snapshot))
+(def token-steps (cond flat? (vec (drop (count const-steps) @lines)) stream? (vec @lines) :else []))
 ;; token-steps holds every BEGIN..last dispatch in order; SUBMIT/READ are in ans-binds, one triple per token.
 (defn emit-tokens [steps binds answers]
   ;; every token records the same number of lines (BEGIN + its dispatches), so
@@ -335,8 +389,9 @@
               "(ns gpu.decode-tokens (:export [main]))\n"
               "(defn gpu [r :string] :string\n  (typed-cap-call :gpu/compute :string :string r))\n"
               (when stream? (str rec-body-src att-body-src layer-fns-src))
+              (when fn-mode? (str fn-rec-src fn-att-src fn-layers-src fn-token-src))
               "(defn main [] :string\n"
               "    (do\n" (str/join "\n" (map #(str "      (gpu " % ")") const-steps)) "\n"
-              (emit-tokens token-steps @ans-binds @token-answers) "))\n"))
+              (if fn-mode? (str "      (token-step 0 " ntok " \"\")") (emit-tokens token-steps @ans-binds @token-answers)) "))\n"))
 (fs/writeFileSync out src)
-(println (str "wrote " out ": " (count @lines) " requests, layers " layers " tokens " ntok " buffers " (dec @next-buffer) " pipelines " (dec @next-pipeline) " backend " backend " layouts " (pr-str layouts) (when stream? " STREAM (per-layer MAP/FREE; last token answers its full logits)")))
+(println (str "wrote " out ": " (if fn-mode? (str (count const-steps) " constant requests + a token-step function") (str (count @lines) " requests")) ", layers " layers " tokens " ntok " buffers " (dec @next-buffer) " pipelines " (dec @next-pipeline) " backend " backend " layouts " (pr-str layouts) (when stream? " STREAM (per-layer MAP/FREE; last token answers its full logits)")))

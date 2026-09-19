@@ -379,6 +379,26 @@ large on some coordinates (1.2e-1 at step 4) while the distribution moves
 8.5e-4 nats — the number that matters for serving is the second; both are
 recorded.
 
+**Tick 11 (iteration 16): the guest is a program, not a transcript.** The
+default (`fn` mode; `flat` keeps the 2026-09-19 straight-line form for A/B)
+computes its handles: `string-from-i64` exists in the profile, so
+`recurrent-layer [w0 xin xout ring S]` / `attention-layer [w0 xin xout kc vc]`
+build every request from `(+ w0 k)`; weights are MAPped at a stride of 19
+handles per layer (attention layers pad with three 16-byte ALLOCs);
+`layers [il n]` recurses over the layers (attention when `(bit-and il 3) = 3`,
+state index `il - il/4` or `il/4`); `token-step [pos n acc]` recurses over the
+tokens and accumulates the answers. The position and the tokens live on the
+device: `embed_iq4xs` reads `tokbuf[pos[0]]` (binding 4, `dyn`), `argmax_final`
+appends the next token to `tokbuf[pos + 1]` once past the prompt (binding 2 is
+writable now), `pos_incr` bumps the counter. So the program no longer depends
+on T except for the token buffer's size, and a 12-layer × 4-token guest is
+30 KB of source instead of 200 KB. Trap found on the way: an nbb map literal
+with more than 8 entries evaluates its values in *hash* order, so the layer's
+MAPs came out scrambled — `layer-weights!` now MAPs in `rec-keys` / `att-keys`
+order explicitly. Verified: K16 12 L, `9707,198,220` + 1 greedy — all four
+steps match the oracle at 27.2–27.7 ms/token (flat: 27.0–27.8); Xavier 12 L × 3
+(h2 default) 39.4 ms/token, chain 163967 → 1320 → 11278.
+
 What this is not yet: the 40-layer model on a device with room (the serving
 processes own the memory), prompt-side prefill (tokens are fed one at a time),
 sampling other than argmax, distribution parity with llama.cpp over a real
