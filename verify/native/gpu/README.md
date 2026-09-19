@@ -865,3 +865,26 @@ What this is not yet: the 40-layer model on a device with room (the serving
 processes own the memory), prompt-side prefill (tokens are fed one at a time),
 sampling other than argmax, distribution parity with llama.cpp over a real
 prompt, and the per-backend kernel layouts (Xavier).
+## Tick 37 (2026-09-20, C-3-2): the HTTP shell — `serve_http.cljk`
+
+The serving surface is a kbb script (`node /opt/kbb-engine/cli.js serve_http.cljk ...` on the box; the
+kbb engine is `org-babashka-nbb` rsynced to `/opt/kbb-engine`, no kbb launcher there): `POST /v1/completions`
+→ `tokenizer_core.cljk` (encode, loaded once with `nbb.core/load-file`; the CLI `gguf_tokenizer.cljk` now
+loads the same core) → `kexe-loader-gpu` with `NEX_PROMPT=<ids>` + argv `<plen> <max_tokens>` (the runtime
+guest of tick 36, WRITEDEC, amu #1035 merged this tick and the loader promoted on all three boxes,
+previous kept as `kexe-loader-gpu.pre1035`) → parse `:result-utf8-hex`, split `#`-joined `ns|x|id` parts,
+take the argmax after the last prompt token and each generated one → decode → OpenAI-shaped JSON with
+`token_ids`, `usage`, `timing`. One process per request; greedy only.
+
+Two things node 18 (the boxes) would not run: destructuring `def` (kbb/sci wants `(def a ..)` per name)
+and the qwen2 pre-tokenizer's `(?i:'s|...)` inline modifier (V8 12.5+) — spelled out case by case in
+`tokenizer_core.cljk`; `tokenizer_check.cljk` still 12/12 against llama-server after the change.
+
+K16, `rt12.bin` (12 layers, runtime prompt): `curl -d '{"prompt":"The capital of France is","max_tokens":8}'`
+→ ids `128186,116769,166224,2752,2752,132819,176133,4032`, 27.0 ms/token on the 13 steps, HTTP wall
+3.8–5.2 s over 3 runs; the bare loader run is 3.95 s (3 runs: 3.92–3.97) of which the 13 token steps are
+0.35 s — **the other 3.6 s is process start + MAP of the 12 layers + pipeline creation, paid per request.**
+That is the cost the resident form (guest loops over requests, weights mapped once) removes, and it is the
+next item. The 12-layer text is not meant to read (a 12-layer prefix is not the model); the check is the id
+list against the f64 oracle (`decode_tokens_ref.py nex.gguf 760,6511,314,9338,369 12 13`) — the oracle's steps 4–11 are `128186,116769,166224,2752,2752,132819,176133,4032`: 8/8 exact through
+the whole HTTP → tokenizer → kexe → detokenize path (prompt steps 0–3 are forced, so 5 prompt + 8 generated = 13 steps).
