@@ -1,42 +1,82 @@
-;; The serving shell (iteration 42, C-3-2): an OpenAI-compatible POST /v1/completions in front of a
-;; runtime-prompt kexe. text -> tokenizer_core (encode) -> kexe-loader-gpu with NEX_PROMPT and the two
-;; i64 arguments (prompt length, max_tokens) -> the answer's per-step argmax ids -> decode -> JSON.
-;; One process per request (the guest MAPs the weights each time); the resident form is the next step.
+;; The serving shell (iteration 42 one process per request; iteration 43 RESIDENT): an OpenAI-compatible
+;; POST /v1/completions in front of one resident kexe (`… fn - resident` guest). The guest MAPs the weights
+;; once and then takes one message per token step on its standard input -- "<token id>,<reset flag>" --
+;; and answers "<ns>|<hex argmax id>" on its standard output; the shell feeds the prompt (flag 1 on the
+;; first token rewinds the position) and then feeds each argmax back, so a request costs its steps and
+;; nothing else. Requests are serialized (one step in flight). The guest's string pool and pair heap are
+;; bump allocators (measured K16 12L: 11.3 KiB and 3.5 K pairs per step), so the shell respawns the guest
+;; after `steps-per-life` steps (default 15000: the loader ceilings are a 1 GiB pool and 2^26 pairs, 2^26 / 3.5 K = 19 k steps), when it exits, or when the
+;; loader's 86400 s wall ceiling ends it (a day per guest life; a respawn is the MAP cost, 1.3 s for 12 layers on K16).
 ;; Greedy only (the guest's sampling row is a build-time choice for now).
 ;;
-;;   NEX_GGUF=<gguf or head dump> node /opt/kbb-engine/cli.js serve_http.cljk <kexe-loader> <serve.bin> <offset> <x86_64|aarch64> <port> [allow-csv]
+;;   NEX_GGUF=<gguf or head dump> node /opt/kbb-engine/cli.js serve_http.cljk <kexe-loader> <resident.bin> <offset> <x86_64|aarch64> <port> [allow-csv] [steps-per-life]
 ;;   curl -s localhost:8099/v1/completions -H 'Content-Type: application/json' -d '{"prompt":"The capital of France is","max_tokens":8}'
-(require '["http" :as http] '["child_process" :as cp] '["path" :as path] '[clojure.string :as str])
+(require '["http" :as http] '["child_process" :as cp] '["path" :as path] '[clojure.string :as str] '[nbb.core :refer [load-file]])
 (def args (vec *command-line-args*))
-(when (< (count args) 5) (println "usage: <kexe-loader> <serve.bin> <offset> <isa> <port> [allow-csv]") (js/process.exit 2))
+(when (< (count args) 5) (println "usage: <kexe-loader> <resident.bin> <offset> <isa> <port> [allow-csv] [steps-per-life]") (js/process.exit 2))
 (def loader (args 0)) (def bin (args 1)) (def offset (args 2)) (def isa (args 3)) (def port (args 4))
-(def allow (or (get args 5) "42,33"))
-(require '[nbb.core :refer [load-file]])
+(def allow (or (get args 5) "42,33,41,37,39"))
+(def steps-per-life (js/parseInt (or (get args 6) "15000")))
 (load-file (path/join (path/dirname *file*) "tokenizer_core.cljk"))
-(defn run-guest [ids max-tokens]
-  (let [env (js/Object.assign #js {} js/process.env #js {:NEX_PROMPT (str/join "," ids) :KEXE_RESULT_TYPE "string" :KEXE_STRUCTURED_REPORT "1"
-                                                          :KEXE_FUEL "100000000" :KEXE_WALL_SECONDS "600" :KEXE_STRING_POOL "16777216" :KEXE_PAIRS "4194304"})
-        t0 (js/Date.now)
-        r (cp/spawnSync loader (clj->js [bin offset "2" isa allow (str (count ids)) (str max-tokens)]) (clj->js {:encoding "utf8" :env env :maxBuffer (* 64 1024 1024)}))
-        out (str (.-stdout r) (.-stderr r))
-        m (re-find #":result-utf8-hex \"([0-9a-f]+)\"" out)]
-    (if-not m
-      {:error (subs out 0 (min 400 (count out)))}
-      (let [answer (.toString (js/Buffer.from (second m) "hex") "utf8")
-            parts (str/split (first (str/split answer #"\|[0-9a-f]{100,}$")) #"#")   ;; drop the trailing logits field
-            steps (mapv (fn [p] (let [[ns _x id] (str/split p #"\|")] {:ms (/ (js/parseInt ns) 1e6) :id (.readUInt32LE (js/Buffer.from id "hex") 0)})) parts)
-            generated (mapv :id (subvec steps (dec (count ids))))]   ;; the argmax after the last prompt token, then one per generated token
-        {:generated (vec (take max-tokens generated)) :ms-per-token (/ (reduce + (map :ms steps)) (max 1 (count steps))) :wall-ms (- (js/Date.now) t0)}))))
+;; --- the resident guest: one process, a line reader, a waiter for the next reply ---
+(def guest (atom nil))   ;; {:proc :buf :waiter :steps :born}
+(defn spawn-guest! []
+  (let [env (js/Object.assign #js {} js/process.env #js {:KEXE_RESULT_TYPE "string" :KEXE_STRUCTURED_REPORT "1" :KEXE_FUEL "1000000000000" :KEXE_WALL_SECONDS "86400"
+                                                          :KEXE_STRING_POOL "1073741824" :KEXE_PAIRS "67108864"})
+        p (cp/spawn loader (clj->js [bin offset "0" isa allow]) (clj->js {:env env :stdio ["pipe" "pipe" "pipe"]}))
+        g {:proc p :buf (atom "") :waiter (atom nil) :steps (atom 0) :born (js/Date.now)}]
+    (.on (.-stdout p) "data" (fn [chunk]
+                               (swap! (:buf g) str (.toString chunk "utf8"))
+                               (loop []
+                                 (let [b @(:buf g) i (.indexOf b "\n")]
+                                   (when (>= i 0)
+                                     (reset! (:buf g) (subs b (inc i)))
+                                     (when-let [w @(:waiter g)] (reset! (:waiter g) nil) (w (subs b 0 i)))
+                                     (recur))))))
+    (.on (.-stderr p) "data" (fn [chunk] (let [s (.toString chunk "utf8")] (when (seq (str/trim s)) (js/console.error (str "guest: " (str/trim s)))))))
+    (.on p "exit" (fn [code sig] (js/console.error (str "guest exited code=" code " sig=" sig " after " @(:steps g) " steps")) (when (= @guest g) (reset! guest nil))
+                    (when-let [w @(:waiter g)] (reset! (:waiter g) nil) (w nil))))
+    (reset! guest g)
+    g))
+(defn step!
+  "Feed one token; resolves to [ns argmax-id] or nil if the guest died."
+  [g tok reset?]
+  (js/Promise. (fn [resolve _]
+                 (reset! (:waiter g) (fn [line] (swap! (:steps g) inc)
+                                       (resolve (when line (let [[ns idhex] (str/split line #"\|")] [(js/parseInt ns) (.readUInt32LE (js/Buffer.from idhex "hex") 0)])))))
+                 (.write (.-stdin (:proc g)) (str tok "," (if reset? 1 0))))))
+(defn ensure-guest! []
+  (let [g @guest]
+    (if (and g (< @(:steps g) steps-per-life)) g
+        (do (when g (js/console.error (str "guest retired after " @(:steps g) " steps")) (.end (.-stdin (:proc g))))
+            (spawn-guest!)))))
+(defn run-request
+  "Prompt ids -> promise of {:generated [...] :ns [...]} (greedy: each argmax is the next input)."
+  [ids max-tokens]
+  (let [g (ensure-guest!) out (atom []) nss (atom [])]
+    (letfn [(feed [i tok]
+              (.then (step! g tok (= i 0))
+                     (fn [r]
+                       (if-not r {:error "guest died"}
+                         (let [[ns am] r] (swap! nss conj ns)
+                           (cond (< (inc i) (count ids)) (feed (inc i) (ids (inc i)))       ;; still the prompt: the reply is not kept
+                                 :else (do (swap! out conj am)
+                                           (if (< (count @out) max-tokens) (feed (inc i) am) {:generated @out :ns @nss}))))))))]
+      (feed 0 (ids 0)))))
+(def queue (atom (js/Promise.resolve nil)))   ;; requests serialized: one step in flight at a time
+(defn enqueue [thunk] (let [p (.then @queue (fn [_] (thunk)))] (reset! queue (.catch p (fn [_] nil))) p))
 (defn completion [body]
-  (let [prompt (or (.-prompt body) "") max-tokens (or (.-max_tokens body) 16)
-        ids (encode prompt)
-        {:keys [generated error ms-per-token wall-ms]} (run-guest ids max-tokens)]
-    (if error
-      #js {:error #js {:message (str "guest trapped: " error) :type "server_error"}}
-      #js {:id (str "cmpl-" (js/Date.now)) :object "text_completion" :created (quot (js/Date.now) 1000) :model "nex-n2.5-mini/kotoba-native"
-           :choices #js [#js {:index 0 :text (decode generated) :finish_reason "length" :token_ids (clj->js generated)}]
-           :usage #js {:prompt_tokens (count ids) :completion_tokens (count generated) :total_tokens (+ (count ids) (count generated))}
-           :timing #js {:ms_per_token ms-per-token :wall_ms wall-ms}})))
+  (let [prompt (or (.-prompt body) "") max-tokens (or (.-max_tokens body) 16) ids (encode prompt) t0 (js/Date.now)]
+    (if (empty? ids)
+      (js/Promise.resolve #js {:error #js {:message "empty prompt" :type "invalid_request_error"}})
+      (.then (enqueue #(run-request ids max-tokens))
+             (fn [{:keys [generated ns error]}]
+               (if error
+                 #js {:error #js {:message error :type "server_error"}}
+                 #js {:id (str "cmpl-" (js/Date.now)) :object "text_completion" :created (quot (js/Date.now) 1000) :model "nex-n2.5-mini/kotoba-native"
+                      :choices #js [#js {:index 0 :text (decode generated) :finish_reason "length" :token_ids (clj->js generated)}]
+                      :usage #js {:prompt_tokens (count ids) :completion_tokens (count generated) :total_tokens (+ (count ids) (count generated))}
+                      :timing #js {:ms_per_token (/ (reduce + ns) (max 1 (count ns)) 1e6) :steps (count ns) :wall_ms (- (js/Date.now) t0) :guest_steps @(:steps @guest)}}))))))
 (def server
   (http/createServer
    (fn [req res]
@@ -44,9 +84,11 @@
        (let [chunks (atom [])]
          (.on req "data" #(swap! chunks conj %))
          (.on req "end" (fn []
-                          (let [body (try (js/JSON.parse (.toString (js/Buffer.concat (clj->js @chunks)) "utf8")) (catch :default _ nil))
-                                out (if body (completion body) #js {:error #js {:message "bad json" :type "invalid_request_error"}})]
-                            (.writeHead res (if (.-error out) 400 200) #js {"Content-Type" "application/json"})
-                            (.end res (js/JSON.stringify out))))))
+                          (let [body (try (js/JSON.parse (.toString (js/Buffer.concat (clj->js @chunks)) "utf8")) (catch :default _ nil))]
+                            (.then (if body (completion body) (js/Promise.resolve #js {:error #js {:message "bad json" :type "invalid_request_error"}}))
+                                   (fn [out]
+                                     (.writeHead res (if (.-error out) (if (= "server_error" (.. out -error -type)) 500 400) 200) #js {"Content-Type" "application/json"})
+                                     (.end res (js/JSON.stringify out))))))))
        (do (.writeHead res 404 #js {"Content-Type" "application/json"}) (.end res (js/JSON.stringify #js {:error "only POST /v1/completions"})))))))
-(.listen server (js/parseInt port) (fn [] (println (str "SERVE\tnex kotoba-native\thttp://0.0.0.0:" port "/v1/completions\tguest " bin " @" offset))))
+(.listen server (js/parseInt port)
+         (fn [] (spawn-guest!) (println (str "SERVE\tnex kotoba-native resident\thttp://0.0.0.0:" port "/v1/completions\tguest " bin " @" offset "\tsteps-per-life " steps-per-life))))

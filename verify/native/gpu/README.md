@@ -888,3 +888,45 @@ That is the cost the resident form (guest loops over requests, weights mapped on
 next item. The 12-layer text is not meant to read (a 12-layer prefix is not the model); the check is the id
 list against the f64 oracle (`decode_tokens_ref.py nex.gguf 760,6511,314,9338,369 12 13`) — the oracle's steps 4–11 are `128186,116769,166224,2752,2752,132819,176133,4032`: 8/8 exact through
 the whole HTTP → tokenizer → kexe → detokenize path (prompt steps 0–3 are forced, so 5 prompt + 8 generated = 13 steps).
+
+## Tick 38 (2026-09-20, C-3-3): the resident guest — weights mapped once, one message per token step
+
+`… <backend> fn - resident` (generator) emits a guest whose `main` runs the constant phase (MAP, ALLOC,
+PIPELINE) once and then `serve-loop`: `:io/read "64"` (wire 41, the pipe's atomic write) → one message
+`"<token id>,<reset flag>"` → `WRITEDEC` into a 16-byte control buffer → the token step's command buffer,
+now opened by the `ctl` op (`nex_ops.comp`: flag ≠ 0 rewinds `pos` to 0, then `tokbuf[pos] = token`) →
+`SUBMIT` → `READ` the argmax → `:io/write` `"<ns>|<hex id>\n"` + an empty `:io/write-error` (the loader
+buffers standard output 64 KiB and flushes it before any diagnostic write — the first run hung in `read(0)`
+with the reply sitting in that buffer) → recur until EOF. Policy `policy_resident.edn` (wires 42 33 41 37 39).
+No state is zeroed on a reset: `deltanet_fused.comp` reads the ring and S as zero when `pos[0] == 0`
+(`fresh`), `attn_decode` reads `T = pos + 1` entries, `copy_at` rewrites the cache at `pos` — position 0
+has no history by definition, so the rewind is the whole reset. `argmax_final`'s prompt-length meta is
+4096 in this mode (the shell is the token buffer's only writer).
+
+`serve_http.cljk` is now this guest's shell: spawns it once (`KEXE_STRING_POOL` 1 GiB, `KEXE_PAIRS` 2^26,
+`KEXE_WALL_SECONDS` 86400 — the loader's ceilings; larger values are refused at start), serializes
+requests, feeds the prompt (flag 1 on the first token) then each argmax back, respawns after
+`steps-per-life` (15000) steps or on exit. The pool and pair heap are bump allocators: measured 11.3 KiB
+and 3.5 K pairs per 12-layer step (120 steps: 1,360,741 B / 420,849 pairs), so 2^26 pairs is ~19 k steps.
+
+Measured, 12 layers, prompt 760,6511,314,9338,369 + 8 greedy (`resident_drive.py`, 3 requests each box):
+
+| box | GPU ms/token (SUBMIT ns) | wall per 12-step request | first request (MAP + steps) | ids |
+|---|---|---|---|---|
+| K16 radv | 27.1 | 0.374 s | 1.69 s | oracle 8/8, ×10 identical |
+| B70 anv (int8) | 4.97 | 0.112 s | 2.00 s | oracle 8/8 |
+| Xavier nvgpu (h2) | 37.2 | 0.669 s | 2.99 s | oracle 8/8 |
+
+HTTP on K16 (`curl … max_tokens 8`, 5 runs): **wall 381–395 ms, was 3.8–5.2 s in tick 37**; the same 8 ids.
+`resident_mix.py` alternates the two oracle prompts (5-token/8 and 3-token/2) on one guest: **6/6** equal
+to the single-prompt oracle — the rewind leaks nothing across requests of different lengths.
+
+**The number that fell out**: wall per step minus GPU ns = host cost per step, and it is one round trip
+per `gpu` request (12 layers = 291 requests per step: 22 per recurrent layer, 27 per attention, 12 in the
+loop): K16 4.1 ms (14 µs/request), B70 4.4 ms (15 µs), Xavier 18.6 ms (64 µs). Every earlier "ms/token"
+in this README is the SUBMIT ns — GPU time — so the served rate is lower than those tables say: Xavier
+40 layers ≈ 942 requests ≈ 60 ms on top of 86.9 ms GPU (≈ 6.8 tok/s served, not 11.5); B70 40 layers
+≈ 14 ms on top of the ~10 ms GPU estimate. The broker pipe round trip and the Vulkan recording per
+dispatch are not separated yet. Since fn mode made every step's dispatches identical (device-side pos
+and token), the whole step is ONE reusable command buffer: record once, replay per step — a loader
+request (`BEGIN keep` / `REPLAY`) that turns 291–942 round trips into 1. That is the next item.
