@@ -21,7 +21,7 @@ for pos in range(len(got)):
     j = int(np.searchsorted(cp, u * mass, side="right")); j = min(j, len(idx) - 1); exact.append(int(idx[j]))
 exact = np.array(exact)
 agree = int((got == exact).sum()); inside = int(inset[got].sum())
-print(f"top-p set: {k} tokens, mass {mass:.4f}, tau {tau:.3e}; draws {len(got)}: exact-match {agree}/{len(got)}, inside the set {inside}/{len(got)}; command buffer {int(ns)/1e6:.1f} ms")
+print(f"top-p set: {k} tokens, mass {mass:.4f}, tau {tau:.3e}; draws {len(got)}: exact-match {agree}/{len(got)}, inside the set {inside}/{len(got)}; last draw command buffer {int(ns)/1e6:.2f} ms")
 # empirical vs exact over the set (total variation on the top tokens)
 counts = np.bincount(got, minlength=len(p))[idx] / len(got); q = p[idx] / mass
 print(f"empirical vs exact over the set: TV {0.5*np.abs(counts-q).sum():.3f} (256 draws; expected ~{0.5*np.sqrt(len(idx)/len(got))/2:.2f}), top-5 exact {[(int(idx[i]), round(float(q[i]),3)) for i in np.argsort(-q)[:5]]} empirical {[(int(idx[i]), round(float(counts[i]),3)) for i in np.argsort(-q)[:5]]}")
