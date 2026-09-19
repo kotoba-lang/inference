@@ -562,6 +562,30 @@ is kernel time plus launch gaps of small dispatches, and the next B levers are
 the kdots themselves (expert kdots at ~90 GB/s and qkv at ~130 on a ≥ 260 GB/s
 device).
 
+**Tick 20 (iteration 25, B-3): the B70 kernel zoo at a pinned clock.** The B70
+idles at **400 MHz** (`/sys/class/drm/card0/device/tile0/gt0/freq0`, max 2800)
+and a ten-dispatch bench does not ramp it: the same kernels measured 19–26 GB/s
+cold and 120–260 GB/s with `min_freq` pinned — the Xavier governor story again
+(tick 2). Composed decode steps ramp the clock themselves (4 L × 3 T 3.50 ms
+either way), so only the micro-benches were wrong. Pinned, GB/s:
+
+| tensor | r1 | s2 | s4 | h2 | x8 | **r8** | s3_r8 |
+|---|---|---|---|---|---|---|---|
+| attn_qkv Q5_K | 121 | 120 | 141 | 134 | 143 | **170** | 105 |
+| attn_gate IQ4_XS | 90 | 79 | 91 | 102 | 97 | 91 | 104 |
+| ffn_gate_exps[0] (1 expert) | 30 | 29 | 31 | 31 | 30 | 14 | 15 |
+| output Q6_K | 151 | 133 | 195 | 192 | 173 | **261** | 187 |
+
+The `anv` row's `:wide` class moves to r8 (qkv +40%); `:narrow` stays r1 (r8
+starves on 512-row tensors); `:lm` was r8 already. Composed 4 L × 3 T on B70:
+**3.50 → 3.45 ms/token** — the wide kdots are a small share of the layer. The
+B70 budget, restated with these numbers: a recurrent layer's ~36 MB of weights
+at 260 GB/s is 0.14 ms; the layer takes ~0.46. The rest is latency: the
+delta-net step is 32 workgroups × 128 threads each walking two serial 128-step
+loops (~0.065 ms, ~2 ms per 40-layer token), the expert kdots run at ~90 GB/s,
+and ~20 small dispatches per layer each cost their launch. Those three, in that
+order, are the remaining B levers.
+
 What this is not yet: the 40-layer model on a device with room (the serving
 processes own the memory), prompt-side prefill (tokens are fed one at a time),
 sampling other than argmax, distribution parity with llama.cpp over a real
