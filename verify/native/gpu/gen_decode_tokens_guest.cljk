@@ -54,7 +54,7 @@
 ;; on RADV r8 wins attn_gate and loses the experts, and s2 LOSES (one wave64 per
 ;; workgroup pays the barriers); on ANV r1 wins everything but the lm_head.
 (def layout-table
-  {"anv"   {:wide "kdot_f32_r1.spv" :narrow "kdot_f32_r1.spv" :lm "kdot_f32_r8.spv"}
+  {"anv"   {:wide "kdot_f32_r8.spv" :narrow "kdot_f32_r1.spv" :lm "kdot_f32_r8.spv"}   ;; wide -> r8 since iteration 25 (B70 at 2800 MHz: qkv 170 vs 121 GB/s)
    "radv"  {:wide "kdot_f32_r8.spv" :narrow "kdot_f32_r1.spv" :lm "kdot_f32_r1.spv"}
    ;; nvgpu default = packed-half dequant (kdot_h2_r1) since iteration 15: over all
    ;; 40 layers KL(oracle||h2) = 8.5e-4 nats and KL(llama.cpp||h2) = 0.0142, the same
