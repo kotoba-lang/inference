@@ -22,13 +22,14 @@
 ;; projections (attn_qkv, attn_gate, attn_q, ssm_out, attn_output), :narrow =
 ;; 32/512-row kdots (alpha/beta, k/v, experts, shared expert), :lm = the Q6_K
 ;; lm_head. Measured 2026-09-19 (pinned clocks): on nvgpu r1 ~ x8 ~ r8 and the
-;; shared-header kdot_s2_r1 wins every class (composed step 60.0 -> 54.0 ms);
+;; shared-header kdot_s2_r1 wins every class (composed step 60.0 -> 54.0 ms), and
+;; kdot_s4_r1 (all headers staged once, two blocks per iteration) 52.8 -> 48.6;
 ;; on RADV r8 wins attn_gate and loses the experts, and s2 LOSES (one wave64 per
 ;; workgroup pays the barriers); on ANV r1 wins everything but the lm_head.
 (def layout-table
   {"anv"   {:wide "kdot_f32_r1.spv" :narrow "kdot_f32_r1.spv" :lm "kdot_f32_r8.spv"}
    "radv"  {:wide "kdot_f32_r8.spv" :narrow "kdot_f32_r1.spv" :lm "kdot_f32_r1.spv"}
-   "nvgpu" {:wide "kdot_s2_r1.spv"  :narrow "kdot_s2_r1.spv"  :lm "kdot_s2_r1.spv"}})
+   "nvgpu" {:wide "kdot_s4_r1.spv"  :narrow "kdot_s4_r1.spv"  :lm "kdot_s4_r1.spv"}})
 (def layouts (or (layout-table backend) (do (println "REFUSE unknown backend" backend) (js/process.exit 2))))
 ;; --- GGUF directory (header only) ---
 (def fd (fs/openSync gguf "r"))
