@@ -37,7 +37,10 @@
 ;; that advances every occupied row at once (an empty row is fed 0 with flag 1). The batch step is greedy and one
 ;; token per row per step, so in batch mode prefill chunks and sampling are not used (the single-row steps share
 ;; row 0's state with the batch step and cannot be mixed in). 0 = the serial shell as before.
-(def batch-rows (js/parseInt (or (get args 8) "0")))
+;; iteration 54: "1,2,4" names an ADAPTIVE guest (`batch:1,2,4`) -- one kept step per B; each tick uses the smallest B that
+;; covers the highest occupied row, so a lone request in row 0 pays a one-row step.
+(def batch-sizes (vec (sort (map js/parseInt (str/split (or (get args 8) "0") #",")))))
+(def batch-rows (apply max batch-sizes))
 (load-file (path/join (path/dirname *file*) "tokenizer_core.cljk"))
 (def eog-ids (set (keep token->id ["<|im_end|>" "<|endoftext|>"])))
 (when (empty? eog-ids) (println "REFUSE the GGUF names no <|im_end|> / <|endoftext|>") (js/process.exit 2))
@@ -72,12 +75,12 @@
                  (.write (.-stdin (:proc g)) (str (if (vector? tok) (str/join "," tok) tok) "," (if reset? 1 0)
                                                   (when sample (str "," (f32-bits (:T sample)) "," (f32-bits (:top-p sample)) "," (:seed sample))))))))
 (defn batch-step!
-  "One batch message: TOKS and FLAGS (B each). Resolves to [ns [pick-per-row]] or nil if the guest died."
+  "One batch message: TOKS and FLAGS (B each, B = the step size). Resolves to [ns [pick-per-row]] or nil if the guest died."
   [g toks flags]
   (js/Promise. (fn [resolve _]
                  (reset! (:waiter g) (fn [line] (swap! (:steps g) inc)
                                        (resolve (when line (let [[ns idhex] (str/split line #"\|") buf (js/Buffer.from idhex "hex")]
-                                                             [(js/parseInt ns) (mapv #(.readUInt32LE buf (+ (* % 256) 244)) (range batch-rows))])))))
+                                                             [(js/parseInt ns) (mapv #(.readUInt32LE buf (+ (* % 256) 244)) (range (count toks)))])))))
                  (.write (.-stdin (:proc g)) (str/join "," (concat toks flags))))))
 (defn ensure-guest! []
   (let [g @guest]
@@ -144,6 +147,9 @@
   (if (every? nil? @rows)
     (reset! ticking false)
     (let [g (ensure-guest!) rs @rows t0 (js/Date.now)
+          top (inc (apply max (keep-indexed (fn [i r] (when r i)) rs)))   ;; rows 0..top-1 must be in the step
+          B (or (first (filter #(>= % top) batch-sizes)) batch-rows)   ;; the smallest step that covers them
+          rs (subvec rs 0 B)
           toks (mapv #(if % (:next %) 0) rs) flags (mapv #(if (and % (:reset? %)) 1 (if % 0 1)) rs)]
       (.then (batch-step! g toks flags)
              (fn [r]
@@ -153,7 +159,7 @@
                    (swap! rows (fn [cur]
                      (vec (map-indexed
                            (fn [i row]
-                             (if (nil? row) nil
+                             (if (or (nil? row) (>= i (count picks))) row
                                (let [row (-> row (assoc :reset? false) (update :i inc) (update :ns conj ns))
                                      pick (picks i)]
                                  (cond (< (:i row) (count (:ids row))) (assoc row :next ((:ids row) (:i row)))   ;; still the prompt

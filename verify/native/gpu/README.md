@@ -1225,3 +1225,27 @@ single stream of 11.5 tokens/s, 1.3–1.4×. The batch guest's step always compu
 the B-row step and loses the prefill chunks: the serving policy that follows is "serial shell under light load,
 batch shell under heavy load", or an adaptive guest with kept buffers for B ∈ {1, 2, 4} — that is the next item.
 Ids in batch mode equal the greedy single-row ids on every request checked.
+
+## Tick 49 (2026-09-20, C-4): adaptive batch — one kept step per B, the scheduler pays for the rows it occupies
+
+`… resident-replay - batch:1,2,4`: an ADAPTIVE guest records one batch step per B into kept buffers 0, 1, 2 (the
+single-row decode / prefill / sampled steps are left out — they share row 0's memory with the batch rows and
+cannot be interleaved), with layer bodies per B (`recurrent-layer-b1` / `-b2` / `-b`) and the same row layout
+(`rowpos`, token rows, KV slices, per-row ring / state), so a B=1 step advances row 0 and a B=4 step rows 0–3 of
+the same state. `serve_http.cljk … 0 1,2,4`: each tick takes the smallest B that covers the highest occupied
+row (admission fills the lowest free row), the message is 2B words, the reply is read for B rows.
+
+K16, 12 layers, `ra12.bin`, `load_check.py` (prompts of 5 / 1 tokens + 8 generated):
+
+| N | serial shell (tick 48) | B=4-only scheduler (tick 48) | **adaptive {1,2,4}** |
+|---|---|---|---|
+| 1 | 0.376 s, 34.6 seq-tokens/s | 0.661 s, 19.7 | **0.392 s, 33.2** |
+| 2 | — | — | **0.436 s, 50.5** |
+| 4 | 1.155 s, 38.1 | 0.762 s, 57.7 | **0.742 s, 59.3** |
+| 8 | 2.327 s, 37.8 | 1.276 s, 69.0 | 1.25–1.49 s, 59–71 (3 runs) |
+
+The lone request is back to a single-row step (0.96× the serial shell; the 4 % is the missing prefill chunk),
+N=2 is 1.5×, N=4–8 1.6–1.9×; ids unchanged. The N=8 spread is the K16 iGPU's clock (three consecutive runs),
+not the scheduler. Not measured on Xavier this tick (the head would have to stop again; its B=4 figures are
+tick 48's). What batch mode still lacks against the serial head: prefill chunks per row and sampling — both
+are per-row variants of steps that exist; the batch step's message would carry them per row.
