@@ -640,6 +640,23 @@ accepts `r1 | r4 | r8 | r16 | r32`. Next kernel: an r8-shaped packed-half kdot
 for ANV (h2's arithmetic, r8's rows in flight), with the 40-layer parity
 measurement before it can become the `anv` default.
 
+**Tick 25 (iteration 30, B-7): packed half on ANV — refuted; and the lever
+ANV does have.** `kdot_h2_r8.comp` (r8's eight rows in flight, h2's exponent-
+trick halves and packed multiplies, shared half codebook for IQ4_XS). B70,
+pinned, vs the f32 r8: attn_qkv Q5_K 162 → **103** GB/s, attn_gate IQ4_XS 90 →
+111, single expert 13 → 16, lm_head Q6_K 261 → **191**. Packed half is not
+cheaper on Xe2 in this shape — the byte composition of the codes costs what the
+half multiplies save, and Q5_K / Q6_K lose outright. The `anv` row stays f32;
+the kernel is kept as a measured negative. The floor-to-kernel gap on ANV is
+therefore not "arithmetic that halves in fp16". What Xe2 *does* expose, and the
+Xavier driver does not: **`VK_KHR_shader_integer_dot_product` with
+`integerDotProduct4x8BitPackedSignedAccelerated` (B70 and K16 both)** — the
+`dp4a` path llama.cpp's CUDA kernels live on: quantize the activation to int8
+per 32-block once per token, then one packed 4×8-bit dot per four values with no
+int→float conversions (the K-quant `codes` words are already byte-per-code, so
+the dot consumes them directly; mins and the Q6_K −32 fold into a Σx term).
+That is the next kernel, and its numerics are llama.cpp's own.
+
 What this is not yet: the 40-layer model on a device with room (the serving
 processes own the memory), prompt-side prefill (tokens are fed one at a time),
 sampling other than argmax, distribution parity with llama.cpp over a real
