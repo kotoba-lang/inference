@@ -1041,3 +1041,31 @@ int8 pair, `--target-env vulkan1.3`); decode re-checked 5.06 ms/token 8/8. The r
 `.spv` on a box is stale whenever its mtime precedes the source's last commit — check that before reading a
 mismatch as a bug (twice now: Xavier tick 41, B70 tick 42). `nex_pos_add.spv` / `nex_pos_seed.spv` built on all
 three boxes.
+
+## Tick 43 (2026-09-20, C-1 / kernel): the prefill kdot's positions in registers — Xavier 545 → 292 ms
+
+`kdot_f32_p.comp` kept `acc[MAXP]` / `mins[MAXP]` indexed by a runtime-bounded loop; on NVIDIA that is LOCAL
+MEMORY (the trap the kernel's own q6 comment names). `-DPFIX=<P>` makes the position count a compile-time
+constant (`kdot_f32_p<P>.spv`, P = 4 5 8 16 built on the three boxes; a mismatched `positions` writes a NaN
+instead of a wrong number), and the activation is one `vec4` load per position per block instead of four
+scalars. The generator's prefill mode names `kdot_f32_p<PF>.spv`.
+
+| | before (tick 42) | constant P | + vec4 loads | vs decode |
+|---|---|---|---|---|
+| Xavier 12 L, 5 tokens | 174.4 ms | 106.3 | **99.5 ms** | 183 ms → **1.84×** |
+| Xavier 40 L, 5 tokens | 545 ms | 317 | **292–308 ms** | 430 ms → **1.4–1.47×** |
+| K16 12 L | 67.3 | — | 63.2–65.8 | 135 → 2.1× |
+| B70 12 L | 10.3 | — | 9.69 | 25 → 2.6× |
+
+Rows unchanged (Xavier 40 L `x rel` ≤ 1.35e-2, K16 ≤ 1.3e-5, B70 ≤ 2.7e-5), argmax = oracle everywhere. The
+NVIDIA compiler was the one that needed the constant; RADV/ANV already kept the arrays in registers (4–6 %).
+
+**`-DHALF` measured and not adopted**: the packed-f16 products (kdot_h2_r1's form) on top of constant P gave
+Xavier 12 L 99.5 → 99.5 ms (nothing) and 40 L 317 → 296 ms (7 %) while the rows moved to `x rel` 3.7e-3 (12 L)
+and **0.115 (40 L)** — the f16 rounding compounds through 40 layers of P-row activations. The kernel was
+never issue-bound the way the decode h2 kernel is; it was spilling. The `HALF` arm stays in the source as the
+measured negative (not built).
+
+Xavier's 40-layer prefill is now 1.4× decode, so the prompt half of a chat request (21 tokens = 1.8 s fed
+one step each) can drop toward ~1.3 s with batched prefill once it is in the resident protocol — which is the
+next item, for all three boxes.
