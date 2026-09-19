@@ -954,3 +954,28 @@ host cost per step is the 4 round trips + the `READ` (its own copy command buffe
 the guest's life is no longer bounded by its allocators in practice (2^26 pairs / 142 ≈ 470 k steps).
 For the served rate this is the correction of tick 38's correction: Xavier 40 layers ≈ 87 ms GPU + ~3 ms
 host, B70 40 layers ≈ 10 ms GPU + ~1 ms.
+
+## Tick 40 (2026-09-20, A / C-3-5): the 40-layer model served natively on Xavier — chat included
+
+`… 40 4 9707 /root/kgpu … nvgpu fn - resident-replay` (1123 constant requests + the step; kept command buffer of
+~940 dispatches) on Xavier with `kexe-loader-gpu` (= #1036): the France prompt + 8 greedy →
+`11751,13,248046,198,248068,271,248069,271` = the 40-layer f64 oracle (`decode_tokens_ref40-12.npz`) 8/8,
+**85.5–86.2 ms/token GPU, 1.04 s wall per 12 steps (86.7 ms/step → 11.5 tok/s served)**, first request 13.1 s
+(the 18.7 GB MAP). Text: " Paris.<|im_end|>…" — llama-server (K16 :8097) continues " Paris.\n\nThe capital of
+France is": after "." it has "\n\n" 0.128 vs `<|im_end|>` 0.120 (its own top_logprobs), a near-tie the f64 oracle
+resolves our way. Not a bug to chase; it is what KL 0.014 looks like at an argmax.
+
+The tokenizer now matches control / user-defined tokens (`token_type` 3 and 4: `<|im_start|>` `<|im_end|>`
+`<think>` `</think>` …) verbatim before the pre-tokenizer, longest first, like llama.cpp's `parse_special`:
+the ChatML prefix tokenizes identically to llama-server's `/tokenize` (13/13 ids); the corpus stays 12/12.
+`serve_http.cljk` gained `POST /v1/chat/completions` (the template as `/apply-template` renders it for this
+GGUF, checked on two message shapes; `reasoning_content` split at `</think>`) and stops at `<|im_end|>` /
+`<|endoftext|>` (`finish_reason "stop"`). Xavier, 40 layers, chat "What is the capital of France? Answer in
+one word." → `"Paris"`, stop, 21 prompt + 4 generated, 2.26 s (llama-server: "Paris", 5 tokens). A haiku
+request: 200 tokens with reasoning, coherent, 216 steps in 19.0 s = **88.2 ms/step wall, 11.3 tok/s**.
+
+The surface is a systemd unit on Xavier, `murakumo-xavier-nex-native.service` (:8091, node 18 + the kbb
+engine at `/opt/kbb-engine`, `steps-per-life` 400000), enabled. It is NOT yet the gateway head (:8090 of the
+stopped llama-server unit): the shell has no `stream: true` (SSE) and prompt tokens are still fed one step
+each (21 prompt tokens = 1.8 s of the 2.26 s above) — the prefill mode of tick 33 has to enter the resident
+protocol first. Those two are the next items; B70's 40 layers still wait on the vLLM 27 GB decision.

@@ -7,7 +7,13 @@
 ;; bump allocators (measured K16 12L: 11.3 KiB and 3.5 K pairs per step), so the shell respawns the guest
 ;; after `steps-per-life` steps (default 15000: the loader ceilings are a 1 GiB pool and 2^26 pairs, 2^26 / 3.5 K = 19 k steps), when it exits, or when the
 ;; loader's 86400 s wall ceiling ends it (a day per guest life; a respawn is the MAP cost, 1.3 s for 12 layers on K16).
-;; Greedy only (the guest's sampling row is a build-time choice for now).
+;; Greedy only (the guest's sampling row is a build-time choice for now). Generation stops at an end-of-generation
+;; token (<|im_end|> / <|endoftext|>, finish_reason "stop") or at max_tokens ("length").
+;; POST /v1/chat/completions (iteration 45) renders the model's ChatML template the way llama-server's
+;; /apply-template does for this GGUF -- "<|im_start|>{role}\n{content}<|im_end|>\n" per message, earlier assistant
+;; turns prefixed by "<think>\n\n</think>\n\n", the generation prompt "<|im_start|>assistant\n<think>" -- and answers
+;; reasoning_content (up to </think>) and content separately. `chat_template_kwargs.enable_thinking false` closes the
+;; think block in the prompt (ours: the llama-server on K16 ignores that kwarg for this template).
 ;;
 ;;   NEX_GGUF=<gguf or head dump> node /opt/kbb-engine/cli.js serve_http.cljk <kexe-loader> <resident.bin> <offset> <x86_64|aarch64> <port> [allow-csv] [steps-per-life]
 ;;   curl -s localhost:8099/v1/completions -H 'Content-Type: application/json' -d '{"prompt":"The capital of France is","max_tokens":8}'
@@ -18,6 +24,8 @@
 (def allow (or (get args 5) "42,33,41,37,39"))
 (def steps-per-life (js/parseInt (or (get args 6) "15000")))
 (load-file (path/join (path/dirname *file*) "tokenizer_core.cljk"))
+(def eog-ids (set (keep token->id ["<|im_end|>" "<|endoftext|>"])))
+(when (empty? eog-ids) (println "REFUSE the GGUF names no <|im_end|> / <|endoftext|>") (js/process.exit 2))
 ;; --- the resident guest: one process, a line reader, a waiter for the next reply ---
 (def guest (atom nil))   ;; {:proc :buf :waiter :steps :born}
 (defn spawn-guest! []
@@ -51,7 +59,8 @@
         (do (when g (js/console.error (str "guest retired after " @(:steps g) " steps")) (.end (.-stdin (:proc g))))
             (spawn-guest!)))))
 (defn run-request
-  "Prompt ids -> promise of {:generated [...] :ns [...]} (greedy: each argmax is the next input)."
+  "Prompt ids -> promise of {:generated [...] :ns [...] :finish \"stop\"|\"length\"} (greedy: each argmax is the next input;
+   an end-of-generation id ends the request and is not part of the answer)."
   [ids max-tokens]
   (let [g (ensure-guest!) out (atom []) nss (atom [])]
     (letfn [(feed [i tok]
@@ -60,9 +69,22 @@
                        (if-not r {:error "guest died"}
                          (let [[ns am] r] (swap! nss conj ns)
                            (cond (< (inc i) (count ids)) (feed (inc i) (ids (inc i)))       ;; still the prompt: the reply is not kept
+                                 (contains? eog-ids am) {:generated @out :ns @nss :finish "stop"}
                                  :else (do (swap! out conj am)
-                                           (if (< (count @out) max-tokens) (feed (inc i) am) {:generated @out :ns @nss}))))))))]
+                                           (if (< (count @out) max-tokens) (feed (inc i) am) {:generated @out :ns @nss :finish "length"}))))))))]
       (feed 0 (ids 0)))))
+(defn render-chat
+  "The ChatML template of this GGUF as llama-server's /apply-template renders it (checked on two message shapes)."
+  [messages thinking?]
+  (str (apply str (map (fn [m] (let [role (.-role m) content (str (.-content m))]
+                                 (str "<|im_start|>" role "\n" (if (= role "assistant") (str "<think>\n\n</think>\n\n" content) content) "<|im_end|>\n")))
+                       (array-seq messages)))
+       "<|im_start|>assistant\n<think>" (when-not thinking? "\n\n</think>\n\n")))
+(defn split-think
+  "Generated text after a prompt that ends in <think>: [reasoning content]."
+  [text]
+  (let [i (.indexOf text "</think>")]
+    (if (neg? i) ["" text] [(str/trim (subs text 0 i)) (str/replace (subs text (+ i 8)) #"^\n+" "")])))
 (def queue (atom (js/Promise.resolve nil)))   ;; requests serialized: one step in flight at a time
 (defn enqueue [thunk] (let [p (.then @queue (fn [_] (thunk)))] (reset! queue (.catch p (fn [_] nil))) p))
 (defn completion [body]
@@ -70,25 +92,42 @@
     (if (empty? ids)
       (js/Promise.resolve #js {:error #js {:message "empty prompt" :type "invalid_request_error"}})
       (.then (enqueue #(run-request ids max-tokens))
-             (fn [{:keys [generated ns error]}]
+             (fn [{:keys [generated ns error finish]}]
                (if error
                  #js {:error #js {:message error :type "server_error"}}
                  #js {:id (str "cmpl-" (js/Date.now)) :object "text_completion" :created (quot (js/Date.now) 1000) :model "nex-n2.5-mini/kotoba-native"
-                      :choices #js [#js {:index 0 :text (decode generated) :finish_reason "length" :token_ids (clj->js generated)}]
+                      :choices #js [#js {:index 0 :text (decode generated) :finish_reason finish :token_ids (clj->js generated)}]
                       :usage #js {:prompt_tokens (count ids) :completion_tokens (count generated) :total_tokens (+ (count ids) (count generated))}
                       :timing #js {:ms_per_token (/ (reduce + ns) (max 1 (count ns)) 1e6) :steps (count ns) :wall_ms (- (js/Date.now) t0) :guest_steps @(:steps @guest)}}))))))
+(defn chat-completion [body]
+  (let [messages (or (.-messages body) #js []) max-tokens (or (.-max_tokens body) 256)
+        thinking? (not (false? (some-> body .-chat_template_kwargs .-enable_thinking)))
+        prompt (render-chat messages thinking?) ids (encode prompt) t0 (js/Date.now)]
+    (if (zero? (.-length messages))
+      (js/Promise.resolve #js {:error #js {:message "no messages" :type "invalid_request_error"}})
+      (.then (enqueue #(run-request ids max-tokens))
+             (fn [{:keys [generated ns error finish]}]
+               (if error
+                 #js {:error #js {:message error :type "server_error"}}
+                 (let [[reasoning content] (split-think (decode generated))]
+                   #js {:id (str "chatcmpl-" (js/Date.now)) :object "chat.completion" :created (quot (js/Date.now) 1000) :model "nex-n2.5-mini/kotoba-native"
+                        :choices #js [#js {:index 0 :message #js {:role "assistant" :content content :reasoning_content reasoning} :finish_reason finish}]
+                        :usage #js {:prompt_tokens (count ids) :completion_tokens (count generated) :total_tokens (+ (count ids) (count generated))}
+                        :timing #js {:ms_per_token (/ (reduce + ns) (max 1 (count ns)) 1e6) :steps (count ns) :wall_ms (- (js/Date.now) t0) :guest_steps @(:steps @guest)}})))))))
 (def server
   (http/createServer
    (fn [req res]
-     (if (and (= "POST" (.-method req)) (= "/v1/completions" (.-url req)))
+     (if (and (= "POST" (.-method req)) (contains? #{"/v1/completions" "/v1/chat/completions"} (.-url req)))
        (let [chunks (atom [])]
          (.on req "data" #(swap! chunks conj %))
          (.on req "end" (fn []
                           (let [body (try (js/JSON.parse (.toString (js/Buffer.concat (clj->js @chunks)) "utf8")) (catch :default _ nil))]
-                            (.then (if body (completion body) (js/Promise.resolve #js {:error #js {:message "bad json" :type "invalid_request_error"}}))
+                            (.then (cond (nil? body) (js/Promise.resolve #js {:error #js {:message "bad json" :type "invalid_request_error"}})
+                                         (= "/v1/chat/completions" (.-url req)) (chat-completion body)
+                                         :else (completion body))
                                    (fn [out]
                                      (.writeHead res (if (.-error out) (if (= "server_error" (.. out -error -type)) 500 400) 200) #js {"Content-Type" "application/json"})
                                      (.end res (js/JSON.stringify out))))))))
-       (do (.writeHead res 404 #js {"Content-Type" "application/json"}) (.end res (js/JSON.stringify #js {:error "only POST /v1/completions"})))))))
+       (do (.writeHead res 404 #js {"Content-Type" "application/json"}) (.end res (js/JSON.stringify #js {:error "only POST /v1/completions | /v1/chat/completions"})))))))
 (.listen server (js/parseInt port)
-         (fn [] (spawn-guest!) (println (str "SERVE\tnex kotoba-native resident\thttp://0.0.0.0:" port "/v1/completions\tguest " bin " @" offset "\tsteps-per-life " steps-per-life))))
+         (fn [] (spawn-guest!) (println (str "SERVE\tnex kotoba-native resident\thttp://0.0.0.0:" port "/v1/{chat/,}completions\tguest " bin " @" offset "\tsteps-per-life " steps-per-life))))

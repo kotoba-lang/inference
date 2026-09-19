@@ -56,9 +56,22 @@
                      (cond (empty? ps) out
                            (and (= (first ps) a) (= (second ps) b)) (recur (drop 2 ps) (conj out merged))
                            :else (recur (rest ps) (conj out (first ps)))))))))))
-(defn encode [text]
+;; control / user-defined tokens (tokenizer.ggml.token_type 3 and 4, e.g. <|im_start|> <|im_end|> <think>): matched verbatim BEFORE the
+;; pre-tokenizer, longest first, as llama.cpp's tokenizer does with parse_special = true (iteration 45, the chat template).
+(def control-tokens (let [types (kv "tokenizer.ggml.token_type")]
+                      (if types (->> (map-indexed (fn [i t] [i t]) types) (filter #(contains? #{3 4} (second %))) (map #(tokens (first %))) (sort-by #(- (count %))) vec) [])))
+(def control-re (when (seq control-tokens) (js/RegExp. (str/join "|" (map #(str/replace % #"[.*+?^${}()|\[\]\\]" "\\$&") control-tokens)) "g")))
+(defn encode-plain [text]
   (vec (mapcat (fn [piece] (map #(or (token->id %) (do (println "REFUSE no token for" (pr-str %)) (js/process.exit 3))) (bpe (bytes->units piece))))
-               (array-seq (.match text pre-re)))))
+               (array-seq (or (.match text pre-re) #js [])))))   ;; .match is null on no match (the empty text before a leading control token)
+(defn encode [text]
+  (if-not control-re (encode-plain text)
+    (loop [i 0 out []]
+      (set! (.-lastIndex control-re) i)
+      (let [m (.exec control-re text)]
+        (if-not m (into out (encode-plain (subs text i)))
+          (let [j (.-index m) tok (aget m 0)]
+            (recur (+ j (count tok)) (-> out (into (encode-plain (subs text i j))) (conj (token->id tok))))))))))
 (defn decode [ids]
   (let [units (apply str (map #(tokens %) ids))
         bytes (js/Buffer.from (clj->js (mapv #(char->byte %) (array-seq (js/Array.from units)))))]
