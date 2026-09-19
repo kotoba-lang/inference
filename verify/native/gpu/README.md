@@ -843,6 +843,24 @@ serving shell's text ↔ ids; the guest keeps taking ids. Not covered yet:
 special tokens (`<|im_start|>` etc. must be spliced by the chat-template layer,
 not the BPE), and `add_special` (Qwen adds no BOS).
 
+**Tick 36 (iteration 41, C-3-1): the prompt at run time.** One guest binary
+now serves any prompt: `… <backend> fn - runtime` emits an exported
+`serve [plen ntok]` beside `main` (the frontend requires `main` to take no
+arguments; the loader passes i64 argv to an exported entry —
+`extract-native --symbol serve`, arity 2). `serve` reads the prompt as a
+decimal list from `:env/read NEX_PROMPT` and writes it to the token buffer
+with the loader's new `WRITEDEC` (amu #1034; the guest formats decimals but
+has no hex, no `string->i64`, no `string-length` on the native slice — those
+three refusals shaped the design), rewrites `argmax_final`'s prompt-length
+meta the same way, and runs the token loop for `plen + ntok` steps; the token
+buffer holds 4096 slots and the KV caches a 4096-token context. Policy gains
+`[:cap/call 33]`. K16, 12 layers, one binary: `NEX_PROMPT=9707,198,220 … 3 1`
+→ 163967 / 112516 / 169222 / 169484 (4/4 = oracle); `NEX_PROMPT=760,6511,314,
+9338,369 … 5 3` → 8/8 = oracle, 26.6–27.8 ms/token. The first attempt sized
+the KV cache from the build-time token count and the second prompt's step 4
+read past it — argmax happened to match while `x rel` was 1.2; the row check
+caught it.
+
 What this is not yet: the 40-layer model on a device with room (the serving
 processes own the memory), prompt-side prefill (tokens are fed one at a time),
 sampling other than argmax, distribution parity with llama.cpp over a real
