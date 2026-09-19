@@ -754,6 +754,25 @@ Per box, the kdot story is now: K16 bandwidth-bound (nothing left in the
 kernel), B70 issue/coalescing-bound (int8 × x8r4 landed), Xavier
 instruction-bound without an integer dot (h2 landed, dp4a unavailable).
 
+**Tick 31 (iteration 36, C-1 groundwork): the kernels are prefill-ready.** A
+real prefill runs the prompt's P tokens through each layer as *one* batch where
+the math allows and P sequential steps where it does not: the kdots take
+`positions = P` with `input_per_expert = 1` (the activation is `[P × n]`, the
+weights are read **once** instead of P times — the whole point); rmsnorm /
+rope / softmax / silu are row-wise already; the delta-net step and causal
+attention are recurrences and run P dispatches each, one per token. Two kernel
+changes make that possible and change nothing for decode: `deltanet_fused`
+reads its **row** from `pos[1]` (which token of the batch; 0 in decode) and
+offsets `qkv / alpha / betaL / z / out` by it; every kdot's `in_row` is
+`position / pad0` when `Meta.pad0 > 1` (the MoE prefill has 8 expert positions
+per token). Decode re-verified on all three boxes after the rebuild (B70 2.58
+ms, K16 27.3, Xavier 36.6). Dispatch arithmetic for a P-token prompt on 40
+layers: decode-as-prefill = P × ~21 dispatches and P weight passes; batched =
+~21 + 2P dispatches (the two recurrences) and one weight pass — for P = 16 the
+weight traffic per prompt drops 16×, the dispatch count 5×. The generator's
+`prefill` mode (batched layer bodies, a `stepbuf` for the recurrences, MoE ids
+`[P × 8]`, lm_head on the last row) is the next tick.
+
 What this is not yet: the 40-layer model on a device with room (the serving
 processes own the memory), prompt-side prefill (tokens are fed one at a time),
 sampling other than argmax, distribution parity with llama.cpp over a real
