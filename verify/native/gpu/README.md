@@ -456,6 +456,24 @@ token. That is the format's numerics, not the sampler (the same SPIR-V picks
 must use the exact kernels or compare distributions, not token chains. The
 single-workgroup `sample_topp` stays in `nex_ops.comp` as the reference form.
 
+**Tick 15 (iteration 20): the whole model resident on one GPU.** The owner
+stopped Xavier's llama-server (`murakumo-xavier-nex-n25-mini.service`, 21 GB
+of device memory) for this path (2026-09-19, order A → B → C). The `fn`-mode
+guest with 40 layers and the `nvgpu` (h2) row then runs resident — 17.4 GB of
+weights MAPped once in 19 s, then one command buffer per token:
+
+| Xavier, 40 layers resident, h2 | |
+|---|---|
+| ms/token (12 tokens: 5 prompt + 7 greedy) | **89.3–89.6, mean 89.5 → 11.2 tok/s** |
+| vs oracle | 12/12 argmax equal; final logits as tick 10 |
+| greedy continuation of "The capital of France is" | ` Paris.<\|im_end\|>\n<think>\n\n</think>\n\n` |
+| llama.cpp CUDA on the same box (stopped) | 18.7 tok/s |
+
+The first full-model number of the native path, and it is what the 12-layer
+extrapolation said (1.8 ms/layer × 40 + 18 ms lm_head). The token budget is
+72 ms of layers (kdot at the nvgpu instruction-issue ceiling) + 18 ms of
+Q6_K lm_head on the f32 path; those two are the A items that follow.
+
 What this is not yet: the 40-layer model on a device with room (the serving
 processes own the memory), prompt-side prefill (tokens are fed one at a time),
 sampling other than argmax, distribution parity with llama.cpp over a real
