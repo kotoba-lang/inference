@@ -212,9 +212,39 @@ step goes **60.0 → 54.0 ms/token** (argmax chain unchanged: 163967 → 1320 �
 11278). On the K16 iGPU (RADV, one wave64 per workgroup) s2 is *slower* than r1
 (attn_qkv 31.9 → 22.5 GB/s, experts 16.5 → 9.5; lm_head equal), so s2 stays
 nvgpu-only — the layout table is no longer neutral, it carries this. Remaining
-Xavier gap: 54 ms ≈ 17 GB/s against the 33 GB/s control probe, and ~0.5 ms of
-per-dispatch cost × 29 dispatches per layer; the next lever is fusing
-dispatches inside the layer (rmsnorm+kdot, silu_mul+down, weighted_sum+add).
+Xavier gap: 54 ms ≈ 17 GB/s against the 33 GB/s control probe.
+
+**Tick 5 (iteration 10): barrier groups.** The "~0.5 ms per dispatch" above was
+the single-dispatch *submit* latency, not the cost of a dispatch inside a
+command buffer. Measured with a probe of N trivial dispatches in one buffer
+(amu `test/fixtures/gpu/gpu-dispatch-floor*.kotoba`, slope 270 → 1080):
+
+| box | per dispatch, with the loader's compute→compute barrier | without (`DISPATCHC`) |
+|---|---|---|
+| B70 ANV | **13 µs** | 0.18 µs |
+| K16 RADV | 2.7 µs | 0.15 µs |
+| Xavier nvgpu | 3.5 µs | 0.35 µs |
+
+So dispatch count is a B70 lever (125 dispatches ≈ 1.6 of 3.9 ms at 4 layers),
+a small one elsewhere, and the barrier — not the launch — is what costs. amu
+PR #1029 adds `DISPATCHC`: recorded like `DISPATCH` but with no barrier before
+it; the guest asserts the dispatch reads nothing written, and writes nothing
+touched, since the last plain `DISPATCH`. The generator marks 18 of the 27
+per-layer dispatches concurrent (qkv|gate|alpha|beta, gate_decay2×2|conv1d,
+l2norm q|k, q|k|v, rmsnorm q|k, rope q|k|copy v, router|gate_sh|up_sh|shlogit,
+softmax_topk|silu_sh, gate_exps|up_exps|down_sh) and orders the MoE tail so
+the groups are contiguous — 27 → 15 barriers per layer. Results bit-identical
+on all three boxes (same `x rel`, same argmax chains):
+
+| box | before | after |
+|---|---|---|
+| B70 4L × 3T | 3.93 ms/token | **3.63** |
+| K16 iGPU 12L × 3T | 28.4 | **27.4** |
+| Xavier 12L × 3T | 54.0 | **52.8** |
+
+Fusing kernels (rmsnorm+kdot etc.) would remove the same barriers and is now
+worth less than it looked; the Xavier budget is still the kdot bandwidth
+(~12.6 GB/s over the layers, 20 on the lm_head).
 
 What this is not yet: the 40-layer model on a device with room (the serving
 processes own the memory), prompt-side prefill (tokens are fed one at a time),
