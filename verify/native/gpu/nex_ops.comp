@@ -7,6 +7,9 @@
 // Meta at 0 (the loader binds everything as storage):
 //   n rows aux aux2 : u32   eps scale p0 p1 : f32
 layout(local_size_x = 256) in;
+#ifndef BATCH_CACHE_ROWS
+#define BATCH_CACHE_ROWS 4096u   // -DBATCH: KV positions per sequence (each row's cache slice)
+#endif
 layout(std430, binding = 0) readonly buffer Meta { uint n; uint rows; uint aux; uint aux2; float eps; float scale; float p0; float p1; } P;
 layout(std430, binding = 1) readonly buffer A { float a[]; };
 layout(std430, binding = 2) buffer B { float b[]; };   // not readonly: argmax_final writes the token buffer through it (iteration 16)
@@ -122,9 +125,15 @@ void op_gate_decay2() {
 // position stride; rope_neox: the angle's position; attn_decode: T = pos + 1.
 uint dyn_pos() { return ids[0]; }
 void op_copy_at() {
+#ifdef BATCH
+  // C-4 (iteration 51): row = sequence (workgroup y); a [row x n] -> o[row * aux (cache stride) + pos[row] * aux2 + i]
+  uint row = gl_WorkGroupID.y, i = gl_WorkGroupID.x * 256u + gl_LocalInvocationID.x; if (i >= P.n) return;
+  o[row * P.aux + ids[row] * P.aux2 + i] = a[row * P.n + i];
+#else
   uint i = gl_GlobalInvocationID.x; if (i >= P.n) return;
   uint off = (P.p1 != 0.0) ? dyn_pos() * P.aux2 : P.aux2;
   o[off + i] = a[i];
+#endif
 }
 void op_weighted_sum() {   // workgroup y = token (prefill): a [(y*aux+e) x n], b [y*aux+e], c / o [y x n], s [y]
   uint i = gl_GlobalInvocationID.x, y = gl_WorkGroupID.y; if (i >= P.n) return;
@@ -138,7 +147,11 @@ void op_rope_neox() {   // workgroup x = head row over all batch rows; P.rows = 
   for (uint i = t; i < n; i += 256u) {
     if (i >= nrot) { o[base + i] = a[base + i]; continue; }
     uint pair = (i >= hlf) ? i - hlf : i;
+#ifdef BATCH
+    float theta = float(ids[tokrow]) * pow(P.scale, -2.0 * float(pair) / float(nrot));   // C-4: the row's own position
+#else
     float theta = float(((P.p1 != 0.0) ? dyn_pos() : P.aux2) + tokrow) * pow(P.scale, -2.0 * float(pair) / float(nrot));
+#endif
     float cs = cos(theta), sn = sin(theta);
     float x0 = a[base + pair], x1 = a[base + pair + hlf];
     o[base + i] = (i >= hlf) ? (x0 * sn + x1 * cs) : (x0 * cs - x1 * sn);
@@ -146,12 +159,17 @@ void op_rope_neox() {   // workgroup x = head row over all batch rows; P.rows = 
 }
 void op_attn_decode() {   // workgroup y = query row of the batch (prefill): causal T = base + 1 + row, q / out / gate offset by the row (iteration 38)
   uint h = gl_WorkGroupID.x, row = gl_WorkGroupID.y, t = gl_LocalInvocationID.x, d = P.n;
-  uint T = ((P.p1 != 0.0) ? dyn_pos() + 1u : P.aux) + row; uint hkv = h / (P.rows / P.aux2);
+#ifdef BATCH
+  // C-4 (iteration 51): row = sequence; T = its own position + 1; its KV cache starts at row * BATCH_CACHE_ROWS positions
+  uint T = ids[row] + 1u; uint hkv = h / (P.rows / P.aux2); uint cbase = row * BATCH_CACHE_ROWS * P.aux2 * d;
+#else
+  uint T = ((P.p1 != 0.0) ? dyn_pos() + 1u : P.aux) + row; uint hkv = h / (P.rows / P.aux2); uint cbase = 0u;
+#endif
   uint qoff = row * P.rows * d;
   float sc = -1e30;
   if (t < T) {
     float dt = 0.0;
-    for (uint i = 0u; i < d; i++) dt += a[qoff + h * d + i] * b[(t * P.aux2 + hkv) * d + i];
+    for (uint i = 0u; i < d; i++) dt += a[qoff + h * d + i] * b[cbase + (t * P.aux2 + hkv) * d + i];
     sc = dt * P.scale;
   }
   red[t] = sc; barrier();
@@ -163,33 +181,43 @@ void op_attn_decode() {   // workgroup y = query row of the batch (prefill): cau
   red[t] = p; barrier();
   for (uint i = t; i < d; i += 256u) {
     float acc = 0.0;
-    for (uint tt = 0u; tt < T; tt++) acc += red[tt] * c[(tt * P.aux2 + hkv) * d + i];
+    for (uint tt = 0u; tt < T; tt++) acc += red[tt] * c[cbase + (tt * P.aux2 + hkv) * d + i];
     uint gi = (P.eps < 0.0) ? (row * P.rows * 2u * d + (h * 2u + 1u) * d + i) : (qoff + h * d + i);
     o[qoff + h * d + i] = acc * sigmoid(s[gi]);
   }
 }
 void op_argmax_partial() {
   uint t = gl_LocalInvocationID.x, n = P.n, start = gl_WorkGroupID.x * 4096u;
+#ifdef BATCH
+  uint row = gl_WorkGroupID.y, lbase = row * n, pbase = row * 64u;   // C-4: logits [row x n], partials 64 per row
+#else
+  uint lbase = 0u, pbase = 0u;
+#endif
   float bv = -1e30; uint bi = 0u;
-  for (uint i = start + t; i < min(start + 4096u, n); i += 256u) { float v = a[i]; if (v > bv || (v == bv && i < bi)) { bv = v; bi = i; } }
+  for (uint i = start + t; i < min(start + 4096u, n); i += 256u) { float v = a[lbase + i]; if (v > bv || (v == bv && i < bi)) { bv = v; bi = i; } }
   red[t] = bv; redi[t] = bi; barrier();
   for (uint st = 128u; st > 0u; st >>= 1u) {
     if (t < st) { float ov = red[t + st]; uint oi = redi[t + st]; if (ov > red[t] || (ov == red[t] && oi < redi[t])) { red[t] = ov; redi[t] = oi; } }
     barrier();
   }
-  if (t == 0u) { s[gl_WorkGroupID.x] = red[0]; ids[gl_WorkGroupID.x] = redi[0]; }
+  if (t == 0u) { s[pbase + gl_WorkGroupID.x] = red[0]; ids[pbase + gl_WorkGroupID.x] = redi[0]; }
 }
 void op_argmax_final() {
   uint t = gl_LocalInvocationID.x, parts = P.aux;
+#ifdef BATCH
+  uint pbase = gl_WorkGroupID.y * 64u;   // C-4: this row's 61 partials; the pick lands at ids[pbase + parts] (slot 61 of the row)
+#else
+  uint pbase = 0u;
+#endif
   float bv = -1e30; uint bi = 0u;
-  for (uint i = t; i < parts; i += 256u) { float v = s[i]; uint ix = ids[i]; if (v > bv || (v == bv && ix < bi)) { bv = v; bi = ix; } }
+  for (uint i = t; i < parts; i += 256u) { float v = s[pbase + i]; uint ix = ids[pbase + i]; if (v > bv || (v == bv && ix < bi)) { bv = v; bi = ix; } }
   red[t] = bv; redi[t] = bi; barrier();
   for (uint st = 128u; st > 0u; st >>= 1u) {
     if (t < st) { float ov = red[t + st]; uint oi = redi[t + st]; if (ov > red[t] || (ov == red[t] && oi < redi[t])) { red[t] = ov; redi[t] = oi; } }
     barrier();
   }
   if (t == 0u) {
-    ids[parts] = redi[0]; o[0] = red[0];
+    ids[pbase + parts] = redi[0]; o[pbase] = red[0];
     // device-side token buffer (iteration 16): with p1 != 0, b is the token buffer
     // (uint bits in a float buffer), c[0] the position, aux2 the prompt length --
     // the argmax becomes the next input token unless the prompt still forces it.
@@ -341,12 +369,21 @@ void op_quant_q8() {
     ids[b * 8u + w] = packed;
   }
 }
-void op_pos_incr() { if (gl_GlobalInvocationID.x == 0u) ids[0] += 1u; }   // the position counter, once per token
+#ifdef BATCH
+void op_pos_incr() { uint r = gl_GlobalInvocationID.x; if (r < P.n) ids[r] += 1u; }   // C-4: every row's position
+#else
+void op_pos_incr() { if (gl_GlobalInvocationID.x == 0u) ids[0] += 1u; }
+#endif   // the position counter, once per token
 // ctl (resident serving, iteration 43): one message = "<token id>,<reset flag>" WRITEDEC'd into c (uint bits);
 // a set flag rewinds the position to 0 (the kernels read no history at position 0, so nothing else is
 // reset), then the token goes to the token buffer at the position: b[pos] = token, as argmax_final writes it.
 // iteration 49: P.n tokens (1 in decode) then the flag at c[n]: tokbuf[pos + i] = token i -- the prefill message
+#ifdef BATCH
+// C-4: the message is B tokens then B flags; row r: flag -> pos[r] = 0, then tokbuf[r * aux (row stride) + pos[r]] = token r
+void op_ctl() { uint r = gl_GlobalInvocationID.x; if (r < P.n) { if (floatBitsToUint(c[P.n + r]) != 0u) ids[r] = 0u; b[r * P.aux + ids[r]] = c[r]; } }
+#else
 void op_ctl() { if (gl_GlobalInvocationID.x == 0u) { uint n = P.n; if (floatBitsToUint(c[n]) != 0u) ids[0] = 0u; for (uint i = 0u; i < n; i++) b[ids[0] + i] = c[i]; } }
+#endif
 // params (resident sampling, iteration 50): the sampled-decode message "t,f,T,top_p,seed" -- ctrl words 2..4 become the
 // sampler meta's eps / scale / p0 (words 4..6): c = ctrl, o = the sampler's Meta buffer (bit copies, as ctl copies tokens)
 void op_params() { uint i = gl_GlobalInvocationID.x; if (i < 3u) o[4u + i] = c[2u + i]; }
