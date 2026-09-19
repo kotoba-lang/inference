@@ -1198,3 +1198,30 @@ took the lm_head — the r1 shape wins on radv for this kernel; kept in the sour
 at 8B positions (their weights differ per position, ~3 ms), the delta-net's per-row state traffic (~1.5 ms), and
 the rest of the row-doubled ops. Those are per-row costs, so they scale with B and cap the gain — B=4 at 1.87×
 is near what this shape gives on K16.
+
+## Tick 48 (2026-09-20, C-4): the shell scheduler — rows as slots
+
+`serve_http.cljk … <prefill-bucket> <batch-rows>`: with `batch-rows` B (a `… batch:<B>` guest) the shell is a
+scheduler. B rows are slots; an arriving request waits in `pending` and takes a free row at the next tick with
+its reset flag; every tick is ONE 2B-word message that advances every occupied row (an empty row gets `0,1`);
+a row leaves on `<|im_end|>` / `<|endoftext|>` (`stop`) or its `max_tokens` (`length`), and its promise
+resolves — streaming per row works through the same `on-token`. The batch step is greedy and one token per
+row per step, so batch mode uses neither prefill chunks nor sampling (the single-row steps share row 0's state
+with the batch step and cannot be interleaved). `load_check.py` fires N concurrent requests.
+
+K16, 12 layers, `rb12lm4.bin` (B = 4), prompts of 5 / 1 tokens + 8 generated, vs the serial shell (`rs12s.bin`,
+prefill bucket 8):
+
+| N concurrent | serial shell | batch scheduler (B = 4) | ratio |
+|---|---|---|---|
+| 1 | 0.376 s, 34.6 seq-tokens/s | 0.661 s, 19.7 | 0.57× |
+| 4 | 1.155 s, 38.1 | 0.762 s, **57.7** | **1.51×** |
+| 8 | 2.327 s, 37.8 | 1.276 s, **69.0** | **1.83×** |
+
+Xavier, 40 layers, `rb40-nv.bin` (B = 4) on :8090 with the head unit stopped for the measurement (the primary
+vLLM head was up; the unit was restarted and answered `"Paris"` in 1.69 s afterwards): N=1 3.9 seq-tokens/s
+(the France request stops at "Paris." after 7 tokens), N=4 **14.8**, N=8 **15.8** — against the serial head's
+single stream of 11.5 tokens/s, 1.3–1.4×. The batch guest's step always computes B rows, so a lone request pays
+the B-row step and loses the prefill chunks: the serving policy that follows is "serial shell under light load,
+batch shell under heavy load", or an adaptive guest with kept buffers for B ∈ {1, 2, 4} — that is the next item.
+Ids in batch mode equal the greedy single-row ids on every request checked.

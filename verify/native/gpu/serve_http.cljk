@@ -25,13 +25,19 @@
 ;;   curl -s localhost:8099/v1/completions -H 'Content-Type: application/json' -d '{"prompt":"The capital of France is","max_tokens":8}'
 (require '["http" :as http] '["child_process" :as cp] '["path" :as path] '[clojure.string :as str] '[nbb.core :refer [load-file]])
 (def args (vec *command-line-args*))
-(when (< (count args) 5) (println "usage: <kexe-loader> <resident.bin> <offset> <isa> <port> [allow-csv] [steps-per-life] [prefill-bucket]") (js/process.exit 2))
+(when (< (count args) 5) (println "usage: <kexe-loader> <resident.bin> <offset> <isa> <port> [allow-csv] [steps-per-life] [prefill-bucket] [batch-rows]") (js/process.exit 2))
 (def loader (args 0)) (def bin (args 1)) (def offset (args 2)) (def isa (args 3)) (def port (args 4))
 (def allow (or (get args 5) "42,33,41,37,39"))
 (def steps-per-life (js/parseInt (or (get args 6) "15000")))
 ;; prefill bucket P of a `resident-replay … prefill:<P>` guest (iteration 49): the prompt goes in as chunks of P tokens
 ;; per message ("t0,…,tP-1,flag"), the remainder one token per message; 0 = the guest has no prefill step.
 (def prefill-bucket (js/parseInt (or (get args 7) "0")))
+;; batch rows B of a `… batch:<B>` guest (iteration 53, C-4): the shell becomes a SCHEDULER -- B rows are slots, a
+;; request takes a free row and leaves it on stop / length, and every step is one 2B-word message (B tokens, B flags)
+;; that advances every occupied row at once (an empty row is fed 0 with flag 1). The batch step is greedy and one
+;; token per row per step, so in batch mode prefill chunks and sampling are not used (the single-row steps share
+;; row 0's state with the batch step and cannot be mixed in). 0 = the serial shell as before.
+(def batch-rows (js/parseInt (or (get args 8) "0")))
 (load-file (path/join (path/dirname *file*) "tokenizer_core.cljk"))
 (def eog-ids (set (keep token->id ["<|im_end|>" "<|endoftext|>"])))
 (when (empty? eog-ids) (println "REFUSE the GGUF names no <|im_end|> / <|endoftext|>") (js/process.exit 2))
@@ -65,6 +71,14 @@
                                        (resolve (when line (let [[ns idhex] (str/split line #"\|")] [(js/parseInt ns) (.readUInt32LE (js/Buffer.from idhex "hex") 0)])))))
                  (.write (.-stdin (:proc g)) (str (if (vector? tok) (str/join "," tok) tok) "," (if reset? 1 0)
                                                   (when sample (str "," (f32-bits (:T sample)) "," (f32-bits (:top-p sample)) "," (:seed sample))))))))
+(defn batch-step!
+  "One batch message: TOKS and FLAGS (B each). Resolves to [ns [pick-per-row]] or nil if the guest died."
+  [g toks flags]
+  (js/Promise. (fn [resolve _]
+                 (reset! (:waiter g) (fn [line] (swap! (:steps g) inc)
+                                       (resolve (when line (let [[ns idhex] (str/split line #"\|") buf (js/Buffer.from idhex "hex")]
+                                                             [(js/parseInt ns) (mapv #(.readUInt32LE buf (+ (* % 256) 244)) (range batch-rows))])))))
+                 (.write (.-stdin (:proc g)) (str/join "," (concat toks flags))))))
 (defn ensure-guest! []
   (let [g @guest]
     (if (and g (< @(:steps g) steps-per-life)) g
@@ -116,6 +130,53 @@
     (if (neg? i) ["" text] [(str/trim (subs text 0 i)) (str/replace (subs text (+ i 8)) #"^\n+" "")])))
 (def queue (atom (js/Promise.resolve nil)))   ;; requests serialized: one step in flight at a time
 (defn enqueue [thunk] (let [p (.then @queue (fn [_] (thunk)))] (reset! queue (.catch p (fn [_] nil))) p))
+;; --- the batch scheduler (batch-rows > 0) ---
+(def rows (atom (vec (repeat (max 0 batch-rows) nil))))   ;; slot -> request state or nil
+(def pending (atom []))                                     ;; arrived requests waiting for a row
+(def ticking (atom false))
+(defn admit! []
+  (swap! rows (fn [rs] (reduce (fn [rs i] (if (and (nil? (rs i)) (seq @pending))
+                                             (let [r (first @pending)] (swap! pending subvec 1) (assoc rs i (assoc r :reset? true)))
+                                             rs))
+                               rs (range (count rs))))))
+(defn tick! []
+  (admit!)
+  (if (every? nil? @rows)
+    (reset! ticking false)
+    (let [g (ensure-guest!) rs @rows t0 (js/Date.now)
+          toks (mapv #(if % (:next %) 0) rs) flags (mapv #(if (and % (:reset? %)) 1 (if % 0 1)) rs)]
+      (.then (batch-step! g toks flags)
+             (fn [r]
+               (if-not r
+                 (do (doseq [row rs :when row] ((:resolve row) {:error "guest died"})) (reset! rows (vec (repeat batch-rows nil))) (reset! ticking false))
+                 (let [[ns picks] r]
+                   (swap! rows (fn [cur]
+                     (vec (map-indexed
+                           (fn [i row]
+                             (if (nil? row) nil
+                               (let [row (-> row (assoc :reset? false) (update :i inc) (update :ns conj ns))
+                                     pick (picks i)]
+                                 (cond (< (:i row) (count (:ids row))) (assoc row :next ((:ids row) (:i row)))   ;; still the prompt
+                                       (contains? eog-ids pick) (do ((:resolve row) {:generated (:out row) :ns (:ns row) :finish "stop"}) nil)
+                                       :else (let [row (-> row (update :out conj pick) (assoc :next pick))]
+                                               (when-let [f (:on-token row)] (f pick))
+                                               (if (>= (count (:out row)) (:max-tokens row))
+                                                 (do ((:resolve row) {:generated (:out row) :ns (:ns row) :finish "length"}) nil)
+                                                 row))))))
+                           cur))))
+                   (tick!))))))))
+(defn run-batched
+  "Prompt ids -> promise; the request joins the batch step at the next tick."
+  [ids max-tokens & [on-token]]
+  (js/Promise. (fn [resolve _]
+                 (swap! pending conj {:ids ids :i 0 :out [] :ns [] :next (ids 0) :max-tokens max-tokens :on-token on-token :resolve resolve})
+                 (when-not @ticking (reset! ticking true) (tick!)))))
+(defn submit
+  "The request path: the batch scheduler when batch-rows > 0 (greedy, no prefill chunks), else the serial shell."
+  [ids max-tokens on-token sample]
+  (if (pos? batch-rows)
+    (run-batched ids max-tokens on-token)
+    (enqueue #(run-request ids max-tokens on-token sample))))
 (defn sample-of
   "The request's sampler parameters, or nil for greedy (temperature 0)."
   [body]
@@ -132,7 +193,7 @@
   [res ids max-tokens chunk-fn final-fn sample]
   (let [send (sse-writer res) dec (js/TextDecoder. "utf-8") t0 (js/Date.now)
         on-token (fn [id] (let [text (.decode dec (token-bytes id) #js {:stream true})] (when (seq text) (when-let [c (chunk-fn text)] (send c)))))]
-    (.then (enqueue #(run-request ids max-tokens on-token sample))
+    (.then (submit ids max-tokens on-token sample)
            (fn [{:keys [generated ns error finish]}]
              (if error (send #js {:error #js {:message error :type "server_error"}})
                (let [tail (.decode dec)]   ;; whatever an incomplete trailing sequence held
@@ -167,7 +228,7 @@
   (let [prompt (or (.-prompt body) "") max-tokens (or (.-max_tokens body) 16) ids (encode prompt) t0 (js/Date.now) sample (sample-of body)]
     (if (empty? ids)
       (js/Promise.resolve #js {:error #js {:message "empty prompt" :type "invalid_request_error"}})
-      (.then (enqueue #(run-request ids max-tokens nil sample))
+      (.then (submit ids max-tokens nil sample)
              (fn [{:keys [generated ns error finish]}]
                (if error
                  #js {:error #js {:message error :type "server_error"}}
@@ -182,7 +243,7 @@
         prompt (render-chat messages thinking?) ids (encode prompt) t0 (js/Date.now) sample (sample-of body)]
     (if (zero? (.-length messages))
       (js/Promise.resolve #js {:error #js {:message "no messages" :type "invalid_request_error"}})
-      (.then (enqueue #(run-request ids max-tokens nil sample))
+      (.then (submit ids max-tokens nil sample)
              (fn [{:keys [generated ns error finish]}]
                (if error
                  #js {:error #js {:message error :type "server_error"}}
@@ -225,4 +286,4 @@
              (do (.writeHead res 200 #js {"Content-Type" "application/json"}) (.end res (js/JSON.stringify #js {:object "list" :data #js [#js {:id "nex-n2.5-mini/kotoba-native" :object "model" :owned_by "kotoba-lang"}]})))
              :else (do (.writeHead res 404 #js {"Content-Type" "application/json"}) (.end res (js/JSON.stringify #js {:error "POST /v1/completions | /v1/chat/completions, GET /health | /slots | /v1/models"}))))))))
 (.listen server (js/parseInt port)
-         (fn [] (spawn-guest!) (println (str "SERVE\tnex kotoba-native resident\thttp://0.0.0.0:" port "/v1/{chat/,}completions\tguest " bin " @" offset "\tsteps-per-life " steps-per-life "\tprefill-bucket " prefill-bucket))))
+         (fn [] (spawn-guest!) (println (str "SERVE\tnex kotoba-native resident\thttp://0.0.0.0:" port "/v1/{chat/,}completions\tguest " bin " @" offset "\tsteps-per-life " steps-per-life "\tprefill-bucket " prefill-bucket "\tbatch-rows " batch-rows))))
