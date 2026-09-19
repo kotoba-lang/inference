@@ -608,6 +608,22 @@ K16 (RADV) experts on r8 are neutral (27.2 vs 27.3, bandwidth-bound), so the
 `radv` row is unchanged. B70's 40-layer estimate: ~14 ms/token, ~70 tok/s class
 (still an extrapolation from 4 layers — a resident run needs vLLM's memory).
 
+**Tick 23 (iteration 28, B-6): consolidation measured, one class split found.**
+`kdot_f32_r8_dual.comp` computes gate and up for the same eight (expert, row)
+pairs from one x read and writes `silu(gate)·up` directly — three dispatches
+(gate_exps, up_exps, silu_mul) become one. Correct, and **slower**: 3.06 → 3.09
+ms on B70 (two weight streams and four accumulator arrays per thread; the two
+separate dispatches were already concurrent). Kept as `:expert-dual` in the
+table for A/B, not used. The per-op profile of the current layer (pinned
+clock, floor-subtracted) then showed the real item: **ssm_out / attn_output
+(2048 rows × 4096 cols) on r8 get only 256 workgroups** and had slowed from
+0.04 to 0.063 ms when `:wide` moved to r8 in tick 20 — the "wide" class was
+two shapes. A fifth class `:out` puts them back on r1: **3.05 → 2.96 ms/token**
+(oracle-exact). `anv` = wide r8 / narrow r1 / expert r8 / out r1 / lm r8.
+Session tally for B70's 4-layer token: 3.63 (tick 5) → 2.96; 40-layer estimate
+≈ 40 × 0.315 + 1.7 ≈ **14 ms, ~70 tok/s**. Small-dispatch consolidation is
+closed as a B lever (ticks 19 and 23 both measured it at 0 to −1%).
+
 What this is not yet: the 40-layer model on a device with room (the serving
 processes own the memory), prompt-side prefill (tokens are fed one at a time),
 sampling other than argmax, distribution parity with llama.cpp over a real
