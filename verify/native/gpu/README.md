@@ -597,6 +597,17 @@ on 40 layers), **Xavier 12 L × 3 T 37.1 → 36.4**, **K16 12 L 27.3 → 27.3** 
 wave64 already had the parallelism). `profile_guest.py --report` knows the
 fused layer's 21 labels.
 
+**Tick 22 (iteration 27, B-5): the expert kdots get their own class.** The
+layout table has a fourth class, `:expert` (the three 8-position expert kdots;
+falls back to `:narrow` when absent). On B70 the experts move to r8: 4 L × 3 T
+**3.30 → 3.06 ms/token** (−0.06 ms per layer, ≈ −2.4 ms on 40 layers),
+oracle-exact; the same for the *narrow* class (alpha/beta 32 rows, k/v/shared
+experts 512–2048) **loses** (3.15 — small row counts starve r8's 8-rows-per-
+workgroup shape), so `anv` is now wide r8 / narrow r1 / expert r8 / lm r8. On
+K16 (RADV) experts on r8 are neutral (27.2 vs 27.3, bandwidth-bound), so the
+`radv` row is unchanged. B70's 40-layer estimate: ~14 ms/token, ~70 tok/s class
+(still an extrapolation from 4 layers — a resident run needs vLLM's memory).
+
 What this is not yet: the 40-layer model on a device with room (the serving
 processes own the memory), prompt-side prefill (tokens are fed one at a time),
 sampling other than argmax, distribution parity with llama.cpp over a real
