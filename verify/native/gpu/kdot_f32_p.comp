@@ -18,6 +18,12 @@ layout(std430, binding = 3) buffer O { float outp[]; };
 layout(std430, binding = 4) readonly buffer E { uint expert_ids[]; };
 
 #define MAXP 16
+// -DROWS=<R> (iteration 52, C-4): R rows per workgroup, the r8 kernel's shape with the positions inner loop --
+// each block's activations (P vec4) are loaded once and dotted against R rows' dequantized values; the
+// accumulators are acc[R][P]. Dispatch (ceil(rows / R), 1, 1). ROWS = 1 is the kernel as before.
+#ifndef ROWS
+#define ROWS 1
+#endif
 // -DPFIX=<P>: the position count is a compile-time constant (kdot_f32_p<P>.spv). With a runtime bound the
 // per-position accumulators acc[] / mins[] are dynamically indexed and go to LOCAL MEMORY on NVIDIA (the
 // same trap the q6 ivec4 hit); a constant bound lets the loops unroll and the accumulators live in
@@ -27,10 +33,12 @@ layout(std430, binding = 4) readonly buffer E { uint expert_ids[]; };
 // are summed in f32 (kdot_h2_r1's form; the f16 rounding budget is the same as decode's h2 path).
 #ifdef PFIX
 #define POSITIONS uint(PFIX)
+#define PCAP PFIX          // accumulators / partials sized by the constant P
 #else
 #define POSITIONS positions
+#define PCAP MAXP
 #endif
-shared float partial[MAXP * 64];
+shared float partial[ROWS * PCAP * 64];
 
 uint weight_byte(uint offset) { return (weights[offset >> 2u] >> ((offset & 3u) * 8u)) & 255u; }
 float weight_half(uint offset) {
@@ -109,7 +117,7 @@ uint block_bytes_of(uint t) {
 }
 
 void main() {
-  uint row = gl_WorkGroupID.x;
+  uint row0 = gl_WorkGroupID.x * uint(ROWS);
   uint t = gl_LocalInvocationID.x;
   uint blocks = params.cols / 256u;
   uint tt = params.tensor_type;
@@ -117,15 +125,19 @@ void main() {
   uint row_bytes = blocks * block_bytes;
   uint index = t * 4u;
   uint positions = min(params.positions, uint(MAXP));
-  float acc[MAXP]; float mins[MAXP];
-  for (uint p = 0u; p < MAXP; p++) { acc[p] = 0.0; mins[p] = 0.0; }
+  float acc[ROWS * PCAP]; float mins[ROWS * PCAP];
+  for (uint k = 0u; k < uint(ROWS) * uint(PCAP); k++) { acc[k] = 0.0; mins[k] = 0.0; }
 #ifdef PFIX
-  if (params.positions != POSITIONS) { if (t == 0u && row < params.rows) outp[row] = uintBitsToFloat(0x7fc00001u); return; }   // a NaN says the binary was built for another P
+  if (params.positions != POSITIONS) { if (t == 0u && row0 < params.rows) outp[row0] = uintBitsToFloat(0x7fc00001u); return; }   // a NaN says the binary was built for another P
 #endif
-  if (row < params.rows) {
-    uint rowbase = row * row_bytes;
-    for (uint block = 0u; block < blocks; block++) {
-      uint wb = rowbase + block * block_bytes;
+  uint nrows = min(uint(ROWS), params.rows - min(row0, params.rows));
+  for (uint block = 0u; block < blocks; block++) {
+    uint xb = block * 256u + index;
+    vec4 y[PCAP];
+    for (uint p = 0u; p < POSITIONS; p++) y[p] = x4[(p * params.cols + xb) >> 2u];   // index is t*4 + multiples of 256: always vec4-aligned
+    for (uint r = 0u; r < uint(ROWS); r++) {
+      if (r >= nrows) break;
+      uint wb = (row0 + r) * row_bytes + block * block_bytes;
       vec4 qf; float ws = 0.0, wm = 0.0;    // this thread's four dequantized values: ws * q (- wm per activation sum)
       if (tt == 12u || tt == 13u) {
         uint j = index / 32u;
@@ -139,28 +151,28 @@ void main() {
         uint sb = weight_byte(wb + 192u + j);
         qf = vec4(q6_word_values(wb, index)); ws = weight_half(wb + 208u) * float((sb >= 128u) ? int(sb) - 256 : int(sb));
       }
-      uint xb = block * 256u + index;
 #ifdef HALF
       f16vec2 qlo = f16vec2(qf.xy), qhi = f16vec2(qf.zw);
 #endif
       for (uint p = 0u; p < POSITIONS; p++) {
-        uint xp = p * params.cols + xb;
-        vec4 y = x4[xp >> 2u];   // index is t*4 + multiples of 256: always vec4-aligned
 #ifdef HALF
-        f16vec2 p0 = qlo * f16vec2(y.xy), p1 = qhi * f16vec2(y.zw);
-        acc[p] += ws * (float(p0.x) + float(p0.y) + float(p1.x) + float(p1.y));
+        f16vec2 p0 = qlo * f16vec2(y[p].xy), p1 = qhi * f16vec2(y[p].zw);
+        acc[r * uint(PCAP) + p] += ws * (float(p0.x) + float(p0.y) + float(p1.x) + float(p1.y));
 #else
-        acc[p] += ws * dot(qf, y);
+        acc[r * uint(PCAP) + p] += ws * dot(qf, y[p]);
 #endif
-        mins[p] += wm * (y.x + y.y + y.z + y.w);
+        mins[r * uint(PCAP) + p] += wm * (y[p].x + y[p].y + y[p].z + y[p].w);
       }
     }
   }
-  for (uint p = 0u; p < POSITIONS; p++) partial[p * 64u + t] = acc[p] - mins[p];
+  for (uint r = 0u; r < uint(ROWS); r++) for (uint p = 0u; p < POSITIONS; p++) partial[(r * uint(PCAP) + p) * 64u + t] = acc[r * uint(PCAP) + p] - mins[r * uint(PCAP) + p];
   barrier();
   for (uint stride = 32u; stride > 0u; stride >>= 1u) {
-    if (t < stride) for (uint p = 0u; p < POSITIONS; p++) partial[p * 64u + t] += partial[p * 64u + t + stride];
+    if (t < stride) for (uint r = 0u; r < uint(ROWS); r++) for (uint p = 0u; p < POSITIONS; p++) partial[(r * uint(PCAP) + p) * 64u + t] += partial[(r * uint(PCAP) + p) * 64u + t + stride];
     barrier();
   }
-  if (t < POSITIONS && row < params.rows) outp[t * params.rows + row] = partial[t * 64u];
+  if (t < uint(ROWS) * POSITIONS) {
+    uint r = t / POSITIONS, p = t - r * POSITIONS;
+    if (r < nrows) outp[p * params.rows + row0 + r] = partial[(r * uint(PCAP) + p) * 64u];
+  }
 }

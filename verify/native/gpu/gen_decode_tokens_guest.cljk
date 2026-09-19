@@ -108,12 +108,12 @@
             :wide-i8 "kdot_i8_x8r4.spv" :lm-i8 "kdot_i8_x8r4.spv"}
    "anv-exact" {:wide "kdot_x8r4.spv" :narrow "kdot_f32_r1.spv" :lm "kdot_x8r4.spv" :expert "kdot_f32_r8.spv" :out "kdot_f32_r1.spv"}   ;; wide / lm -> x8r4 (iteration 33: 2.97 -> 2.82 ms; experts on x8r8 lose, 3.27), experts r8 (iteration 27), out r1 (iteration 28)
    "anv-dual" {:wide "kdot_f32_r8.spv" :narrow "kdot_f32_r1.spv" :lm "kdot_f32_r8.spv" :expert "kdot_f32_r8.spv" :expert-dual "kdot_f32_r8_dual.spv"}   ;; experiment: gate + up + silu in one dispatch (iteration 28)
-   "radv"  {:wide "kdot_f32_r8.spv" :narrow "kdot_f32_r1.spv" :lm "kdot_f32_r1.spv"}
+   "radv"  {:wide "kdot_f32_r8.spv" :narrow "kdot_f32_r1.spv" :lm "kdot_f32_r1.spv" :lm-once true}   ;; batch: lm_head read once via the positions kernel (iteration 52: B=2 49.2 -> 36.9 ms)
    ;; nvgpu default = packed-half dequant (kdot_h2_r1) since iteration 15: over all
    ;; 40 layers KL(oracle||h2) = 8.5e-4 nats and KL(llama.cpp||h2) = 0.0142, the same
    ;; as the exact kernel's 0.0167 -- llama.cpp itself is ~0.015 from the f64 oracle.
    ;; 12L x 3T 48.5 -> 39.3 ms/token. "nvgpu-exact" keeps the f32 path (s4).
-   "nvgpu"       {:wide "kdot_h2_r1.spv" :narrow "kdot_h2_r1.spv" :lm "kdot_h2q6_r1.spv"}   ;; lm_head on the Q6_K half path (separate binary) since iteration 21
+   "nvgpu"       {:wide "kdot_h2_r1.spv" :narrow "kdot_h2_r1.spv" :lm "kdot_h2q6_r1.spv" :lm-once true}   ;; lm_head on the Q6_K half path (separate binary) since iteration 21; batch: read once (iteration 52: B=2 77.4 -> 60.8 ms)
    "nvgpu-exact" {:wide "kdot_s4_r1.spv" :narrow "kdot_s4_r1.spv" :lm "kdot_s4_r1.spv"}})
 (def layouts (or (layout-table backend) (do (println "REFUSE unknown backend" backend) (js/process.exit 2))))
 ;; --- GGUF directory (header only) ---
@@ -224,8 +224,12 @@
 ;; per-position accumulators in registers (Xavier 12L 174 -> 99 ms, 40L 545 -> 317 ms; K16 -4 %, B70 -6 %).
 ;; The pipeline itself is created per phase (phase-metas :kdot-p) and bound by with-phase.
 (def ^:dynamic kdot-p nil)   ;; the P-position kdot of the phase being emitted (set below from phase-decode, rebound by with-phase)
-(defn pkdot! [pipe spv rows meta w x out ids] (if prefill? (dispatch! kdot-p rows 1 1 meta w x out ids) (dispatch! pipe (wg-of spv rows) PF 1 meta w x out ids)))
-(defn pkdotc! [pipe spv rows meta w x out ids] (if prefill? (dispatchc! kdot-p rows 1 1 meta w x out ids) (dispatchc! pipe (wg-of spv rows) PF 1 meta w x out ids)))
+;; PROWS: rows per workgroup of the positions kernel (kdot_f32_p<P>r<R>.spv, -DROWS=R; iteration 52): the r8 shape
+;; with the positions inner loop. Per backend (layout :prows), overridable with NEX_PROWS for the sweep.
+(def PROWS (js/parseInt (or (aget js/process.env "NEX_PROWS") (str (get layouts :prows 1)))))
+(defn pwg [rows] (quot (+ rows PROWS -1) PROWS))
+(defn pkdot! [pipe spv rows meta w x out ids] (if prefill? (dispatch! kdot-p (pwg rows) 1 1 meta w x out ids) (dispatch! pipe (wg-of spv rows) PF 1 meta w x out ids)))
+(defn pkdotc! [pipe spv rows meta w x out ids] (if prefill? (dispatchc! kdot-p (pwg rows) 1 1 meta w x out ids) (dispatchc! pipe (wg-of spv rows) PF 1 meta w x out ids)))
 (def expert-spv (or (:expert layouts) (:narrow layouts)))
 (def deltanet (pipeline! "deltanet_step.spv" 8))
 (def deltanet-fused (when fused? (pipeline! "deltanet_fused.spv" 13)))
@@ -267,7 +271,7 @@
      :m-lm (if batch-phase? (kdot-meta! 248320 2048 14 pf 1 0 0) (kdot-meta! 248320 2048 14 1 0 0 (dec pf)))   ;; prefill: the lm_head reads the last batch row (pad1); batch: every row
      :m-copy-dyn (ops-meta-dyn! (* 512 pf) 1 0 512 0 0)   ;; prefill: P consecutive rows in one copy
      :m-padd (when pre? (ops-meta! pf 1 0 0 0 0))   ;; pos_add: n = the batch
-     :kdot-p (when pre? (pipeline! (str "kdot_f32_p" pf ".spv") 5))}))
+     :kdot-p (when pre? (pipeline! (str "kdot_f32_p" pf (when (> PROWS 1) (str "r" PROWS)) ".spv") 5))}))
 (def phase-decode (phase-metas PF-static prefill?))   ;; the legacy single phase (fn / prefill / stream / flat modes) and the resident decode step
 (def phase-prefill (when PB (phase-metas PB true)))
 (def phase-batch (when BB (phase-metas BB true true)))   ;; prefill-shaped (P-row kdots) with batch semantics
@@ -555,7 +559,12 @@
     (dispatch! (ops "rmsnorm") PF 1 1 m-norm x-final w-out-norm zeros16 hN zeros16 zeros16)
     (if i8-lm
       (let [[xq xs] (quant! hN 2048 hN-i8)] (dispatch! i8-lm (wg-of (:lm-i8 layouts) 248320) 1 1 m-lm w-lm xq logits zeros16 xs))
-      (dispatch! kdot-lm (wg-of (:lm layouts) 248320) (if batch? PF 1) 1 m-lm w-lm hN logits zerosP))   ;; batch: every row's logits
+      (cond
+        ;; batch: every row's logits. :lm-once backends read the 425 MB lm_head ONCE through the positions kernel (radv,
+        ;; nvgpu: bandwidth / issue bound on it); anv's x8r4 with the positions dispatch beats the f32 kernel even read B times
+        (and batch? (:lm-once layouts)) (dispatch! kdot-p (pwg 248320) 1 1 m-lm w-lm hN logits zerosP)
+        batch? (dispatch! kdot-lm (wg-of (:lm layouts) 248320) PF 1 m-lm w-lm hN logits zerosP)
+        :else (dispatch! kdot-lm (wg-of (:lm layouts) 248320) 1 1 m-lm w-lm hN logits zeros16)))
     (if (or sampling sampled?)
       ;; multi-workgroup sampler (iteration 19): 61-workgroup passes, 30 bisection rounds on tau, one final pass
       (let [h [(if sampled? m-sample-dyn m-sample) logits tokbuf posbuf sample-o sample-s amax-ids]]
