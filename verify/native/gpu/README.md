@@ -1010,3 +1010,34 @@ prefill's lm_head read row 0 (argmax 163967 = the prompt's first step) until the
 rows `x rel` ≤ 2.2e-3 (h2 experts). Decode re-checked after the rebuild (36.6 ms/token, 8/8). Conclusion for
 the next item: on Xavier a resident prefill needs an h2 positions-inner-loop kdot before it is worth its
 complexity; on B70 / K16 the f32 one already pays.
+
+## Tick 42 (2026-09-20, C-1 / C-3-7): prefill as a fn-mode program — 40 layers compile; measured on three boxes
+
+`… <backend> prefill` is now the FUNCTION program (the literal one is `prefill-flat`): the layer functions run
+`PF` rows; a recurrent layer seeds its stepbuf from the position (`pos_seed`: `[pos, 0]`, handle = `S + (SB0 − S0)`
+since states and stepbufs both run one per recurrent layer — the 5-parameter ABI has no room for a sixth) and
+runs its P delta-net steps; the step ends with `pos_add PF`; the dyn `copy_at` meta covers `512 · PF` (the
+first fn-mode run had rows 1–4 at `x rel` 8–12 with row 0 exact — only row 0 of K/V reached the cache).
+The embed already read `pos + row`. The 40-layer guest is 66 KB of source (1155 constant requests) and compiles.
+
+12 layers, the 5-token France prompt, rows vs the f64 oracle and the last row's argmax (3 runs each):
+
+| box | prefill (one command buffer) | decode 5 steps | ratio | rows | argmax |
+|---|---|---|---|---|---|
+| K16 radv | **67.3–68.1 ms** | 5 × 27.1 = 135 ms | **2.0×** | `x rel` ≤ 1.3e-5 | 128186 = oracle |
+| B70 anv | **10.3 ms** | 5 × 5.0 = 25 ms | **2.4×** | ≤ 2.7e-5 | 128186 = oracle (after the rebuild below) |
+| Xavier nvgpu | 174.4 ms | 5 × 36.6 = 183 ms | 1.05× | ≤ 2.2e-3 | 128186 = oracle |
+
+**40 layers on Xavier**: 545–558 ms for 5 tokens vs 5 × 86 = 430 ms decode — **1.27× slower than decode**;
+rows `x rel` ≤ 1.35e-2 (the h2 experts, 40 layers deep), argmax 11751 = the 40-layer oracle. Same conclusion as
+tick 41 with the sign now negative: on Xavier the f32 positions-inner-loop kdot loses to the h2 decode kernels
+it replaces. The next item is the h2 twin of `kdot_f32_p` (`-DHALF`: f16x2 dequant and activations, HFMA2 on
+Volta); until then the Xavier shell must keep feeding prompts one step at a time.
+
+**Stale kernels, second time.** B70's `kdot_x8r4.spv` / `kdot_f32_r1.spv` / `kdot_f32_r8.spv` / `kdot_i8_*` were
+built between the two prefill commits (they had `pad0`, not `pad1`), so the prefill's lm_head read row 0
+(argmax 163967) while every row was right. Rebuilt all seven from the current sources (glslang 16.6 for the
+int8 pair, `--target-env vulkan1.3`); decode re-checked 5.06 ms/token 8/8. The rule that follows: a kernel's
+`.spv` on a box is stale whenever its mtime precedes the source's last commit — check that before reading a
+mismatch as a bug (twice now: Xavier tick 41, B70 tick 42). `nex_pos_add.spv` / `nex_pos_seed.spv` built on all
+three boxes.

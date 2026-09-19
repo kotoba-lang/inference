@@ -346,6 +346,8 @@ void op_pos_incr() { if (gl_GlobalInvocationID.x == 0u) ids[0] += 1u; }   // the
 // a set flag rewinds the position to 0 (the kernels read no history at position 0, so nothing else is
 // reset), then the token goes to the token buffer at the position: b[pos] = token, as argmax_final writes it.
 void op_ctl() { if (gl_GlobalInvocationID.x == 0u) { if (floatBitsToUint(c[1]) != 0u) ids[0] = 0u; b[ids[0]] = c[0]; } }
+void op_pos_add() { if (gl_GlobalInvocationID.x == 0u) ids[0] += P.n; }   // prefill in fn mode (iteration 47): the position advances by the batch
+void op_pos_seed() { if (gl_GlobalInvocationID.x == 0u) { ids[0] = floatBitsToUint(a[0]); ids[1] = 0u; } }   // a layer's stepbuf = [the step's base position, row 0] before its P delta-net steps
 void op_pos_incr2() { if (gl_GlobalInvocationID.x == 0u) { ids[0] += 1u; ids[1] += 1u; } }   // prefill: absolute position and batch row together
 void op_add() {
   uint i = gl_GlobalInvocationID.x; if (i >= P.n) return;
@@ -368,7 +370,7 @@ void op_add_rmsnorm() {   // workgroup x = row (prefill batches P rows; decode d
 }
 
 #ifndef OP
-#error "compile with -DOP=<rmsnorm|l2norm|gated_rmsnorm|silu_mul|conv1d_step|softmax_topk|gate_decay|gate_decay2|copy_at|weighted_sum|rope_neox|attn_decode|argmax_partial|argmax_final|add|f32_matvec|add_rmsnorm|pos_incr|sample_topp|sample_part|sample_probs|sample_bisect_part|sample_bisect_step|sample_final|quant_q8|pos_incr2|ctl>"
+#error "compile with -DOP=<rmsnorm|l2norm|gated_rmsnorm|silu_mul|conv1d_step|softmax_topk|gate_decay|gate_decay2|copy_at|weighted_sum|rope_neox|attn_decode|argmax_partial|argmax_final|add|f32_matvec|add_rmsnorm|pos_incr|sample_topp|sample_part|sample_probs|sample_bisect_part|sample_bisect_step|sample_final|quant_q8|pos_incr2|ctl|pos_add|pos_seed>"
 #endif
 #define CAT2(a, b) a##b
 #define CAT(a, b) CAT2(a, b)
