@@ -164,7 +164,7 @@
 (let [argv (vec js/process.argv)
       script-index (first (keep-indexed (fn [i a]
                                           (when (str/ends-with? (str a)
-                                                                "kotodama/oracle_gen.cljs")
+                                                                "kotodama/oracle_gen.cljk")
                                             i))
                                         argv))]
   (when script-index
