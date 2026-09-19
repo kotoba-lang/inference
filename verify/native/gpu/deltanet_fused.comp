@@ -34,11 +34,23 @@ float wg_sum(uint t, float v) {
   float r = red[0]; barrier(); return r;
 }
 // conv1d step + silu for channel c, reading ring slot p; returns the activation, writes slot 1-p if `own`
+// -DBATCH (iteration 51, C-4): the rows are INDEPENDENT SEQUENCES, row = workgroup y; binding 12 holds one
+// absolute position per row (pos[row]); the ring and the state are per row (row * their single-sequence size).
+#ifdef BATCH
+#define ROW gl_WorkGroupID.y
+#define MYPOS pos[ROW]
+#else
+#define ROW pos[1]
+#define MYPOS pos[0]
+#endif
 float conv_step(uint c, uint p, bool own, uint qoff) {
   uint n = P.n, rb = p * 3u * n, wb = (1u - p) * 3u * n;
+#ifdef BATCH
+  rb += ROW * 6u * n; wb += ROW * 6u * n;
+#endif
   // position 0 has no history (iteration 43): a resident guest rewinds the position to 0 for a new
   // request and never zeroes the ring or the state, so both read as zero when pos[0] == 0.
-  bool fresh = pos[0] == 0u;
+  bool fresh = MYPOS == 0u;
   float x0 = fresh ? 0.0 : ring[rb + c], x1 = fresh ? 0.0 : ring[rb + n + c], x2 = fresh ? 0.0 : ring[rb + 2u * n + c], x3 = qkv[qoff + c];
   float y = convw[c * 4u] * x0 + convw[c * 4u + 1u] * x1 + convw[c * 4u + 2u] * x2 + convw[c * 4u + 3u] * x3;
   if (own) { ring[wb + c] = x1; ring[wb + n + c] = x2; ring[wb + 2u * n + c] = x3; }
@@ -46,8 +58,8 @@ float conv_step(uint c, uint p, bool own, uint qoff) {
 }
 void main() {
   uint h = gl_WorkGroupID.x, t = gl_LocalInvocationID.x, j = t & 127u, part = t >> 7u;
-  uint K_ = P.k_dim, V_ = P.v_dim, kh = h % P.k_heads, p = pos[0] & 1u;
-  uint row = pos[1];                          // prefill: which token of the batch; the kdot outputs are [P x n], alpha/beta [P x heads], z / out [P x heads*V_]
+  uint K_ = P.k_dim, V_ = P.v_dim, kh = h % P.k_heads, p = MYPOS & 1u;
+  uint row = ROW;                             // prefill: which token of the batch (BATCH: which sequence); the kdot outputs are [P x n], alpha/beta [P x heads], z / out [P x heads*V_]
   uint qoff = row * P.n, hoff = row * P.heads, voff = row * P.heads * V_;
   // conv on this head's channels (part 0 only; the ring is written once): q (shared with head h + k_heads), k (same), v (own)
   if (part == 0u) {
@@ -66,8 +78,11 @@ void main() {
   float decay = exp(softplus(alpha[hoff + h] + dt[h]) * ssm_a[h]), b = sigmoid(betaL[hoff + h]);
   // delta rule on the head's state (K_ x V_): this thread owns column j, keys [i0, i1)
   uint sbase = h * K_ * V_, quarter = K_ / 4u, i0 = part * quarter, i1 = i0 + quarter;
+#ifdef BATCH
+  sbase += row * P.heads * K_ * V_;
+#endif
   float kv_mem = 0.0;
-  bool fresh = pos[0] == 0u;   // no history at position 0 (iteration 43)
+  bool fresh = MYPOS == 0u;   // no history at position 0 (iteration 43)
   for (uint i = i0; i < i1; i++) { float s_ = (fresh ? 0.0 : state[sbase + i * V_ + j]) * decay; state[sbase + i * V_ + j] = s_; kv_mem += s_ * sk[i]; }
   part4[part][j] = kv_mem; barrier();
   float delta = (vc - (part4[0][j] + part4[1][j] + part4[2][j] + part4[3][j])) * b;

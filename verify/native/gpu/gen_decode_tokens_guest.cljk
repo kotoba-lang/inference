@@ -14,7 +14,7 @@
 ;; Root ADR-2609182400 C.
 (require '["fs" :as fs] '[clojure.string :as str])
 (def args (vec *command-line-args*))
-(when-not (<= 6 (count args) 11) (println "usage: <file.gguf> <layers> <tokens> <prompt-token-id[,id...]> <dir-on-box> <out.kotoba> [anv|radv|nvgpu|nvgpu-exact] [stream|flat|fn|prefill|prefill-flat] [sample:<T>:<top_p>:<seed>|-] [runtime|resident|resident-replay] [prefill:<P>]") (js/process.exit 2))
+(when-not (<= 6 (count args) 12) (println "usage: <file.gguf> <layers> <tokens> <prompt-token-id[,id...]> <dir-on-box> <out.kotoba> [anv|radv|nvgpu|nvgpu-exact] [stream|flat|fn|prefill|prefill-flat] [sample:<T>:<top_p>:<seed>|-] [runtime|resident|resident-replay] [prefill:<P>|-] [batch:<B>]") (js/process.exit 2))
 ;; runtime (fn mode, iteration 41): the prompt ids are read when the guest RUNS -- :env/read NEX_PROMPT
 ;; ("760,6511,...") written to the device with WRITEDEC -- and main takes (prompt length, tokens to
 ;; generate) as its two i64 arguments (the loader's argv; the native slice has string-from-i64 but no
@@ -33,6 +33,12 @@
 ;; buffer 1. A message of P tokens + flag ("t0,...,tP-1,f") is one batched step; a message of 2 words ("t,f") is a
 ;; decode step -- the guest tells them apart by WRITEDEC's answer (the word count), the only parse it has.
 (def PB (when-let [a (get args 10)] (when (str/starts-with? a "prefill:") (js/parseInt (subs a 8)))))
+;; batch:<B> (iteration 51, C-4): kept command buffer 3 is a DECODE step of B independent sequences -- one row each,
+;; its own position (rowpos[row]), token buffer row, KV cache slice, delta-net ring and state; the -DBATCH kernel
+;; twins (nex_*_b.spv, deltanet_fused_b.spv, embed_iq4xs_b.spv). The message is B tokens then B flags (2B words).
+(def BB (when-let [a (get args 11)] (when (str/starts-with? a "batch:") (js/parseInt (subs a 6)))))
+(when (and BB (or (not (= "resident-replay" (get args 9))) (< BB 2) (contains? #{2 5 (when PB (inc PB))} (* 2 BB))))
+  (println "REFUSE batch:" BB "-- needs resident-replay, B >= 2, and 2B not in {2, 5, P+1}") (js/process.exit 2))
 (def replay? (= "resident-replay" (get args 9)))
 (when (and PB (not replay?)) (println "REFUSE prefill:<P> needs resident-replay") (js/process.exit 2))
 ;; resident sampling (iteration 50): every resident-replay guest also records kept command buffer 2, the SAMPLED decode
@@ -81,7 +87,8 @@
 (when (and (not prefill?) (< ntok (count prompt))) (println "REFUSE tokens" ntok "< prompt length" (count prompt)) (js/process.exit 2))
 (def PF-static (if prefill? (count prompt) 1))
 (def ^:dynamic PF PF-static)   ;; batch rows of the step being EMITTED (rebound per phase: decode 1 / prefill P)
-(def PMAX (max PF-static (or PB 1)))   ;; rows every activation buffer holds
+(def PMAX (max PF-static (or PB 1) (or BB 1)))   ;; rows every activation buffer holds
+(def NSEQ (or BB 1))   ;; sequences whose state (ring, S, KV, token row) the guest holds
 
 (def backend (or (get args 6) "anv"))
 ;; Kernel layout per (backend, tensor class) -- the co-scientist table (root
@@ -223,6 +230,10 @@
 (def deltanet (pipeline! "deltanet_step.spv" 8))
 (def deltanet-fused (when fused? (pipeline! "deltanet_fused.spv" 13)))
 (def embed (pipeline! "embed_iq4xs.spv" 5))
+(def deltanet-fused-b (when BB (pipeline! "deltanet_fused_b.spv" 13)))
+(def embed-b (when BB (pipeline! "embed_iq4xs_b.spv" 5)))
+(def batch-op-names ["copy_at" "rope_neox" "attn_decode" "argmax_partial" "argmax_final" "pos_incr" "ctl"])
+(def ^:dynamic batch? false)   ;; the batch phase is being emitted
 (def w-embd (map-tensor! "token_embd.weight"))
 (def prompt-ids (alloc! (max 16 (* 4 (count prompt)))))
 (def x (alloc! (* PMAX 8192)))
@@ -236,16 +247,16 @@
 (def zerosP (let [b (alloc! (max 16 (* 4 PMAX)))] (zero! b) b))   ;; expert_ids of zeros for the P-position non-MoE kdots
 (zero! zeros16)
 (write! prompt-ids (apply str (map le32 prompt)))
-(def rings (vec (for [il (range layers) :when (= 1 (recurrent il))] (let [r (alloc! (if fused? 196608 98304))] (zero! r) r))))   ;; fused: 2 slots x 3 x 8192 (double-buffered by pos parity)
-(def states (vec (for [il (range layers) :when (= 1 (recurrent il))] (let [s (alloc! 2097152)] (zero! s) s))))
-(def kcaches (vec (for [il (range layers) :when (= 0 (recurrent il))] (let [b (alloc! (* (if runtime? 4096 (max ntok PMAX)) 2048))] (zero! b) b))))   ;; runtime: 4096-token context
-(def vcaches (vec (for [il (range layers) :when (= 0 (recurrent il))] (let [b (alloc! (* (if runtime? 4096 (max ntok PMAX)) 2048))] (zero! b) b))))   ;; runtime: 4096-token context
+(def rings (vec (for [il (range layers) :when (= 1 (recurrent il))] (let [r (alloc! (* NSEQ (if fused? 196608 98304)))] (zero! r) r))))   ;; fused: 2 slots x 3 x 8192 (double-buffered by pos parity)
+(def states (vec (for [il (range layers) :when (= 1 (recurrent il))] (let [s (alloc! (* NSEQ 2097152))] (zero! s) s))))
+(def kcaches (vec (for [il (range layers) :when (= 0 (recurrent il))] (let [b (alloc! (* NSEQ (if runtime? 4096 (max ntok PMAX)) 2048))] (zero! b) b))))   ;; runtime: 4096-token context
+(def vcaches (vec (for [il (range layers) :when (= 0 (recurrent il))] (let [b (alloc! (* NSEQ (if runtime? 4096 (max ntok PMAX)) 2048))] (zero! b) b))))   ;; runtime: 4096-token context
 ;; the metas that depend on the batch (PF) or on the prefill form are made per PHASE: decode (pf 1) and, with
 ;; prefill:<P>, prefill (pf P). `with-phase` rebinds PF / prefill? / the metas / kdot-p around an emission.
 (def ^:dynamic prefill? prefill?)
-(defn phase-metas [pf pre?]
+(defn phase-metas [pf pre? & [batch-phase?]]
   (let [ipe (if pre? 1 0)]
-    {:pf pf :pre? pre?
+    {:pf pf :pre? pre? :batch? (boolean batch-phase?)
      :m-norm (ops-meta! 2048 pf 0 0 eps 0) :m-qkv (kdot-meta! 8192 2048 13 pf ipe) :m-gate (kdot-meta! 4096 2048 23 pf ipe)
      :m-ab (kdot-meta! 32 2048 23 pf ipe) :m-out (kdot-meta! 2048 4096 23 pf ipe)
      :m-q (kdot-meta! 8192 2048 23 pf ipe) :m-k (kdot-meta! 512 2048 23 pf ipe) :m-v (kdot-meta! 512 2048 13 pf ipe)
@@ -253,12 +264,13 @@
      :m-gate-exps (kdot-meta! 512 2048 23 (* 8 pf) ipe (if pre? 8 0)) :m-down-exps (kdot-meta! 2048 512 23 (* 8 pf) 1)
      :m-silu8 (ops-meta! (* pf 4096) 1 0 0 0 0) :m-gate-sh (kdot-meta! 512 2048 23 pf ipe) :m-down-sh (kdot-meta! 2048 512 23 pf ipe)
      :m-silu-sh (ops-meta! (* pf 512) 1 0 0 0 0) :m-add (ops-meta! (* pf 2048) 1 0 0 0 0)
-     :m-lm (kdot-meta! 248320 2048 14 1 0 0 (dec pf))   ;; prefill: the lm_head reads the last batch row (pad1)
+     :m-lm (if batch-phase? (kdot-meta! 248320 2048 14 pf 1 0 0) (kdot-meta! 248320 2048 14 1 0 0 (dec pf)))   ;; prefill: the lm_head reads the last batch row (pad1); batch: every row
      :m-copy-dyn (ops-meta-dyn! (* 512 pf) 1 0 512 0 0)   ;; prefill: P consecutive rows in one copy
      :m-padd (when pre? (ops-meta! pf 1 0 0 0 0))   ;; pos_add: n = the batch
      :kdot-p (when pre? (pipeline! (str "kdot_f32_p" pf ".spv") 5))}))
 (def phase-decode (phase-metas PF-static prefill?))   ;; the legacy single phase (fn / prefill / stream / flat modes) and the resident decode step
 (def phase-prefill (when PB (phase-metas PB true)))
+(def phase-batch (when BB (phase-metas BB true true)))   ;; prefill-shaped (P-row kdots) with batch semantics
 ;; root values = the decode phase, so every legacy emission sees them unbound
 (def ^:dynamic m-norm (:m-norm phase-decode)) (def ^:dynamic m-qkv (:m-qkv phase-decode)) (def ^:dynamic m-gate (:m-gate phase-decode))
 (def ^:dynamic m-ab (:m-ab phase-decode)) (def ^:dynamic m-out (:m-out phase-decode)) (def ^:dynamic m-q (:m-q phase-decode))
@@ -272,7 +284,7 @@
                  #'m-silu-sh :m-silu-sh #'m-add :m-add #'m-lm :m-lm #'m-copy-dyn :m-copy-dyn #'m-padd :m-padd #'kdot-p :kdot-p})
 (defn with-phase [ph f]
   (with-bindings (merge (into {} (map (fn [[v k]] [v (get ph k)]) phase-vars))
-                        {#'PF (:pf ph) #'prefill? (:pre? ph)
+                        {#'PF (:pf ph) #'prefill? (:pre? ph) #'batch? (:batch? ph)
                          #'i8-wide (when-not (:pre? ph) i8-wide*) #'i8-lm (when-not (:pre? ph) i8-lm*)
                          #'i8-expert (when-not (:pre? ph) i8-expert*) #'kdot-expert-dual (when-not (:pre? ph) kdot-expert-dual*)})
     (f))) (def m-gd (ops-meta! 32 32 32 0 0 0)) (def m-gd0 (ops-meta! 32 32 0 0 0 0)) (def m-conv (ops-meta! 8192 1 0 0 0 0))
@@ -285,7 +297,7 @@
 (def m-addn (ops-meta! 2048 1 0 0 eps 0)) (def m-router (ops-meta! 2048 256 0 0 0 0)) (def m-topk (ops-meta! 256 1 8 0 0 1.0))
 (def m-shlogit (ops-meta! 2048 1 0 0 0 0)) (def m-wsum (ops-meta! 2048 1 8 0 0 0))
 (def w-out-norm (map-tensor! "output_norm.weight")) (def w-lm (map-tensor! "output.weight"))
-(def hN (alloc! (* PMAX 8192))) (def logits (alloc! (* 248320 4))) (def amax-s (alloc! 256)) (def amax-ids (alloc! 256))
+(def hN (alloc! (* PMAX 8192))) (def logits (alloc! (* NSEQ 248320 4))) (def amax-s (alloc! (* NSEQ 256))) (def amax-ids (alloc! (* NSEQ 256)))   ;; batch: one row of 64 slots per sequence
 (def m-am1 (ops-meta! 248320 1 61 0 0 0)) (def m-am2 (ops-meta! 248320 1 61 0 0 0))
 ;; int8 twins of the activations the i8 kdots read: [xq xs] per buffer, and one quant meta per value count
 (def q-metas (when quant {2048 (ops-meta! 2048 1 0 0 0 0) 4096 (ops-meta! 4096 1 0 0 0 0)}))
@@ -305,11 +317,19 @@
 (def m-ropeq-dyn (ops-meta-dyn! 256 16 nrot 0 0 rope-base)) (def m-ropek-dyn (ops-meta-dyn! 256 2 nrot 0 0 rope-base))
 (def m-attn-dyn (ops-meta-dyn! 256 16 0 2 -1.0 (/ 1.0 16.0)))
 ;; fn mode: the token buffer holds the prompt, then argmax_final appends each next token; embed reads slot pos
-(def tokbuf (let [b (alloc! (if runtime? (* 4 4096) (max 16 (* 4 (+ ntok 1)) (* 4 (count prompt)))))] (when-not runtime? (write! b (apply str (map le32 prompt)))) b))   ;; holds the prompt and every decoded token (runtime: 4096 slots, filled by WRITEDEC)
+(def tokbuf (let [b (alloc! (if runtime? (* NSEQ 4 4096) (max 16 (* 4 (+ ntok 1)) (* 4 (count prompt)))))] (when-not runtime? (write! b (apply str (map le32 prompt)))) b))   ;; holds the prompt and every decoded token (runtime: 4096 slots, filled by WRITEDEC)
 (def m-embed-dyn (let [m (alloc! 16)] (write! m (str (le32 2048) (le32 0) (le32 1) (le32 0))) m))
+;; batch: rowpos = one absolute position per sequence; the token buffer row stride is 4096 (embed pad1, ctl aux)
+(def rowpos (when BB (let [b (alloc! (max 16 (* 4 BB)))] (zero! b) b)))
+(def m-embed-b (when BB (let [m (alloc! 16)] (write! m (str (le32 2048) (le32 0) (le32 1) (le32 4096))) m)))
+(def m-copy-b (when BB (ops-meta! 512 1 (* 4096 512) 512 0 0)))   ;; n per row, aux = cache stride per sequence, aux2 = per position
 (def m-am2-dyn (let [m (alloc! 32)] (write! m (str (le32 248320) (le32 1) (le32 61) (le32 (if resident? 4096 (count prompt))) (lef32 0) (lef32 0) (lef32 0) (lef32 1))) m))   ;; resident: the shell is the only writer of the token buffer
-(def ctrl (when resident? (alloc! (max 20 (* 4 (inc (or PB 1)))))))   ;; >= 5 words: the sampled message   ;; resident: "<token id>,<reset flag>" (or P tokens + flag) lands here (WRITEDEC), read by ctl
+(def ctrl (when resident? (alloc! (max 20 (* 4 (inc (or PB 1))) (* 8 (or BB 1))))))   ;; >= 5 words: the sampled message   ;; resident: "<token id>,<reset flag>" (or P tokens + flag) lands here (WRITEDEC), read by ctl
 (def m-ctlP (when PB (ops-meta! PB 1 0 0 0 0)))   ;; ctl with n = P tokens
+(def m-ctlB (when BB (ops-meta! BB 1 4096 0 0 0)))   ;; batch ctl: n = B rows, aux = token-buffer row stride
+(def m-incrB (when BB (ops-meta! BB 1 0 0 0 0)))   ;; batch pos_incr: every row
+(def ops-b (when BB (into {} (for [op batch-op-names] [op (pipeline! (str "nex_" op "_b.spv") 7)]))))
+(defn op* [nm] (if (and batch? (contains? ops-b nm)) (ops-b nm) (ops nm)))   ;; the phase's kernel twin
 (def m-incr (ops-meta! 1 1 0 0 0 0))
 ;; sampler meta: n rows aux(=ids slot 61) aux2(=prompt length) eps(=T) scale(=top_p) p0(=seed bits) p1(=1)
 (def m-sample (when sampling (let [m (alloc! 32)] (write! m (str (le32 248320) (le32 1) (le32 61) (le32 (count prompt)) (lef32 (:T sampling)) (lef32 (:top-p sampling)) (le32 (:seed sampling)) (lef32 1))) m)))
@@ -339,7 +359,7 @@
 
 ;; one layer's dispatches, for any handle representation (literal or "$symbol")
 (defn emit-layer! [il w xin xout ring S kc vc mrq mrk mattn mcopy pb & [sb]]
-        (when (and prefill? sb fn-mode?) (dispatch! (ops "pos_seed") 1 1 1 m-incr pb zeros16 zeros16 zeros16 zeros16 sb))   ;; stepbuf = [base position, row 0]
+        (when (and prefill? sb fn-mode? (not batch?)) (dispatch! (ops "pos_seed") 1 1 1 m-incr pb zeros16 zeros16 zeros16 zeros16 sb))   ;; stepbuf = [base position, row 0]
         (dispatch! (ops "rmsnorm") PF 1 1 m-norm xin (:norm w) zeros16 h zeros16 zeros16)
         (if (= 1 (recurrent il))
           (do
@@ -353,12 +373,14 @@
             (pkdotc! kdot-narrow (:narrow layouts) 32 m-ab (:alpha w) h alpha zerosP)
             (pkdotc! kdot-narrow (:narrow layouts) 32 m-ab (:beta w) h betaL zerosP)
             (if fused?
-              (if prefill?
+              (cond
+                batch? (dispatch! deltanet-fused-b 32 PF 1 m-fused qkv (:conv w) ring alpha betaL (:dt w) (:a w) S (:ssm-norm w) z gnorm pb)   ;; C-4: one dispatch, row = sequence, pb = rowpos
+                prefill?
                 (let [sb (or sb (stepbufs (count (filter #(= 1 (recurrent %)) (range il)))))]
                   (dotimes [_ PF]
                     (dispatch! deltanet-fused 32 1 1 m-fused qkv (:conv w) ring alpha betaL (:dt w) (:a w) S (:ssm-norm w) z gnorm sb)
                     (dispatch! (ops "pos_incr2") 1 1 1 m-incr zeros16 zeros16 zeros16 zeros16 zeros16 sb)))
-                (dispatch! deltanet-fused 32 1 1 m-fused qkv (:conv w) ring alpha betaL (:dt w) (:a w) S (:ssm-norm w) z gnorm pb))
+                :else (dispatch! deltanet-fused 32 1 1 m-fused qkv (:conv w) ring alpha betaL (:dt w) (:a w) S (:ssm-norm w) z gnorm pb))
               (do
                 (dispatch! (ops "gate_decay2") 1 1 1 m-gd alpha (:dt w) (:a w) gb betaL zeros16)
                 (dispatchc! (ops "gate_decay2") 1 1 1 m-gd0 alpha (:dt w) (:a w) beta-only betaL zeros16)
@@ -376,11 +398,14 @@
             (pkdotc! kdot-narrow (:narrow layouts) 512 m-v (:v w) h vproj zerosP)
             (dispatch! (ops "rmsnorm") (* 16 PF) 1 1 m-qnorm qfull (:qn w) zeros16 qnorm zeros16 zeros16)
             (dispatchc! (ops "rmsnorm") (* 2 PF) 1 1 m-knorm kproj (:kn w) zeros16 knorm zeros16 zeros16)
-            (dispatch! (ops "rope_neox") (* 16 PF) 1 1 mrq qnorm zeros16 zeros16 qrope zeros16 pb)
-            (dispatchc! (ops "rope_neox") (* 2 PF) 1 1 mrk knorm zeros16 zeros16 krope zeros16 pb)
-            (dispatchc! (ops "copy_at") (* 2 PF) 1 1 mcopy vproj zeros16 zeros16 vc zeros16 pb)
-            (dispatch! (ops "copy_at") (* 2 PF) 1 1 mcopy krope zeros16 zeros16 kc zeros16 pb)
-            (dispatch! (ops "attn_decode") 16 PF 1 mattn qrope kc vc attno qfull pb)
+            (dispatch! (op* "rope_neox") (* 16 PF) 1 1 mrq qnorm zeros16 zeros16 qrope zeros16 pb)
+            (dispatchc! (op* "rope_neox") (* 2 PF) 1 1 mrk knorm zeros16 zeros16 krope zeros16 pb)
+            (if batch?
+              (do (dispatchc! (op* "copy_at") 2 PF 1 mcopy vproj zeros16 zeros16 vc zeros16 pb)   ;; C-4: (2, B): row's 512 into its cache slice at its position
+                  (dispatch! (op* "copy_at") 2 PF 1 mcopy krope zeros16 zeros16 kc zeros16 pb))
+              (do (dispatchc! (ops "copy_at") (* 2 PF) 1 1 mcopy vproj zeros16 zeros16 vc zeros16 pb)
+                  (dispatch! (ops "copy_at") (* 2 PF) 1 1 mcopy krope zeros16 zeros16 kc zeros16 pb)))
+            (dispatch! (op* "attn_decode") 16 PF 1 mattn qrope kc vc attno qfull pb)
             (pkdot! kdot-out out-spv 2048 m-attn-o (:o w) attno attn-out zerosP)))
         (dispatch! (ops "add_rmsnorm") PF 1 1 m-addn xin attn-out (:post w) resid h2 zeros16)
         ;; barrier groups (DISPATCHC = independent of everything since the last DISPATCH)
@@ -490,7 +515,7 @@
 (defn fn-body-src [fname keys rec?]
   (reset! lines [])
   (let [w (into {} (map-indexed (fn [i k] [k (hexpr (str "(+ w0 " i ")"))]) keys))]
-    (emit-layer! (if rec? 0 3) w (hexpr "xin") (hexpr "xout") (when rec? (hexpr "ring")) (when rec? (hexpr "S")) (when-not rec? (hexpr "kc")) (when-not rec? (hexpr "vc")) m-ropeq-dyn m-ropek-dyn m-attn-dyn m-copy-dyn posbuf
+    (emit-layer! (if rec? 0 3) w (hexpr "xin") (hexpr "xout") (when rec? (hexpr "ring")) (when rec? (hexpr "S")) (when-not rec? (hexpr "kc")) (when-not rec? (hexpr "vc")) m-ropeq-dyn m-ropek-dyn m-attn-dyn (if batch? m-copy-b m-copy-dyn) (if batch? rowpos posbuf)
                  (when (and rec? prefill?) (hexpr (str "(+ S " (- (js/parseInt (first stepbufs)) (js/parseInt (first states))) ")")))))   ;; stepbuf handle = S + (SB0 - S0): both run one per recurrent layer
   (let [params (concat ["w0" "xin" "xout"] (if rec? ["ring" "S"] ["kc" "vc"])) body @lines]
     (str "(defn " fname " [" (str/join " " (map #(str % " :i64") params)) "] :string\n"
@@ -521,14 +546,16 @@
   (reset! lines [])
   (let [x-final (if (odd? (dec layers)) xb xa)]
     (step! (q "BEGIN"))
-    (when resident? (dispatch! (ops "ctl") 1 1 1 ctl-meta zeros16 tokbuf ctrl zeros16 zeros16 posbuf))
+    (when resident? (dispatch! (op* "ctl") 1 1 1 ctl-meta zeros16 tokbuf ctrl zeros16 zeros16 (if batch? rowpos posbuf)))
     (when sampled? (dispatch! (ops "params") 1 1 1 m-params zeros16 zeros16 ctrl m-sample-dyn zeros16 zeros16))   ;; T / top_p / seed from the message
-    (dispatch! embed 1 PF 1 m-embed-dyn w-embd tokbuf x posbuf)
+    (if batch?
+      (dispatch! embed-b 1 PF 1 m-embed-b w-embd tokbuf x rowpos)
+      (dispatch! embed 1 PF 1 m-embed-dyn w-embd tokbuf x posbuf))
     (step! (str "(" layers-name " 0 " layers ")"))
     (dispatch! (ops "rmsnorm") PF 1 1 m-norm x-final w-out-norm zeros16 hN zeros16 zeros16)
     (if i8-lm
       (let [[xq xs] (quant! hN 2048 hN-i8)] (dispatch! i8-lm (wg-of (:lm-i8 layouts) 248320) 1 1 m-lm w-lm xq logits zeros16 xs))
-      (dispatch! kdot-lm (wg-of (:lm layouts) 248320) 1 1 m-lm w-lm hN logits zeros16))
+      (dispatch! kdot-lm (wg-of (:lm layouts) 248320) (if batch? PF 1) 1 m-lm w-lm hN logits zerosP))   ;; batch: every row's logits
     (if (or sampling sampled?)
       ;; multi-workgroup sampler (iteration 19): 61-workgroup passes, 30 bisection rounds on tau, one final pass
       (let [h [(if sampled? m-sample-dyn m-sample) logits tokbuf posbuf sample-o sample-s amax-ids]]
@@ -536,15 +563,20 @@
         (apply dispatch! (ops "sample_probs") 61 1 1 h)
         (dotimes [_ 30] (apply dispatch! (ops "sample_bisect_part") 61 1 1 h) (apply dispatch! (ops "sample_bisect_step") 1 1 1 h))
         (apply dispatch! (ops "sample_final") 1 1 1 h))
-      (do (dispatch! (ops "argmax_partial") 61 1 1 m-am1 logits zeros16 zeros16 zeros16 amax-s amax-ids)
-          (dispatch! (ops "argmax_final") 1 1 1 m-am2-dyn amax-s tokbuf posbuf amax-s amax-s amax-ids)))
-    (if prefill?
-      (dispatch! (ops "pos_add") 1 1 1 m-padd zeros16 zeros16 zeros16 zeros16 zeros16 posbuf)
-      (dispatch! (ops "pos_incr") 1 1 1 m-incr zeros16 zeros16 zeros16 zeros16 zeros16 posbuf))
+      (do (dispatch! (op* "argmax_partial") 61 (if batch? PF 1) 1 m-am1 logits zeros16 zeros16 zeros16 amax-s amax-ids)
+          (dispatch! (op* "argmax_final") 1 (if batch? PF 1) 1 m-am2-dyn amax-s tokbuf posbuf amax-s amax-s amax-ids)))
+    (cond
+      batch? (dispatch! (op* "pos_incr") 1 1 1 m-incrB zeros16 zeros16 zeros16 zeros16 zeros16 rowpos)
+      prefill? (dispatch! (ops "pos_add") 1 1 1 m-padd zeros16 zeros16 zeros16 zeros16 zeros16 posbuf)
+      :else (dispatch! (ops "pos_incr") 1 1 1 m-incr zeros16 zeros16 zeros16 zeros16 zeros16 posbuf))
     @lines))
 (defn indent-lines [ls] (str/join "\n" (map #(if (str/starts-with? % "(layers") (str "      " %) (str "      (gpu " % ")")) ls)))
 (def prefill-step-lines (when PB (with-phase phase-prefill #(step-lines! m-ctlP "layers-p"))))
 (def sampled-step-lines (when replay? (step-lines! m-incr "layers" true)))
+(def fn-rec-b-src (when BB (with-phase phase-batch #(fn-body-src "recurrent-layer-b" rec-keys true))))
+(def fn-att-b-src (when BB (with-phase phase-batch #(fn-body-src "attention-layer-b" att-keys false))))
+(def fn-layers-b-src (when BB (layers-src "-b")))
+(def batch-step-lines (when BB (with-phase phase-batch #(step-lines! m-ctlB "layers-b"))))
 (def fn-token-src (when fn-mode?
   (step-lines! m-incr "layers")
   (let [x-final (if (odd? (dec layers)) xb xa)]
@@ -571,6 +603,13 @@
                                                    (= % (q "BEGIN")) "      (gpu \"BEGINK 2\")"
                                                    :else (str "      (gpu " % ")")) sampled-step-lines)) "\n"
                        "      (gpu \"SUBMIT\")))\n"))
+                (when BB
+                  (str ";; batch:" BB " (iteration 51, C-4): kept command buffer 3 -- B sequences, one row each; message = B tokens then B flags\n"
+                       "(defn record-batch [] :string\n  (do\n"
+                       (str/join "\n" (map #(cond (str/starts-with? % "(layers") (str "      " %)
+                                                   (= % (q "BEGIN")) "      (gpu \"BEGINK 3\")"
+                                                   :else (str "      (gpu " % ")")) batch-step-lines)) "\n"
+                       "      (gpu \"SUBMIT\")))\n"))
                 (when PB
                   (str ";; prefill:" PB " (iteration 49): the P-token step as kept command buffer 1; a message of P tokens + flag replays it\n"
                        "(defn record-prefill [] :string\n  (do\n"
@@ -583,7 +622,10 @@
                 "    (if (string=? line \"\")\n      n\n      (do\n"
                 (if replay?
                   (str "      (let [nw (gpu (string-concat \"WRITEDEC " ctrl " 0 \" line))]\n"
-                       "      (let [ns (if (string=? nw \"2\") (gpu \"REPLAY 0\") (if (string=? nw \"5\") (gpu \"REPLAY 2\") (gpu \"REPLAY 1\")))\n            idr (gpu \"READ " amax-ids " 244 4\")]\n"
+                       "      (let [ns (if (string=? nw \"2\") (gpu \"REPLAY 0\") (if (string=? nw \"5\") (gpu \"REPLAY 2\") "
+                       (if BB (str "(if (string=? nw \"" (* 2 BB) "\") (gpu \"REPLAY 3\") (gpu \"REPLAY 1\"))") "(gpu \"REPLAY 1\")") "))\n"
+                       ;; batch: the reply carries every row's 64 slots (slot 61 = the pick); single steps write row 0
+                       "            idr (gpu \"READ " amax-ids " " (if BB (str "0 " (* 256 BB)) "244 4") "\")]\n"
                        (when (aget js/process.env "NEX_DEBUG_TOKBUF") (str "      (typed-cap-call :io/write-error :string :string (string-concat \"TOKBUF \" (string-concat (gpu \"READ " tokbuf " 0 64\") (string-concat \" POS \" (string-concat (gpu \"READ " posbuf " 0 4\") \"\\n\")))))\n")))
                   (str "      (gpu (string-concat \"WRITEDEC " ctrl " 0 \" line))\n"
                        (if replay?
@@ -615,7 +657,7 @@
               (if (and runtime? (not resident?)) "(ns gpu.decode-tokens (:export [main serve]))\n" "(ns gpu.decode-tokens (:export [main]))\n")
               "(defn gpu [r :string] :string\n  (typed-cap-call :gpu/compute :string :string r))\n"
               (when stream? (str rec-body-src att-body-src layer-fns-src))
-              (when fn-mode? (str fn-rec-src fn-att-src fn-layers-src (when PB (str fn-rec-p-src fn-att-p-src fn-layers-p-src)) fn-token-src))
+              (when fn-mode? (str fn-rec-src fn-att-src fn-layers-src (when PB (str fn-rec-p-src fn-att-p-src fn-layers-p-src)) (when BB (str fn-rec-b-src fn-att-b-src fn-layers-b-src)) fn-token-src))
               ;; runtime: `main` must take no arguments (frontend rule), so the entry with arguments is the
               ;; exported `serve [plen ntok]` -- extract-native --symbol serve, run with arity 2 and the two
               ;; i64s on the loader's argv; `main` runs `serve` with the build-time counts.
@@ -625,7 +667,7 @@
               "    (do\n" (str/join "\n" (map #(str "      (gpu " % ")") const-steps)) "\n"
               (if fn-mode?
                 (cond
-                  replay? (str "      (record-step)\n      (record-sampled)\n" (when PB "      (record-prefill)\n") "      (string-from-i64 (serve-loop 0))")
+                  replay? (str "      (record-step)\n      (record-sampled)\n" (when PB "      (record-prefill)\n") (when BB "      (record-batch)\n") "      (string-from-i64 (serve-loop 0))")
                   resident? "      (string-from-i64 (serve-loop 0))"
                   runtime?
                   (str "      (let [prompt (typed-cap-call :env/read :string :string \"NEX_PROMPT\")]\n"

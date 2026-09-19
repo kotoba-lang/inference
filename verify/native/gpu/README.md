@@ -1137,3 +1137,36 @@ as before; the haiku at T 0.7 / top_p 0.9: seed 7 → a finished haiku in 22 tok
 tokens of reasoning about syllables (11.5 s) — sampled steps cost ≈ 90–95 ms against 86 greedy. When the
 120-token cap lands inside the think block, the whole text comes back as `content` (there was no `</think>`
 to split on) — same as a truncated llama-server answer, noted.
+
+## Tick 46 (2026-09-20, C-4): batching — B independent sequences in one step
+
+`… resident-replay prefill:<P> batch:<B>` records kept command buffer 3, a decode step of B rows where the
+rows are SEQUENCES: each has its own absolute position (`rowpos[row]`), token-buffer row (stride 4096), KV
+cache slice (`row × 4096 × 512`), delta-net ring and state (`row × their single-sequence size`). Kernel twins
+under `-DBATCH` (`nex_<op>_b.spv` for copy_at / rope_neox / attn_decode / argmax_partial / argmax_final /
+pos_incr / ctl, `deltanet_fused_b.spv`, `embed_iq4xs_b.spv`): row = workgroup y, position from `pos[row]`,
+per-row offsets; the B-row kdots are the prefill phase's (`kdot_f32_p<B>`, MoE experts with `8B` positions),
+the lm_head runs `positions = B`, argmax keeps 64 slots per row (the pick at slot 61). The message is
+`B tokens, B flags` (2B words: flag = rewind that row), so 2B ∉ {2, 5, P+1}; the reply is every row's 64 slots.
+Buffers grow by NSEQ = B (rings, states, caches, token buffer, logits, argmax partials). `batch_drive.py` runs
+B prompts with their own budgets; an idle row is fed token 0 with flag 1.
+
+**Correct on all three boxes**: K16 B=2 (France + 8 and Hello + 2) both rows = their single-sequence oracle;
+K16 B=4 with the two prompts duplicated → the duplicates produce identical sequences and all four match
+(4/4); B70 B=2 2/2; Xavier B=2 2/2 and B=4 4/4 (the two continued Hello rows agree across boxes).
+
+**Throughput, 12 layers, GPU ms per step** (the batch step's kdots are the f32 positions-inner-loop kernel, not
+each backend's tuned decode layout — that is what the numbers say):
+
+| box | single decode step | batch step B=1 | B=2 | B=4 | seq-tokens/s: single → B=2 → B=4 |
+|---|---|---|---|---|---|
+| K16 radv | 27.1 ms | 48.5 | 49.2 | 84.3 | 36.9 → 40.7 → 47.4 (+10 %, +29 %) |
+| B70 anv (int8 decode) | 5.0 | 7.83 | 7.84 | — | 200 → 255 (+28 %) |
+| Xavier nvgpu (h2 decode) | 36.6 | 77.7 | 77.4 | 135.3 | 27.3 → 25.8 → 29.6 (−5 %, +8 %) |
+
+The batch step at B=1 is 1.6–2.1× a decode step: `kdot_f32_p` (one row per workgroup, f32) is what the batch
+phase can use today, and it loses to the r8 / int8 / h2 decode layouts it replaces; B=2 costs the same as B=1
+(weights read once), B=4 about 1.7×. So the mechanism is right and the kernel is the lever: a batch-aware kdot
+per backend (positions inner loop on the r8 / x8r4 / i8 / h2 layouts) would put B=2 near 1.0× a decode step and
+the throughput near 2×. That, and the shell's scheduler (rows as slots), are the next items. Wall time in the
+harness includes the warm-up before the first message and is not the served figure.

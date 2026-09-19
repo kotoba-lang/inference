@@ -22,7 +22,11 @@ void main() {
   uint blocks = P.cols / 256u;
   if (t >= blocks * 8u) return;
   uint row = gl_WorkGroupID.y;   // prefill: token row of the batch (decode dispatches y = 1)
+#ifdef BATCH
+  uint tok = ids[row * P.pad1 + pos[row]];   // C-4 (iteration 51): rows are sequences; pad1 = token-buffer stride per row
+#else
   uint tok = ids[((P.dyn != 0u) ? pos[0] : P.slot) + row];
+#endif
   uint blk = t / 8u, ib = t & 7u;
   uint base = (tok * blocks + blk) * 136u;
   float d = weight_half(base);
