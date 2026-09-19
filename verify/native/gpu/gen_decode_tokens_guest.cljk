@@ -54,7 +54,12 @@
 ;; on RADV r8 wins attn_gate and loses the experts, and s2 LOSES (one wave64 per
 ;; workgroup pays the barriers); on ANV r1 wins everything but the lm_head.
 (def layout-table
-  {"anv"   {:wide "kdot_x8r4.spv" :narrow "kdot_f32_r1.spv" :lm "kdot_x8r4.spv" :expert "kdot_f32_r8.spv" :out "kdot_f32_r1.spv"}   ;; wide / lm -> x8r4 (iteration 33: 2.97 -> 2.82 ms; experts on x8r8 lose, 3.27), experts r8 (iteration 27), out r1 (iteration 28)
+  ;; anv default = int8 activations (quant_q8 + kdot_i8_x8r4) for the wide and lm classes since iteration 34:
+  ;; B70 40 layers KL(oracle||gpu) 3.4e-3 nats, KL(llama.cpp||gpu) 0.0054 (exact kernels: 0.0143), 4L token 2.83 -> 2.55 ms.
+  ;; "anv-exact" keeps the f32 activations. Experts on int8 gained nothing (2.58) and stay f32 r8.
+  {"anv"   {:wide "kdot_x8r4.spv" :narrow "kdot_f32_r1.spv" :lm "kdot_x8r4.spv" :expert "kdot_f32_r8.spv" :out "kdot_f32_r1.spv"
+            :wide-i8 "kdot_i8_x8r4.spv" :lm-i8 "kdot_i8_x8r4.spv"}
+   "anv-exact" {:wide "kdot_x8r4.spv" :narrow "kdot_f32_r1.spv" :lm "kdot_x8r4.spv" :expert "kdot_f32_r8.spv" :out "kdot_f32_r1.spv"}   ;; wide / lm -> x8r4 (iteration 33: 2.97 -> 2.82 ms; experts on x8r8 lose, 3.27), experts r8 (iteration 27), out r1 (iteration 28)
    "anv-dual" {:wide "kdot_f32_r8.spv" :narrow "kdot_f32_r1.spv" :lm "kdot_f32_r8.spv" :expert "kdot_f32_r8.spv" :expert-dual "kdot_f32_r8_dual.spv"}   ;; experiment: gate + up + silu in one dispatch (iteration 28)
    "radv"  {:wide "kdot_f32_r8.spv" :narrow "kdot_f32_r1.spv" :lm "kdot_f32_r1.spv"}
    ;; nvgpu default = packed-half dequant (kdot_h2_r1) since iteration 15: over all
@@ -152,6 +157,12 @@
 (def kdot-expert-dual (when (:expert-dual layouts) (pipeline! (:expert-dual layouts) 6)))   ;; gate + up + silu in one dispatch (iteration 28)
 ;; :out = the 2048-row x 4096-col output projections (ssm_out, attn_output): on r8 they get only 256 workgroups (iteration 28)
 (def kdot-out (if (:out layouts) (pipeline! (:out layouts) 5) kdot-wide))
+;; int8 activations (iteration 34): rows :wide-i8 / :lm-i8 / :expert-i8 name kdot_i8_* kernels (six bindings); the
+;; activation they read is quantized once per layer by nex_quant_q8 into a paired (xq, xscale) buffer.
+(def i8-wide (when (:wide-i8 layouts) (pipeline! (:wide-i8 layouts) 6)))
+(def i8-lm (when (:lm-i8 layouts) (pipeline! (:lm-i8 layouts) 6)))
+(def i8-expert (when (:expert-i8 layouts) (pipeline! (:expert-i8 layouts) 6)))
+(def quant (when (or i8-wide i8-lm i8-expert) (pipeline! "nex_quant_q8.spv" 7)))
 (def out-spv (or (:out layouts) (:wide layouts)))
 ;; rows per workgroup from the kernel name: ...r8.spv -> 8, ...r4.spv -> 4, x8.spv / r1 / s* / h2_r1 -> 1
 (defn rows-of-spv [spv] (if-let [m (re-find #"r(\d+)\.spv$" spv)] (js/parseInt (second m)) 1))
@@ -192,6 +203,12 @@
 (def w-out-norm (map-tensor! "output_norm.weight")) (def w-lm (map-tensor! "output.weight"))
 (def hN (alloc! 8192)) (def logits (alloc! (* 248320 4))) (def amax-s (alloc! 256)) (def amax-ids (alloc! 256))
 (def m-lm (kdot-meta! 248320 2048 14 1 0)) (def m-am1 (ops-meta! 248320 1 61 0 0 0)) (def m-am2 (ops-meta! 248320 1 61 0 0 0))
+;; int8 twins of the activations the i8 kdots read: [xq xs] per buffer, and one quant meta per value count
+(def q-metas (when quant {2048 (ops-meta! 2048 1 0 0 0 0) 4096 (ops-meta! 4096 1 0 0 0 0)}))
+(defn i8-pair! [n] (when quant [(alloc! n) (alloc! (* 4 (quot n 32)))]))
+(def h-i8 (i8-pair! 2048)) (def h2-i8 (i8-pair! 2048)) (def hN-i8 (i8-pair! 2048)) (def actE-i8 (i8-pair! 4096))
+;; emit the quant dispatch for activation x (n values) into its pair; returns the pair
+(defn quant! [x n pair] (dispatch! quant (quot (+ (quot n 32) 255) 256) 1 1 (q-metas n) x zeros16 zeros16 (second pair) zeros16 (first pair)) pair)
 ;; per-token metas: rope position, attention T, cache row, embedding source slot
 (def m-embedP (vec (for [p (range (count prompt))] (let [m (alloc! 16)] (write! m (str (le32 2048) (le32 p) (le32 0) (le32 0))) m))))   ;; slot p of prompt-ids (forced token)
 (def m-embed1 (let [m (alloc! 16)] (write! m (str (le32 2048) (le32 61) (le32 0) (le32 0))) m))    ;; slot 61 of amax-ids = the argmax
@@ -236,8 +253,13 @@
         (dispatch! (ops "rmsnorm") 1 1 1 m-norm xin (:norm w) zeros16 h zeros16 zeros16)
         (if (= 1 (recurrent il))
           (do
-            (dispatch! kdot-wide (wg-of (:wide layouts) 8192) 1 1 m-qkv (:qkv w) h qkv zeros16)
-            (dispatchc! kdot-wide (wg-of (:wide layouts) 4096) 1 1 m-gate (:gate w) h z zeros16)
+            (if i8-wide
+              (let [[xq xs] (quant! h 2048 h-i8)]
+                (dispatch! i8-wide (wg-of (:wide-i8 layouts) 8192) 1 1 m-qkv (:qkv w) xq qkv zeros16 xs)
+                (dispatchc! i8-wide (wg-of (:wide-i8 layouts) 4096) 1 1 m-gate (:gate w) xq z zeros16 xs))
+              (do
+                (dispatch! kdot-wide (wg-of (:wide layouts) 8192) 1 1 m-qkv (:qkv w) h qkv zeros16)
+                (dispatchc! kdot-wide (wg-of (:wide layouts) 4096) 1 1 m-gate (:gate w) h z zeros16)))
             (dispatchc! kdot-narrow (wg-of (:narrow layouts) 32) 1 1 m-ab (:alpha w) h alpha zeros16)
             (dispatchc! kdot-narrow (wg-of (:narrow layouts) 32) 1 1 m-ab (:beta w) h betaL zeros16)
             (if fused?
@@ -252,7 +274,9 @@
                 (dispatch! (ops "gated_rmsnorm") 32 1 1 m-gn dn (:ssm-norm w) z gnorm zeros16 zeros16)))
             (dispatch! kdot-out (wg-of out-spv 2048) 1 1 m-out (:out w) gnorm attn-out zeros16))
           (do
-            (dispatch! kdot-wide (wg-of (:wide layouts) 8192) 1 1 m-q (:q w) h qfull zeros16)
+            (if i8-wide
+              (let [[xq xs] (quant! h 2048 h-i8)] (dispatch! i8-wide (wg-of (:wide-i8 layouts) 8192) 1 1 m-q (:q w) xq qfull zeros16 xs))
+              (dispatch! kdot-wide (wg-of (:wide layouts) 8192) 1 1 m-q (:q w) h qfull zeros16))
             (dispatchc! kdot-narrow (wg-of (:narrow layouts) 512) 1 1 m-k (:k w) h kproj zeros16)
             (dispatchc! kdot-narrow (wg-of (:narrow layouts) 512) 1 1 m-v (:v w) h vproj zeros16)
             (dispatch! (ops "rmsnorm") 16 1 1 m-qnorm qfull (:qn w) zeros16 qnorm zeros16 zeros16)
@@ -274,11 +298,19 @@
         (if kdot-expert-dual
           (do (dispatch! kdot-expert-dual (quot (+ 512 7) 8) 8 1 m-gate-exps (:gate-exps w) (:up-exps w) h2 actE ids)
               (dispatchc! kdot-narrow (wg-of (:narrow layouts) 2048) 1 1 m-down-sh (:down-sh w) sact shdown zeros16))
-          (do (dispatch! kdot-expert (wg-of expert-spv 512) 8 1 m-gate-exps (:gate-exps w) h2 gateE ids)
-              (dispatchc! kdot-expert (wg-of expert-spv 512) 8 1 m-gate-exps (:up-exps w) h2 upE ids)
+          (if i8-expert
+            (let [[xq xs] (quant! h2 2048 h2-i8)]
+              (dispatch! i8-expert (wg-of (:expert-i8 layouts) 512) 8 1 m-gate-exps (:gate-exps w) xq gateE ids xs)
+              (dispatchc! i8-expert (wg-of (:expert-i8 layouts) 512) 8 1 m-gate-exps (:up-exps w) xq upE ids xs)
               (dispatchc! kdot-narrow (wg-of (:narrow layouts) 2048) 1 1 m-down-sh (:down-sh w) sact shdown zeros16)
-              (dispatch! (ops "silu_mul") 16 1 1 m-silu8 gateE upE zeros16 actE zeros16 zeros16)))
-        (dispatch! kdot-expert (wg-of expert-spv 2048) 8 1 m-down-exps (:down-exps w) actE downE ids)
+              (dispatch! (ops "silu_mul") 16 1 1 m-silu8 gateE upE zeros16 actE zeros16 zeros16))
+            (do (dispatch! kdot-expert (wg-of expert-spv 512) 8 1 m-gate-exps (:gate-exps w) h2 gateE ids)
+                (dispatchc! kdot-expert (wg-of expert-spv 512) 8 1 m-gate-exps (:up-exps w) h2 upE ids)
+                (dispatchc! kdot-narrow (wg-of (:narrow layouts) 2048) 1 1 m-down-sh (:down-sh w) sact shdown zeros16)
+                (dispatch! (ops "silu_mul") 16 1 1 m-silu8 gateE upE zeros16 actE zeros16 zeros16))))
+        (if i8-expert
+          (let [[xq xs] (quant! actE 4096 actE-i8)] (dispatch! i8-expert (wg-of (:expert-i8 layouts) 2048) 8 1 m-down-exps (:down-exps w) xq downE ids xs))
+          (dispatch! kdot-expert (wg-of expert-spv 2048) 8 1 m-down-exps (:down-exps w) actE downE ids))
         (dispatch! (ops "weighted_sum") 8 1 1 m-wsum downE topw shdown ffn shlogit zeros16)
         (dispatch! (ops "add") 8 1 1 m-add resid ffn zeros16 xout zeros16 zeros16))
 
@@ -286,7 +318,9 @@
 (defn emit-lm-head! [pos]
   (let [x-final (if (odd? (dec layers)) xb xa)]
     (dispatch! (ops "rmsnorm") 1 1 1 m-norm x-final w-out-norm zeros16 hN zeros16 zeros16)
-    (dispatch! kdot-lm (wg-of (:lm layouts) 248320) 1 1 m-lm w-lm hN logits zeros16)
+    (if i8-lm
+      (let [[xq xs] (quant! hN 2048 hN-i8)] (dispatch! i8-lm (wg-of (:lm-i8 layouts) 248320) 1 1 m-lm w-lm xq logits zeros16 xs))
+      (dispatch! kdot-lm (wg-of (:lm layouts) 248320) 1 1 m-lm w-lm hN logits zeros16))
     (dispatch! (ops "argmax_partial") 61 1 1 m-am1 logits zeros16 zeros16 zeros16 amax-s amax-ids)
     (dispatch! (ops "argmax_final") 1 1 1 m-am2 amax-s zeros16 zeros16 amax-s amax-s amax-ids)
     ;; SUBMIT and the read-backs are bound so their answers survive to the end
@@ -385,7 +419,9 @@
     (dispatch! embed 1 1 1 m-embed-dyn w-embd tokbuf x posbuf)
     (step! (str "(layers 0 " layers ")"))
     (dispatch! (ops "rmsnorm") 1 1 1 m-norm x-final w-out-norm zeros16 hN zeros16 zeros16)
-    (dispatch! kdot-lm (wg-of (:lm layouts) 248320) 1 1 m-lm w-lm hN logits zeros16)
+    (if i8-lm
+      (let [[xq xs] (quant! hN 2048 hN-i8)] (dispatch! i8-lm (wg-of (:lm-i8 layouts) 248320) 1 1 m-lm w-lm xq logits zeros16 xs))
+      (dispatch! kdot-lm (wg-of (:lm layouts) 248320) 1 1 m-lm w-lm hN logits zeros16))
     (if sampling
       ;; multi-workgroup sampler (iteration 19): 61-workgroup passes, 30 bisection rounds on tau, one final pass
       (let [h [m-sample logits tokbuf posbuf sample-o sample-s amax-ids]]

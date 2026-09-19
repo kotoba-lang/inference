@@ -724,6 +724,25 @@ block was a real factor (qkv +22%), not the whole gap: 199 of 598. Session
 tally, B70 4-layer token: 3.63 → 2.82 (−22%); 40-layer estimate ≈ 40 × 0.28 +
 1.7 ≈ **13 ms, ~75 tok/s**.
 
+**Tick 29 (iteration 34, B-11): dp4a on x8r4, wired into the token loop, and
+the parity that makes it the ANV default.** `kdot_i8_x8r4.comp` (two
+`dotPacked4x8EXT` per lane per block on the x8 mapping, 4 rows): B70 pinned
+attn_qkv **221 GB/s** (f32 x8r4 199, session start r8 163), attn_gate 127 (90),
+lm_head **321** (272 / 261) — the coalescing and the integer-dot gains stack.
+The generator quantizes an activation once per layer (`quant_q8` into a paired
+`[xq xscale]` buffer, rows `:wide-i8` / `:lm-i8` / `:expert-i8` name the int8
+kernels). Composed 4 L × 3 T: **2.83 → 2.55 ms/token (−10%)**; int8 experts add
+nothing (2.58) and stay f32 r8. 40-layer streaming parity on B70, same prompt:
+5/5 argmax = oracle, **KL(oracle‖gpu) 3.4e-3 nats, KL(llama.cpp‖gpu) 0.0054** —
+closer to llama.cpp than the exact kernels' 0.0143, as it should be (the same
+Q8-activation regime); p(Paris) 0.535 (llama 0.474, exact 0.549). The hidden
+state's `x rel` reaches 0.42 at the last step while the distribution moves
+3.4e-3 nats — the same shape as h2 on Xavier, and the same rule: decide on the
+distribution. `anv` = int8 wide / lm, `anv-exact` keeps f32. Session tally, B70
+4-layer token: 3.63 → **2.55 (−30%)**; 40-layer estimate ≈ 40 × 0.21 + 1.7 ≈
+**10 ms, ~100 tok/s class** — vLLM's 103 is within reach of the estimate; a
+resident run is what turns it into a measurement.
+
 What this is not yet: the 40-layer model on a device with room (the serving
 processes own the memory), prompt-side prefill (tokens are fed one at a time),
 sampling other than argmax, distribution parity with llama.cpp over a real
