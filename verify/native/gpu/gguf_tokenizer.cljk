@@ -1,68 +1,11 @@
-;; Byte-level BPE tokenizer from a GGUF's own metadata (iteration 40): tokenizer.ggml.tokens /
-;; merges / token_type / pre. Encode = the pre-tokenizer regex (qwen2 / gpt2 family), GPT-2's
-;; byte->unicode map, then greedy lowest-rank merges; decode = the inverse. A kbb tool (the
-;; serving shell's text <-> ids), checked against llama-server's /tokenize and /detokenize by
-;; tokenizer_check.cljk. Reads only the GGUF header (the tensor data is never touched).
-;;
+;; Byte-level BPE tokenizer from a GGUF's own metadata (iteration 40): the CLI over tokenizer_core.cljk.
 ;;   kbb --backend sci gguf_tokenizer.cljk <file.gguf or head dump> encode "<text>"     -> ids, one line, comma separated
 ;;   kbb --backend sci gguf_tokenizer.cljk <file.gguf or head dump> decode 760,6511,...  -> the text
-(require '["fs" :as fs] '[clojure.string :as str])
+(require '["path" :as path] '[clojure.string :as str])
 (def args (vec *command-line-args*))
 (when (< (count args) 3) (println "usage: <gguf> encode <text> | decode <ids>") (js/process.exit 2))
-(def fd (fs/openSync (args 0) "r"))
-(def head (js/Buffer.alloc (* 64 1024 1024)))
-(def n (fs/readSync fd head 0 (.-length head) 0))
-(def buf (.subarray head 0 n))
-(def pos (atom 0))
-(defn- u8 [] (let [v (.readUInt8 buf @pos)] (swap! pos + 1) v))
-(defn- u32 [] (let [v (.readUInt32LE buf @pos)] (swap! pos + 4) v))
-(defn- i32 [] (let [v (.readInt32LE buf @pos)] (swap! pos + 4) v))
-(defn- u64 [] (let [v (.readBigUInt64LE buf @pos)] (swap! pos + 8) (js/Number v)))
-(defn- gstr [] (let [k (u64) s (.toString buf "utf8" @pos (+ @pos k))] (swap! pos + k) s))
-(declare read-value)
-(defn- read-value [t keep?]
-  (case t
-    0 (u8) 1 (u8) 2 (do (swap! pos + 2) 0) 3 (do (swap! pos + 2) 0) 4 (u32) 5 (i32) 6 (do (swap! pos + 4) 0) 7 (u8) 8 (gstr)
-    9 (let [et (u32) k (u64)] (if keep? (vec (repeatedly k #(read-value et true))) (do (dotimes [_ k] (read-value et false)) nil)))
-    10 (u64) 11 (u64) 12 (do (swap! pos + 8) 0)))
-(when-not (= "GGUF" (.toString buf "latin1" 0 4)) (println "REFUSE not a GGUF file") (js/process.exit 2))
-(swap! pos + 4) (u32) (u64)
-(def n-kv (u64))
-(def wanted #{"tokenizer.ggml.tokens" "tokenizer.ggml.merges" "tokenizer.ggml.token_type" "tokenizer.ggml.pre" "tokenizer.ggml.model"})
-(def kv (into {} (for [_ (range n-kv)] (let [k (gstr) t (u32) v (read-value t (contains? wanted k))] [k v]))))
-(def tokens (kv "tokenizer.ggml.tokens"))
-(def merges (kv "tokenizer.ggml.merges"))
-(when-not (and tokens merges) (println "REFUSE the GGUF has no tokenizer.ggml.tokens / merges") (js/process.exit 2))
-;; GPT-2 byte <-> unicode
-(def byte->char
-  (let [printable (concat (range 33 127) (range 161 173) (range 174 256))
-        base (into {} (map (fn [b] [b (js/String.fromCodePoint b)]) printable))]
-    (loop [b 0 nxt 256 m base]
-      (if (= b 256) m
-          (if (contains? m b) (recur (inc b) nxt m) (recur (inc b) (inc nxt) (assoc m b (js/String.fromCodePoint nxt))))))))
-(def char->byte (into {} (map (fn [[b c]] [c b]) byte->char)))
-(def token->id (into {} (map-indexed (fn [i t] [t i]) tokens)))
-(def rank (into {} (map-indexed (fn [i m] [m i]) merges)))   ;; "a b" -> rank
-;; the qwen2 / gpt2 pre-tokenizer (llama.cpp LLAMA_VOCAB_PRE_TYPE_QWEN2)
-(def pre-re (js/RegExp. "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+" "gu"))
-(defn bytes->units [s] (mapv #(byte->char %) (array-seq (js/Buffer.from s "utf8"))))
-(defn bpe [units]
-  (loop [parts units]
-    (let [pairs (map vector parts (rest parts))
-          best (reduce (fn [acc [a b]] (let [r (rank (str a " " b))] (if (and r (or (nil? acc) (< r (second acc)))) [[a b] r] acc))) nil pairs)]
-      (if (nil? best) parts
-          (let [[[a b] _] best merged (str a b)]
-            (recur (loop [ps parts out []]
-                     (cond (empty? ps) out
-                           (and (= (first ps) a) (= (second ps) b)) (recur (drop 2 ps) (conj out merged))
-                           :else (recur (rest ps) (conj out (first ps)))))))))))
-(defn encode [text]
-  (vec (mapcat (fn [piece] (map #(or (token->id %) (do (println "REFUSE no token for" (pr-str %)) (js/process.exit 3))) (bpe (bytes->units piece))))
-               (array-seq (.match text pre-re)))))
-(defn decode [ids]
-  (let [units (apply str (map #(tokens %) ids))
-        bytes (js/Buffer.from (clj->js (mapv #(char->byte %) (array-seq (js/Array.from units)))))]
-    (.toString bytes "utf8")))
+(require '[nbb.core :refer [load-file]])
+(load-file (path/join (path/dirname *file*) "tokenizer_core.cljk"))
 (case (args 1)
   "encode" (println (str/join "," (encode (args 2))))
   "decode" (println (decode (mapv js/parseInt (str/split (args 2) #","))))
