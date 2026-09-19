@@ -14,7 +14,10 @@
 ;; Root ADR-2609182400 C.
 (require '["fs" :as fs] '[clojure.string :as str])
 (def args (vec *command-line-args*))
-(when-not (<= 6 (count args) 8) (println "usage: <file.gguf> <layers> <tokens> <prompt-token-id[,id...]> <dir-on-box> <out.kotoba> [anv|radv|nvgpu|nvgpu-exact] [stream|flat]") (js/process.exit 2))
+(when-not (<= 6 (count args) 9) (println "usage: <file.gguf> <layers> <tokens> <prompt-token-id[,id...]> <dir-on-box> <out.kotoba> [anv|radv|nvgpu|nvgpu-exact] [stream|flat|fn] [sample:<T>:<top_p>:<seed>]") (js/process.exit 2))
+;; sample:T:top_p:seed (fn mode): nex_sample_topp replaces argmax_final -- the draw
+;; u = hash(seed, pos) is reproduced by decode_tokens_ref.py --sample (iteration 18).
+(def sampling (when-let [a (get args 8)] (let [[_ T tp seed] (str/split a #":")] {:T (js/parseFloat T) :top-p (js/parseFloat tp) :seed (js/parseInt seed 0)})))
 ;; stream: the layer weights are MAPped per layer per token and FREEd after the
 ;; layer's command buffer, so the whole 40-layer model runs on a device that
 ;; cannot hold it (K16 GTT 13 GiB vs 17.4 GB of weights) -- for parity, not
@@ -136,7 +139,7 @@
 (defn fresh [prefix] (swap! counter inc) (str prefix @counter))
 ;; --- the plan ---
 (def zeros16 (alloc! 16))
-(def ops (into {} (for [op ["rmsnorm" "l2norm" "gated_rmsnorm" "silu_mul" "conv1d_step" "softmax_topk" "gate_decay2" "weighted_sum" "add" "f32_matvec" "add_rmsnorm" "rope_neox" "attn_decode" "argmax_partial" "argmax_final" "copy_at" "pos_incr"]] [op (pipeline! (str "nex_" op ".spv") 7)])))
+(def ops (into {} (for [op ["rmsnorm" "l2norm" "gated_rmsnorm" "silu_mul" "conv1d_step" "softmax_topk" "gate_decay2" "weighted_sum" "add" "f32_matvec" "add_rmsnorm" "rope_neox" "attn_decode" "argmax_partial" "argmax_final" "copy_at" "pos_incr" "sample_topp"]] [op (pipeline! (str "nex_" op ".spv") 7)])))
 (def kdot-wide (pipeline! (:wide layouts) 5))
 (def kdot-narrow (pipeline! (:narrow layouts) 5))
 (def kdot-lm (pipeline! (:lm layouts) 5))
@@ -190,6 +193,8 @@
 (def m-embed-dyn (let [m (alloc! 16)] (write! m (str (le32 2048) (le32 0) (le32 1) (le32 0))) m))
 (def m-am2-dyn (let [m (alloc! 32)] (write! m (str (le32 248320) (le32 1) (le32 61) (le32 (count prompt)) (lef32 0) (lef32 0) (lef32 0) (lef32 1))) m))
 (def m-incr (ops-meta! 1 1 0 0 0 0))
+;; sampler meta: n rows aux(=ids slot 61) aux2(=prompt length) eps(=T) scale(=top_p) p0(=seed bits) p1(=1)
+(def m-sample (when sampling (let [m (alloc! 32)] (write! m (str (le32 248320) (le32 1) (le32 61) (le32 (count prompt)) (lef32 (:T sampling)) (lef32 (:top-p sampling)) (le32 (:seed sampling)) (lef32 1))) m)))
 (def rec-keys [:norm :post :router :shgate-inp :gate-exps :up-exps :down-exps :gate-sh :up-sh :down-sh :qkv :gate :alpha :beta :dt :a :conv :ssm-norm :out])
 (def att-keys [:norm :post :router :shgate-inp :gate-exps :up-exps :down-exps :gate-sh :up-sh :down-sh :q :k :v :qn :kn :o])
 (def tensor-name {:norm "attn_norm.weight" :post "post_attention_norm.weight" :router "ffn_gate_inp.weight" :shgate-inp "ffn_gate_inp_shexp.weight"
@@ -357,8 +362,10 @@
     (step! (str "(layers 0 " layers ")"))
     (dispatch! (ops "rmsnorm") 1 1 1 m-norm x-final w-out-norm zeros16 hN zeros16 zeros16)
     (dispatch! kdot-lm (wg-of (:lm layouts) 248320) 1 1 m-lm w-lm hN logits zeros16)
-    (dispatch! (ops "argmax_partial") 61 1 1 m-am1 logits zeros16 zeros16 zeros16 amax-s amax-ids)
-    (dispatch! (ops "argmax_final") 1 1 1 m-am2-dyn amax-s tokbuf posbuf amax-s amax-s amax-ids)
+    (if sampling
+      (dispatch! (ops "sample_topp") 1 1 1 m-sample logits tokbuf posbuf amax-s amax-s amax-ids)
+      (do (dispatch! (ops "argmax_partial") 61 1 1 m-am1 logits zeros16 zeros16 zeros16 amax-s amax-ids)
+          (dispatch! (ops "argmax_final") 1 1 1 m-am2-dyn amax-s tokbuf posbuf amax-s amax-s amax-ids)))
     (dispatch! (ops "pos_incr") 1 1 1 m-incr zeros16 zeros16 zeros16 zeros16 zeros16 posbuf)
     (str ";; one token: embed(tokbuf[pos]) -> layers -> lm_head -> argmax (appends tokbuf[pos+1]) -> pos+1; answers accumulate as ns|x|id joined by #\n"
          "(defn token-step [pos :i64 n :i64 acc :string] :string\n"

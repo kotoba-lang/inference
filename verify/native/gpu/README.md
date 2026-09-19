@@ -417,6 +417,24 @@ one distribution. The llama.cpp distribution-parity item is closed for the
 fleet. Streaming stays a correctness tool: on a box that cannot page-cache the
 model it is disk-bound.
 
+**Tick 13 (iteration 18): sampling on the device.** `nex_ops.comp` `sample_topp`:
+one workgroup over the vocabulary — `p = softmax(logits / T)`, the top-p set is
+`{p ≥ τ}` for the largest τ whose mass reaches `top_p` (30-step bisection; the
+sorted definition with boundary ties included), the draw is `u · mass` in index
+order over 256 contiguous chunks, `u = mix32(seed ^ pos·0x9E3779B9) >> 8 / 2²⁴`
+with `pos` from `posbuf`; the token goes to `ids[61]` (read back) and to
+`tokbuf[pos+1]` past the prompt. `sample_test.kotoba` draws 256 times from one
+fixed logits vector (the oracle's last step, `logits_last.f32`) advancing the
+counter with `pos_incr`; `sample_check.py` recomputes every draw in f64 with
+the same hash: K16, T 0.8, top-p 0.95 — top-p set 14 tokens (mass 0.9523),
+**256/256 draws equal to the oracle**, all inside the set, empirical-vs-exact TV
+0.052 (≈ the 256-sample noise). In the token loop (`fn` mode, 9th argument
+`sample:T:top_p:seed`; `decode_tokens_ref.py … --sample T top_p seed` is the
+oracle) K16 12 L, 3 forced + 3 sampled: **6/6 tokens equal** (18171 / 84249 /
+236687 / 112516 / 21356 / 226585). Cost: the single-workgroup sampler is 4.8 ms
+per draw on K16 (27.5 → 32 ms/token) — multi-workgroup partial sums are the
+obvious next cut. Not implemented: top-k, repetition penalties, min-p.
+
 What this is not yet: the 40-layer model on a device with room (the serving
 processes own the memory), prompt-side prefill (tokens are fed one at a time),
 sampling other than argmax, distribution parity with llama.cpp over a real
