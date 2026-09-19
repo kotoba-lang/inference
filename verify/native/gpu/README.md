@@ -586,6 +586,17 @@ loops (~0.065 ms, ~2 ms per 40-layer token), the expert kdots run at ~90 GB/s,
 and ~20 small dispatches per layer each cost their launch. Those three, in that
 order, are the remaining B levers.
 
+**Tick 21 (iteration 26, B-4): the delta-net step on 512 threads.**
+`deltanet_fused.comp` now runs 512 threads per head: thread `(j = t & 127,
+part = t >> 7)` owns value column j and a quarter of the 128 keys in both state
+loops, the four partial `kv_mem` / `o` are summed through shared memory, the
+conv / l2 / gated-rmsnorm parts stay on part 0. Oracle-exact on all three boxes
+(B70 `x rel` 4.9e-6, Xavier 3.1e-3 with h2, K16 chain equal). Per token,
+A/B'd: **B70 4 L × 3 T 3.46 → 3.30 ms** (−0.053 ms per recurrent layer, ≈ −1.6 ms
+on 40 layers), **Xavier 12 L × 3 T 37.1 → 36.4**, **K16 12 L 27.3 → 27.3** (RADV's
+wave64 already had the parallelism). `profile_guest.py --report` knows the
+fused layer's 21 labels.
+
 What this is not yet: the 40-layer model on a device with room (the serving
 processes own the memory), prompt-side prefill (tokens are fed one at a time),
 sampling other than argmax, distribution parity with llama.cpp over a real

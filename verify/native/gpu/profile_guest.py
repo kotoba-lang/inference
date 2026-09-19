@@ -7,6 +7,7 @@
 #        ... compile / run as usual, then: python3 profile_guest.py --report <loader output> <labels> <layers>
 import re, sys, numpy as np
 REC = ['rmsnorm','qkv 8192x2048 Q5_K','gate 4096x2048 IQ4_XS','alpha 32','beta 32','gate_decay2','gate_decay2 (beta)','conv1d','l2norm q','l2norm k','deltanet','gated_rmsnorm','ssm_out 2048x4096','add_rmsnorm','router f32','gate_sh 512','up_sh 512','shlogit','softmax_topk','silu_sh','gate_exps 512x8','up_exps 512x8','down_sh 2048','silu8','down_exps 2048x8','weighted_sum','add']
+REC_FUSED = ['rmsnorm','qkv 8192x2048 Q5_K','gate 4096x2048 IQ4_XS','alpha 32','beta 32','deltanet_fused','ssm_out 2048x4096','add_rmsnorm','router f32','gate_sh 512','up_sh 512','shlogit','softmax_topk','silu_sh','gate_exps 512x8','up_exps 512x8','down_sh 2048','silu8','down_exps 2048x8','weighted_sum','add']
 ATT = ['rmsnorm','q 8192x2048','k 512','v 512','rmsnorm q','rmsnorm k','rope q','rope k','copy v','copy k','attn_decode','attn_out 2048x4096','add_rmsnorm','router f32','gate_sh 512','up_sh 512','shlogit','softmax_topk','silu_sh','gate_exps 512x8','up_exps 512x8','down_sh 2048','silu8','down_exps 2048x8','weighted_sum','add']
 if sys.argv[1] == '--report':
     out = open(sys.argv[2]).read(); labels = open(sys.argv[3]).read().split('\n'); layers = int(sys.argv[4])
@@ -15,7 +16,7 @@ if sys.argv[1] == '--report':
     t = np.array([int(x) / 1e6 for x in bytes.fromhex(m.group(1)).decode().split('|')[1:]])
     print(f'embed {t[0]:.3f} ms (the single-submit floor is about this)'); pos = 1
     for il in range(layers):
-        rec = (il + 1) % 4 != 0; names = REC if rec else ATT; n = len(names)
+        rec = (il + 1) % 4 != 0; names = (REC_FUSED if 'deltanet_fused' in labels else REC) if rec else ATT; n = len(names)
         seg = t[pos:pos + n]; pos += n
         print(f'layer {il} ({"recurrent" if rec else "attention"}) sum {seg.sum():.2f} ms alone-in-submit')
         for nm, v in sorted(zip(names, seg), key=lambda x: -x[1])[:10]: print(f'   {nm:<24s} {v:.3f}')
