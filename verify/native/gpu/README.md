@@ -302,6 +302,28 @@ quantizes activations to Q8 per 32-block (≈4e-3 relative per activation),
 coarser than f16; a like-for-like distribution comparison against llama.cpp
 is the open parity item.
 
+**Tick 8 (iteration 13): the parity probe, and why the first one was worthless.**
+The f64 oracle now runs all 40 layers (K16, ~1 min/token) and saves the full
+logits; llama-server (K16, CPU, the same GGUF) and vLLM (B70, W4A16 AutoRound)
+were asked for the next-token distribution after the same single token 9707
+(`prompt` as a token array, no BOS, `n_probs` / `logprobs`). Three engines, three
+unrelated answers: oracle top-1 198 (p 0.134), llama.cpp top-1 19 (p 0.119,
+198 at 0.099; KL(llama‖oracle) over its top-40 = **1.04 nats**), vLLM top-1 a
+CJK fragment at p 0.0048. A single token at position 0 with no BOS is a
+degenerate input on which nothing can be concluded — the fact that this is
+the only prompt the guests could run was the real gap.
+
+So the generator and the oracle take a **comma-separated prompt**: the first P
+steps are forced to those tokens (prefill at decode speed, one command buffer
+per token, KV/recurrent state carried), greedy decode continues from step P.
+`decode_tokens_ref.py nex.gguf 9707,198,220 12 4` / the guest with the same
+argument: K16 12 layers, all four steps match (argmax 163967 / 112516 /
+169222 / 169484, `x rel` ≤ 6e-6, 27–28 ms per step). The helper modules
+(`layer0_ref.py`, `decode_ref.py`) no longer run their own layer when
+imported with a token list. The like-for-like llama.cpp comparison needs the
+40-layer guest, which needs per-layer MAP/FREE streaming on the K16's 13 GiB
+GTT — the next item.
+
 What this is not yet: the 40-layer model on a device with room (the serving
 processes own the memory), prompt-side prefill (tokens are fed one at a time),
 sampling other than argmax, distribution parity with llama.cpp over a real

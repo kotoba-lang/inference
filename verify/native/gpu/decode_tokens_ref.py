@@ -6,7 +6,8 @@
 import sys, numpy as np, kdot_ref as g
 import layer0_ref as L  # module-level code runs layer 0 once for argv; we only reuse its helpers
 from decode_ref import deq_q6k_blocks, matq
-path, tok0, NL, NT = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+path, NL, NT = sys.argv[1], int(sys.argv[3]), int(sys.argv[4])
+prompt = [int(t) for t in sys.argv[2].split(",")]; tok0 = prompt[0]   # forced prompt tokens, then greedy (iteration 13)
 kv, T, mat, rows_of, rms, silu, sigmoid, softplus, l2 = L.kv, L.T, L.mat, L.rows_of, L.rms, L.silu, L.sigmoid, L.softplus, L.l2
 NROT = kv["qwen35moe.rope.dimension_count"]; BASE = kv["qwen35moe.rope.freq_base"]; NH, NKV, HD = 16, 2, 256
 interval = kv.get("qwen35moe.full_attention_interval", 4)
@@ -26,7 +27,7 @@ def rope(v, heads, pos):
             a, b = v[hh * HD + i], v[hh * HD + i + half]
             o[hh * HD + i] = a * c - b * s_; o[hh * HD + i + half] = a * s_ + b * c
     return o
-tokens = [tok0]; xs = []; argmaxes = []
+tokens = [tok0]; xs = []; argmaxes = []; all_logits = []
 for ti in range(NT):
     tok = tokens[-1]
     x = rows_of("token_embd.weight", tok, 1)[0]
@@ -79,6 +80,6 @@ for ti in range(NT):
     xs.append(x.copy())
     if lm is None: lm = matq("output.weight")
     logits = lm @ rms(x, V("output_norm.weight"))
-    nxt = int(np.argmax(logits)); argmaxes.append(nxt); tokens.append(nxt)
+    nxt = int(np.argmax(logits)); argmaxes.append(nxt); tokens.append(prompt[ti + 1] if ti + 1 < len(prompt) else nxt); all_logits.append(logits.astype(np.float32))
     print(f"step {ti} token {tok} -> argmax {nxt} (logit {logits[nxt]:.5f}) |x| {np.sqrt(np.mean(x*x)):.4g}")
-np.savez("decode_tokens_ref.npz", tokens=np.array(tokens), xs=np.array(xs), argmaxes=np.array(argmaxes), layers=np.array([NL]))
+np.savez("decode_tokens_ref.npz", tokens=np.array(tokens), xs=np.array(xs), argmaxes=np.array(argmaxes), layers=np.array([NL]), logits=np.array(all_logits))  # logits: for distribution parity (iteration 13)

@@ -5,7 +5,7 @@
 # Usage: python3 decode_ref.py <gguf> <token-id> <layers>   -> x.f32, decode_ref.npz
 import sys, numpy as np, kdot_ref as g
 from layer0_ref import *  # noqa: reuses read/mat/rows_of/deq and the constants (runs layer 0 of token argv[2]; we redo below)
-path, tok, NL = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+path, tok, NL = sys.argv[1], int(sys.argv[2].split(",")[0]), int(sys.argv[3])   # importers may pass a comma list of prompt tokens
 NROT = kv["qwen35moe.rope.dimension_count"]; BASE = kv["qwen35moe.rope.freq_base"]; NH, NKV, HD = 16, 2, 256
 def deq_q6k_blocks(raw):             # raw (N,210) for the lm_head
     ql = raw[:, 0:128].astype(np.int64); qh = raw[:, 128:192].astype(np.int64); sc = raw[:, 192:208].astype(np.int8).astype(np.int64)

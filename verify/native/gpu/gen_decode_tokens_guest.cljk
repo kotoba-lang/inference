@@ -6,7 +6,7 @@
 ;; every op of the step one DISPATCH inside a single command buffer, the layer
 ;; output READ back as hex. Checked by layer0_check.py against layer0_ref.py.
 ;;
-;;   kbb --backend sci gen_decode_tokens_guest.cljk <file.gguf> <layers> <tokens> <prompt-token-id> <dir-on-box> <out.kotoba>
+;;   kbb --backend sci gen_decode_tokens_guest.cljk <file.gguf> <layers> <tokens> <prompt-token-id[,id...]> <dir-on-box> <out.kotoba>
 ;;
 ;; The program is straight-line: MAP/ALLOC/WRITE every constant, then ONE
 ;; command buffer (BEGIN .. SUBMIT) holding every dispatch of every layer and the
@@ -14,8 +14,16 @@
 ;; Root ADR-2609182400 C.
 (require '["fs" :as fs] '[clojure.string :as str])
 (def args (vec *command-line-args*))
-(when-not (<= 6 (count args) 7) (println "usage: <file.gguf> <layers> <tokens> <prompt-token-id> <dir-on-box> <out.kotoba> [anv|radv|nvgpu|nvgpu-h2]") (js/process.exit 2))
-(def gguf (args 0)) (def layers (js/parseInt (args 1))) (def ntok (js/parseInt (args 2))) (def tok0 (js/parseInt (args 3))) (def box (args 4)) (def out (args 5))
+(when-not (<= 6 (count args) 7) (println "usage: <file.gguf> <layers> <tokens> <prompt-token-id[,id...]> <dir-on-box> <out.kotoba> [anv|radv|nvgpu|nvgpu-h2]") (js/process.exit 2))
+(def gguf (args 0)) (def layers (js/parseInt (args 1))) (def ntok (js/parseInt (args 2))) (def box (args 4)) (def out (args 5))
+;; <prompt-token-id> may be a comma-separated list: the first P steps are FORCED to
+;; these tokens (prefill at decode speed, one command buffer per prompt token) and
+;; greedy decode continues from step P. A single-token position-0 prompt is a
+;; degenerate parity probe (iteration 13): three engines gave three unrelated
+;; distributions on it.
+(def prompt (mapv js/parseInt (str/split (args 3) #",")))
+(def tok0 (first prompt))
+(when (< ntok (count prompt)) (println "REFUSE tokens" ntok "< prompt length" (count prompt)) (js/process.exit 2))
 (def backend (or (get args 6) "anv"))
 ;; Kernel layout per (backend, tensor class) -- the co-scientist table (root
 ;; ADR-2609182400 C, iterations 3 and 7). Classes: :wide = the 4096/8192-row
@@ -106,7 +114,7 @@
 (def deltanet (pipeline! "deltanet_step.spv" 8))
 (def embed (pipeline! "embed_iq4xs.spv" 4))
 (def w-embd (map-tensor! "token_embd.weight"))
-(def prompt-ids (alloc! 16))
+(def prompt-ids (alloc! (max 16 (* 4 (count prompt)))))
 (def x (alloc! 8192))
 (def h (alloc! 8192)) (def qkv (alloc! 32768)) (def z (alloc! 16384)) (def alpha (alloc! 128)) (def betaL (alloc! 128)) (def gb (alloc! 256)) (def beta-only (alloc! 256))
 (def conv (alloc! 32768)) (def qn (alloc! 8192)) (def kn (alloc! 8192)) (def dn (alloc! 16384)) (def gnorm (alloc! 16384)) (def attn-out (alloc! 8192))
@@ -116,7 +124,7 @@
 (def sg (alloc! 2048)) (def su (alloc! 2048)) (def sact (alloc! 2048)) (def shdown (alloc! 8192)) (def shlogit (alloc! 16)) (def ffn (alloc! 8192))
 (def xa (alloc! 8192)) (def xb (alloc! 8192))
 (zero! zeros16)
-(write! prompt-ids (le32 tok0))
+(write! prompt-ids (apply str (map le32 prompt)))
 (def rings (vec (for [il (range layers) :when (= 1 (recurrent il))] (let [r (alloc! 98304)] (zero! r) r))))
 (def states (vec (for [il (range layers) :when (= 1 (recurrent il))] (let [s (alloc! 2097152)] (zero! s) s))))
 (def kcaches (vec (for [il (range layers) :when (= 0 (recurrent il))] (let [b (alloc! (* ntok 2048))] (zero! b) b))))
@@ -137,7 +145,7 @@
 (def hN (alloc! 8192)) (def logits (alloc! (* 248320 4))) (def amax-s (alloc! 256)) (def amax-ids (alloc! 256))
 (def m-lm (kdot-meta! 248320 2048 14 1 0)) (def m-am1 (ops-meta! 248320 1 61 0 0 0)) (def m-am2 (ops-meta! 248320 1 61 0 0 0))
 ;; per-token metas: rope position, attention T, cache row, embedding source slot
-(def m-embed0 (let [m (alloc! 16)] (write! m (str (le32 2048) (le32 0) (le32 0) (le32 0))) m))     ;; slot 0 of prompt-ids
+(def m-embedP (vec (for [p (range (count prompt))] (let [m (alloc! 16)] (write! m (str (le32 2048) (le32 p) (le32 0) (le32 0))) m))))   ;; slot p of prompt-ids (forced token)
 (def m-embed1 (let [m (alloc! 16)] (write! m (str (le32 2048) (le32 61) (le32 0) (le32 0))) m))    ;; slot 61 of amax-ids = the argmax
 (def m-ropeq (vec (for [pos (range ntok)] (ops-meta! 256 16 nrot pos 0 rope-base))))
 (def m-ropek (vec (for [pos (range ntok)] (ops-meta! 256 2 nrot pos 0 rope-base))))
@@ -157,7 +165,7 @@
 (def ans-binds (atom []))
 (doseq [pos (range ntok)]
   (step! (q "BEGIN"))
-  (dispatch! embed 1 1 1 (if (zero? pos) m-embed0 m-embed1) w-embd (if (zero? pos) prompt-ids amax-ids) x)
+  (dispatch! embed 1 1 1 (if (< pos (count prompt)) (m-embedP pos) m-embed1) w-embd (if (< pos (count prompt)) prompt-ids amax-ids) x)
   (let [rec-index (atom 0) att-index (atom 0)]
     (doseq [il (range layers)]
       (let [w (layer-w il) xin (if (zero? il) x (if (odd? il) xa xb)) xout (if (odd? il) xb xa)]
@@ -232,7 +240,7 @@
                                      groups))]
     (str body "        " (apply cat (interpose (q "#") answers)) (apply str (repeat (count groups) ")")))))
 (def src (str ";; GENERATED by verify/native/gpu/gen_decode_tokens_guest.cljk -- do not edit.\n"
-              ";; Greedy decode of " ntok " tokens from prompt token " tok0 " through layers 0.." (dec layers) " + lm_head, entirely on :gpu/compute: "
+              ";; Greedy decode of " ntok " tokens from prompt tokens " (str/join "," prompt) " (forced) through layers 0.." (dec layers) " + lm_head, entirely on :gpu/compute: "
               (count @lines) " requests, one command buffer per token, state carried in device buffers. Handles are literal (sequential per kind).\n"
               ";; Answer: per token \"<ns>|<hex x after the last layer>|<hex argmax id>\", tokens joined by \"#\".\n"
               "(ns gpu.decode-tokens (:export [main]))\n"
