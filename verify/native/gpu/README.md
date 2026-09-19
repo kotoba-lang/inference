@@ -523,6 +523,27 @@ tick 6). Realistic Vulkan ceiling on Xavier with the remaining items: ~75 ms
 ≈ 13 tok/s, i.e. 0.7× llama.cpp CUDA. That is a decision for the owner, not a
 kernel.
 
+**Tick 18 (iteration 23, B-1): the same profile on B70, and the barrier
+halved.** `profile_guest.py` on B70 (ANV, vLLM resident): the single-submit
+floor is ~0.11 ms and almost every op sits *at* it — subtracting it, a
+recurrent layer is qkv 0.09, deltanet 0.07, down_exps 0.06, gate 0.05,
+gate_exps / up_exps 0.05 each, ssm_out 0.04, everything else ≈ 0; the lm_head
+(r8) 1.59 ms = 262 GB/s, so the B70's memory is faster than the 160 GB/s the
+f32 probe suggested (that probe was compute-bound). Kernel work per layer
+≈ 0.35 ms, in-buffer layer ≈ 0.46 ms → the difference is the **15 barriers ×
+13 µs**, i.e. ~40% of a layer — on B70 the barrier is the item, the opposite
+of Xavier. amu PR #1031: when the device is Vulkan 1.3 the loader records a
+`synchronization2` barrier naming `SHADER_STORAGE_WRITE → STORAGE_READ|WRITE`
+only; the 1.0 `SHADER_READ` also covers uniform / sampled reads and ANV flushes
+twice as much for it. Floor per dispatch **13 → 6.6 µs**; the 4-layer × 3-token
+guest **3.81 → 3.50 ms/token**, bit-identical. RADV: no difference; Xavier's
+JetPack headers are Vulkan 1.2, so the block compiles out there. Corrected
+B70 estimate for 40 layers: 40 × ~0.40 + 1.8 ≈ **18 ms/token ≈ 55 tok/s**
+(the earlier "~28 tok/s" multiplied the 4-layer figure without separating the
+lm_head). Remaining B levers, in order: fusing the ~20 element-wise dispatches
+per layer into the kdots (the other half of the barrier cost), expert kdot
+bandwidth (90 → 200+ GB/s), qkv at 128 GB/s.
+
 What this is not yet: the 40-layer model on a device with room (the serving
 processes own the memory), prompt-side prefill (tokens are fed one at a time),
 sampling other than argmax, distribution parity with llama.cpp over a real
