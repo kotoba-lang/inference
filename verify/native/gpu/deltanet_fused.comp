@@ -23,7 +23,7 @@ layout(std430, binding = 8) buffer St { float state[]; };
 layout(std430, binding = 9) readonly buffer Nw { float ssm_norm[]; };
 layout(std430, binding = 10) readonly buffer Z { float z[]; };
 layout(std430, binding = 11) buffer Out { float outp[]; };
-layout(std430, binding = 12) readonly buffer Pos { uint pos[]; };
+layout(std430, binding = 12) readonly buffer Pos { uint pos[]; };   // pos[0]: absolute position (ring parity); pos[1]: row of the batched inputs this step reads (0 in decode; p in a prefill of P tokens, iteration 36)
 shared float sq[128]; shared float sk[128]; shared float red[512]; shared float cq[128]; shared float ck[128]; shared float cv[128]; shared float part4[4][128];
 float silu(float v) { return v / (1.0 + exp(-v)); }
 float sigmoid(float v) { return 1.0 / (1.0 + exp(-v)); }
@@ -34,9 +34,9 @@ float wg_sum(uint t, float v) {
   float r = red[0]; barrier(); return r;
 }
 // conv1d step + silu for channel c, reading ring slot p; returns the activation, writes slot 1-p if `own`
-float conv_step(uint c, uint p, bool own) {
+float conv_step(uint c, uint p, bool own, uint qoff) {
   uint n = P.n, rb = p * 3u * n, wb = (1u - p) * 3u * n;
-  float x0 = ring[rb + c], x1 = ring[rb + n + c], x2 = ring[rb + 2u * n + c], x3 = qkv[c];
+  float x0 = ring[rb + c], x1 = ring[rb + n + c], x2 = ring[rb + 2u * n + c], x3 = qkv[qoff + c];
   float y = convw[c * 4u] * x0 + convw[c * 4u + 1u] * x1 + convw[c * 4u + 2u] * x2 + convw[c * 4u + 3u] * x3;
   if (own) { ring[wb + c] = x1; ring[wb + n + c] = x2; ring[wb + 2u * n + c] = x3; }
   return silu(y);
@@ -44,11 +44,13 @@ float conv_step(uint c, uint p, bool own) {
 void main() {
   uint h = gl_WorkGroupID.x, t = gl_LocalInvocationID.x, j = t & 127u, part = t >> 7u;
   uint K_ = P.k_dim, V_ = P.v_dim, kh = h % P.k_heads, p = pos[0] & 1u;
+  uint row = pos[1];                          // prefill: which token of the batch; the kdot outputs are [P x n], alpha/beta [P x heads], z / out [P x heads*V_]
+  uint qoff = row * P.n, hoff = row * P.heads, voff = row * P.heads * V_;
   // conv on this head's channels (part 0 only; the ring is written once): q (shared with head h + k_heads), k (same), v (own)
   if (part == 0u) {
-    cq[j] = conv_step(kh * K_ + j, p, h == kh);
-    ck[j] = conv_step(P.k_heads * K_ + kh * K_ + j, p, h == kh);
-    cv[j] = conv_step(P.v_off + h * V_ + j, p, true);
+    cq[j] = conv_step(kh * K_ + j, p, h == kh, qoff);
+    ck[j] = conv_step(P.k_heads * K_ + kh * K_ + j, p, h == kh, qoff);
+    cv[j] = conv_step(P.v_off + h * V_ + j, p, true, qoff);
   }
   barrier();
   float qc = cq[j], kc = ck[j], vc = cv[j];
@@ -58,7 +60,7 @@ void main() {
   if (part == 0u) { sq[j] = qn; sk[j] = kn; }
   barrier();
   // gate and beta
-  float decay = exp(softplus(alpha[h] + dt[h]) * ssm_a[h]), b = sigmoid(betaL[h]);
+  float decay = exp(softplus(alpha[hoff + h] + dt[h]) * ssm_a[h]), b = sigmoid(betaL[hoff + h]);
   // delta rule on the head's state (K_ x V_): this thread owns column j, keys [i0, i1)
   uint sbase = h * K_ * V_, quarter = K_ / 4u, i0 = part * quarter, i1 = i0 + quarter;
   float kv_mem = 0.0;
@@ -72,5 +74,5 @@ void main() {
   o = part4[0][j] + part4[1][j] + part4[2][j] + part4[3][j];
   // gated rmsnorm over the head's V_ outputs (part 0 contributes), times silu(z)
   float inv = inversesqrt(wg_sum(t, (part == 0u) ? o * o : 0.0) / float(V_) + P.eps);
-  if (part == 0u) outp[h * V_ + j] = o * inv * ssm_norm[j] * silu(z[h * V_ + j]);
+  if (part == 0u) outp[voff + h * V_ + j] = o * inv * ssm_norm[j] * silu(z[voff + h * V_ + j]);
 }
