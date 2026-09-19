@@ -492,6 +492,37 @@ to tick 15, and the resident 40-layer token is **88.9 → 86.9 ms (11.5 tok/s)**
 append the final logits to the last token's answer, so `parity_check.py` works
 on them too (needs `KEXE_STRING_POOL` ≥ 8 MiB).
 
+**Tick 17 (iteration 22, A-3 preparation): where the 71 ms of layers go.**
+`profile_guest.py` turns a flat one-token guest into one whose every dispatch
+runs alone in its own command buffer (grouped `timed` functions; 112 nested
+lets exhausted the desugarer's stack) and reports per op. Xavier, 4 layers,
+min of two runs, each figure carrying the ~0.07 ms single-submit floor:
+
+| recurrent layer (sum 4.8 alone; ~1.8 in-buffer) | ms | attention layer (4.2 alone) | ms |
+|---|---|---|---|
+| qkv 8192×2048 Q5_K | 0.82 | attn_out 2048×4096 | 0.47 |
+| gate 4096×2048 IQ4_XS | 0.40 | q 8192×2048 | 0.44 |
+| down_exps 2048×8 | 0.37 | down_exps 2048×8 | 0.37 |
+| gate_exps / up_exps 512×8 | 0.26 / 0.26 | gate_exps / up_exps | 0.26 / 0.26 |
+| deltanet | 0.26 | gate_sh / up_sh 512 | 0.21 / 0.22 |
+| ssm_out 2048×4096 | 0.24 | softmax_topk | 0.19 |
+| gate_decay2 (beta) | 0.23 | router f32 | 0.16 |
+| alpha 32 / beta 32 | 0.22 / 0.15 | add_rmsnorm | 0.14 |
+
+Reading: the big K-quant kdots (qkv, gate, ssm_out/attn_out, the three expert
+kdots) are ~75% of a layer and all sit at the nvgpu instruction-issue ceiling
+measured in tick 6 (~28 G values/s); fusing the element-wise ops around them
+would buy 10–15%. The tiny kdots (alpha/beta 32 rows, gate_sh/up_sh 512) cost
+0.1–0.2 ms each because 32–512 workgroups of 64 threads cannot fill 8 SMs —
+a split-K layout for narrow kdots is the one cheap win left (~0.25 ms/layer,
+≈10 ms/token). Budget arithmetic for the A target: the token touches ~2.6 G
+weight values; at 28 G values/s that is ~90 ms, and llama.cpp CUDA's 18.7
+tok/s (53 ms) needs ~50 G values/s — what `dp4a` gives it and what this
+Vulkan driver does not expose (`VK_KHR_shader_integer_dot_product` absent,
+tick 6). Realistic Vulkan ceiling on Xavier with the remaining items: ~75 ms
+≈ 13 tok/s, i.e. 0.7× llama.cpp CUDA. That is a decision for the owner, not a
+kernel.
+
 What this is not yet: the 40-layer model on a device with room (the serving
 processes own the memory), prompt-side prefill (tokens are fed one at a time),
 sampling other than argmax, distribution parity with llama.cpp over a real
