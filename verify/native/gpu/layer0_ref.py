@@ -4,7 +4,7 @@
 # (Deno, retired). Writes x.f32 (the token's embedding row, MAPped by the guest)
 # and layer0_ref.npz with every intermediate. Usage: python3 layer0_ref.py <gguf> <token-id> <layer>
 import sys, struct, numpy as np, kdot_ref as g
-path, tok, il = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+path, tok, il = sys.argv[1], int(sys.argv[2].split(",")[0]), int(sys.argv[3])   # importers may pass a comma list of prompt tokens
 kv, tensors, ds = g.read_gguf_dir(path)
 T = {t[0]: t for t in tensors}
 f = open(path, 'rb')
@@ -56,6 +56,8 @@ EPS = kv["qwen35moe.attention.layer_norm_rms_epsilon"]
 rms = lambda x, w: x / np.sqrt(np.mean(x * x) + EPS) * w
 silu = lambda v: v / (1 + np.exp(-v)); sigmoid = lambda v: 1 / (1 + np.exp(-v)); softplus = lambda v: np.where(v > 20, v, np.log1p(np.exp(v)))
 l2 = lambda v, scale=1.0: v * (scale / np.sqrt(np.sum(v * v) + EPS))
+# the one-layer run below is the script; importers (decode_ref, decode_tokens_ref) want only the helpers above
+if __name__ != "__main__": il = 0
 p = f"blk.{il}."
 x = rows_of("token_embd.weight", tok, 1)[0]
 x.astype(np.float32).tofile("x.f32")
