@@ -705,6 +705,25 @@ r1-shaped kernel on B70 (143 vs 121) but is one row per workgroup. The next
 kernel is x8's thread mapping with r8's rows in flight ("x8 × r8"). Both
 negatives are kept for A/B.
 
+**Tick 28 (iteration 33, B-10): x8 × rows.** `kdot_x8r8.comp` (`-DROWS`): 256
+threads = 8 block slots × 32 lanes, a lane owns eight consecutive values, R rows
+per workgroup share the activation's two `vec4`. B70, pinned, GB/s:
+
+| tensor | f32 r8 | x8 × r8 | **x8 × r4** |
+|---|---|---|---|
+| attn_qkv Q5_K | 163 | 159 | **199** |
+| attn_gate IQ4_XS | 90 | 104 | |
+| ffn_gate_exps[0] (1 expert) | 14 | **29** | |
+| output Q6_K | 261 | 173 | **272** |
+
+Composed 4 L × 3 T: wide + lm on x8r4 **2.97 → 2.82 ms/token** (oracle-exact);
+experts on x8r8 lose in the 8-position shape (3.27), so `anv` = wide x8r4 /
+narrow r1 / expert r8 / out r1 / lm x8r4. Rows-per-workgroup is now read from
+the kernel's name (`…r8.spv` → 8, `…r4.spv` → 4, else 1). Coalescing inside the
+block was a real factor (qkv +22%), not the whole gap: 199 of 598. Session
+tally, B70 4-layer token: 3.63 → 2.82 (−22%); 40-layer estimate ≈ 40 × 0.28 +
+1.7 ≈ **13 ms, ~75 tok/s**.
+
 What this is not yet: the 40-layer model on a device with room (the serving
 processes own the memory), prompt-side prefill (tokens are fed one at a time),
 sampling other than argmax, distribution parity with llama.cpp over a real
