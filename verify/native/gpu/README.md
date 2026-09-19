@@ -174,8 +174,24 @@ Two findings, one lever pulled:
   on this box: 26 of 31 GB used with swap active while the 17 GB llama-server is
   resident.
 
-Layout choice is per (backend, tensor), as the Deno-era table already said; the
-generator will need that table.
+**Correction (tick 3, same day).** The x8 numbers above were taken BEFORE the
+clocks were pinned and are governor-confounded. With `jetson_clocks` in force,
+r1 ≈ x8 ≈ r8 on Xavier: Q5_K attn_qkv 13.8 / 14.0 / 11.8 GB/s, IQ4_XS gate
+10.8 / 10.4, lm_head 20.4 / 17.6 / 19.5. The structure claim survives in a
+weaker form: the control probe reaches 33 GB/s and the f32 kernel 79 GB/s
+(pinned), so the K-quant kdot on nvgpu loses ~2.4× to dequant arithmetic and
+loads and ~2.4× more to the 64-thread structure. `kdot_s1_r1.comp` (the block's
+16-byte header staged through shared memory once per block, scales read from
+there) is the first real gain on the arithmetic side: 14 → **17 GB/s**, correct.
+
+`gen_decode_tokens_guest.cljk` now takes a backend (`anv | radv | nvgpu`) and picks
+the kernel per tensor class (`:wide` / `:narrow` / `:lm`) from `layout-table`. In the
+composed 12-layer × 3-token step the table changes nothing measurable (K16
+28.0 vs 27.8 ms; Xavier 60.4 vs 59.7): at this depth K16 is already near its
+bandwidth (~0.9 GB of weights actually touched per token — 8 of 256 experts —
+in 28 ms ≈ 32 GB/s of ~44), and Xavier's 60 ms is ~15 GB/s, i.e. the kdot
+ceiling above plus per-dispatch cost. The next Xavier levers are the dequant
+path (s1, then fewer loads per value) and fewer dispatches per layer.
 
 What this is not yet: the 40-layer model on a device with room (the serving
 processes own the memory), prompt-side prefill (tokens are fed one at a time),
