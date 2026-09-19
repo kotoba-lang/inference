@@ -15,8 +15,11 @@ layout(std430, binding = 2) readonly buffer X { float x[]; };
 layout(std430, binding = 3) buffer O { float outp[]; };
 layout(std430, binding = 4) readonly buffer E { uint expert_ids[]; };
 
-const uint ROWS_PER_WG = 8u;
-shared float partial[512];
+#ifndef ROWS
+#define ROWS 8   // rows per workgroup; -DROWS=4|16|32 builds kdot_f32_r4 / r16 / r32 (iteration 29 sweep)
+#endif
+const uint ROWS_PER_WG = uint(ROWS);
+shared float partial[ROWS * 64];
 
 uint weight_byte(uint offset) { return (weights[offset >> 2u] >> ((offset & 3u) * 8u)) & 255u; }
 float weight_half(uint offset) {
@@ -105,7 +108,7 @@ void main() {
   uint block_bytes = block_bytes_of(tt);
   uint row_bytes = blocks * block_bytes;
   uint index = t * 4u;
-  float acc[8]; float mins[8];
+  float acc[ROWS]; float mins[ROWS];
   for (uint r = 0u; r < ROWS_PER_WG; r++) { acc[r] = 0.0; mins[r] = 0.0; }
   uint nrows = min(ROWS_PER_WG, params.rows - min(row0, params.rows));
   if (position < params.positions) {
