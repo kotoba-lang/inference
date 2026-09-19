@@ -829,6 +829,20 @@ rows `x rel` ≤ 1.3e-5. Left in the prefill: the MoE expert kdots (their
 weights differ per position; sharing needs grouping by expert), the delta-net's
 P steps (~12 ms), the lm_head (~10 ms).
 
+**Tick 35 (iteration 40, C-2): the tokenizer.** `gguf_tokenizer.cljk` (kbb) reads
+`tokenizer.ggml.tokens` / `merges` / `pre` from the GGUF header alone and
+implements byte-level BPE — the qwen2/gpt2 pre-tokenizer regex (`\p{L}` /
+`\p{N}` classes, the contraction and whitespace alternatives), GPT-2's
+byte→unicode map, greedy lowest-rank merges — and the inverse for decode.
+`tokenizer_check.cljk` runs a corpus through it and through llama-server's
+`/tokenize` (`add_special false`): **12/12 lines equal** on
+`tokenizer_corpus.txt` (English, Japanese, Korean/Russian, German with
+apostrophes, Python, prices and dates, emoji, contractions, leading/trailing
+and multiple spaces, a URL), and decode round-trips the text. This is the
+serving shell's text ↔ ids; the guest keeps taking ids. Not covered yet:
+special tokens (`<|im_start|>` etc. must be spliced by the chat-template layer,
+not the BPE), and `add_special` (Qwen adds no BOS).
+
 What this is not yet: the 40-layer model on a device with room (the serving
 processes own the memory), prompt-side prefill (tokens are fed one at a time),
 sampling other than argmax, distribution parity with llama.cpp over a real
