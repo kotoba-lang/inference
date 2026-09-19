@@ -14,7 +14,7 @@
 ;; Root ADR-2609182400 C.
 (require '["fs" :as fs] '[clojure.string :as str])
 (def args (vec *command-line-args*))
-(when-not (<= 6 (count args) 10) (println "usage: <file.gguf> <layers> <tokens> <prompt-token-id[,id...]> <dir-on-box> <out.kotoba> [anv|radv|nvgpu|nvgpu-exact] [stream|flat|fn|prefill] [sample:<T>:<top_p>:<seed>|-] [runtime|resident|resident-replay]") (js/process.exit 2))
+(when-not (<= 6 (count args) 10) (println "usage: <file.gguf> <layers> <tokens> <prompt-token-id[,id...]> <dir-on-box> <out.kotoba> [anv|radv|nvgpu|nvgpu-exact] [stream|flat|fn|prefill|prefill-flat] [sample:<T>:<top_p>:<seed>|-] [runtime|resident|resident-replay]") (js/process.exit 2))
 ;; runtime (fn mode, iteration 41): the prompt ids are read when the guest RUNS -- :env/read NEX_PROMPT
 ;; ("760,6511,...") written to the device with WRITEDEC -- and main takes (prompt length, tokens to
 ;; generate) as its two i64 arguments (the loader's argv; the native slice has string-from-i64 but no
@@ -49,12 +49,17 @@
 ;; per token). Default since iteration 16 is the FUNCTION program: handles are
 ;; computed on the device side of the string (string-from-i64), layers and
 ;; tokens are recursions, the position and the token buffer live on the device.
-(def prefill? (= "prefill" (str/replace mode-arg "-nofuse" "")))
+;; prefill (iteration 47: fn mode, so 40 layers compile -- the literal program hit the 64 KiB string limit at
+;; 40 layers): the layer functions take PF rows; each recurrent layer seeds its stepbuf (pos_seed) from the
+;; position and runs P delta-net steps; the step ends with pos_add PF. "prefill-flat" is the iteration 37-39
+;; literal program, kept for the small parity runs.
+(def prefill? (contains? #{"prefill" "prefill-flat"} (str/replace mode-arg "-nofuse" "")))
+(def prefill-flat? (= "prefill-flat" (str/replace mode-arg "-nofuse" "")))
 ;; prefill (iteration 37): the P prompt tokens go through every layer as ONE batch -- the kdots
 ;; with positions = P (weights read once), the row-wise ops with P rows, the delta-net step as
 ;; P sequential dispatches on a per-layer step counter. Emitted as a single flat command buffer;
 ;; the answer is "<ns>|<x of all P rows>|<argmax of the last row>". Recurrent layers only so far.
-(def flat? (or prefill? (= "flat" (str/replace mode-arg "-nofuse" ""))))
+(def flat? (or prefill-flat? (= "flat" (str/replace mode-arg "-nofuse" ""))))
 (def fn-mode? (not (or stream? flat?)))
 (def gguf (args 0)) (def layers (js/parseInt (args 1))) (def ntok (js/parseInt (args 2))) (def box (args 4)) (def out (args 5))
 ;; <prompt-token-id> may be a comma-separated list: the first P steps are FORCED to
@@ -174,7 +179,7 @@
 (defn fresh [prefix] (swap! counter inc) (str prefix @counter))
 ;; --- the plan ---
 (def zeros16 (alloc! 16))
-(def ops (into {} (for [op ["rmsnorm" "l2norm" "gated_rmsnorm" "silu_mul" "conv1d_step" "softmax_topk" "gate_decay2" "weighted_sum" "add" "f32_matvec" "add_rmsnorm" "rope_neox" "attn_decode" "argmax_partial" "argmax_final" "copy_at" "pos_incr" "pos_incr2" "sample_part" "sample_probs" "sample_bisect_part" "sample_bisect_step" "sample_final" "ctl"]] [op (pipeline! (str "nex_" op ".spv") 7)])))
+(def ops (into {} (for [op ["rmsnorm" "l2norm" "gated_rmsnorm" "silu_mul" "conv1d_step" "softmax_topk" "gate_decay2" "weighted_sum" "add" "f32_matvec" "add_rmsnorm" "rope_neox" "attn_decode" "argmax_partial" "argmax_final" "copy_at" "pos_incr" "pos_incr2" "sample_part" "sample_probs" "sample_bisect_part" "sample_bisect_step" "sample_final" "ctl" "pos_add" "pos_seed"]] [op (pipeline! (str "nex_" op ".spv") 7)])))
 (def kdot-wide (pipeline! (:wide layouts) 5))
 (def kdot-narrow (pipeline! (:narrow layouts) 5))
 (def kdot-lm (pipeline! (:lm layouts) 5))
@@ -253,13 +258,14 @@
 ;; stream mode: one meta per kind, position read from posbuf on the device
 (def posbuf (alloc! 16))
 (def m-ropeq-dyn (ops-meta-dyn! 256 16 nrot 0 0 rope-base)) (def m-ropek-dyn (ops-meta-dyn! 256 2 nrot 0 0 rope-base))
-(def m-attn-dyn (ops-meta-dyn! 256 16 0 2 -1.0 (/ 1.0 16.0))) (def m-copy-dyn (ops-meta-dyn! 512 1 0 512 0 0))
+(def m-attn-dyn (ops-meta-dyn! 256 16 0 2 -1.0 (/ 1.0 16.0))) (def m-copy-dyn (ops-meta-dyn! (* 512 PF) 1 0 512 0 0))   ;; prefill: P consecutive rows in one copy (iteration 47)
 ;; fn mode: the token buffer holds the prompt, then argmax_final appends each next token; embed reads slot pos
 (def tokbuf (let [b (alloc! (if runtime? (* 4 4096) (max 16 (* 4 (+ ntok 1)) (* 4 (count prompt)))))] (when-not runtime? (write! b (apply str (map le32 prompt)))) b))   ;; holds the prompt and every decoded token (runtime: 4096 slots, filled by WRITEDEC)
 (def m-embed-dyn (let [m (alloc! 16)] (write! m (str (le32 2048) (le32 0) (le32 1) (le32 0))) m))
 (def m-am2-dyn (let [m (alloc! 32)] (write! m (str (le32 248320) (le32 1) (le32 61) (le32 (if resident? 4096 (count prompt))) (lef32 0) (lef32 0) (lef32 0) (lef32 1))) m))   ;; resident: the shell is the only writer of the token buffer
 (def ctrl (when resident? (alloc! 16)))   ;; resident: "<token id>,<reset flag>" lands here (WRITEDEC), read by ctl
 (def m-incr (ops-meta! 1 1 0 0 0 0))
+(def m-padd (when prefill? (ops-meta! PF 1 0 0 0 0)))   ;; pos_add: n = the batch
 ;; sampler meta: n rows aux(=ids slot 61) aux2(=prompt length) eps(=T) scale(=top_p) p0(=seed bits) p1(=1)
 (def m-sample (when sampling (let [m (alloc! 32)] (write! m (str (le32 248320) (le32 1) (le32 61) (le32 (count prompt)) (lef32 (:T sampling)) (lef32 (:top-p sampling)) (le32 (:seed sampling)) (lef32 1))) m)))
 (def sample-o (when sampling (alloc! 1024)))          ;; partial max / Z / mass, lo / hi
@@ -284,7 +290,8 @@
 (def ans-binds (atom []))
 
 ;; one layer's dispatches, for any handle representation (literal or "$symbol")
-(defn emit-layer! [il w xin xout ring S kc vc mrq mrk mattn mcopy pb]
+(defn emit-layer! [il w xin xout ring S kc vc mrq mrk mattn mcopy pb & [sb]]
+        (when (and prefill? sb fn-mode?) (dispatch! (ops "pos_seed") 1 1 1 m-incr pb zeros16 zeros16 zeros16 zeros16 sb))   ;; stepbuf = [base position, row 0]
         (dispatch! (ops "rmsnorm") PF 1 1 m-norm xin (:norm w) zeros16 h zeros16 zeros16)
         (if (= 1 (recurrent il))
           (do
@@ -299,7 +306,7 @@
             (pkdotc! kdot-narrow (:narrow layouts) 32 m-ab (:beta w) h betaL zerosP)
             (if fused?
               (if prefill?
-                (let [sb (stepbufs (count (filter #(= 1 (recurrent %)) (range il))))]
+                (let [sb (or sb (stepbufs (count (filter #(= 1 (recurrent %)) (range il)))))]
                   (dotimes [_ PF]
                     (dispatch! deltanet-fused 32 1 1 m-fused qkv (:conv w) ring alpha betaL (:dt w) (:a w) S (:ssm-norm w) z gnorm sb)
                     (dispatch! (ops "pos_incr2") 1 1 1 m-incr zeros16 zeros16 zeros16 zeros16 zeros16 sb)))
@@ -435,7 +442,8 @@
 (defn fn-body-src [fname keys rec?]
   (reset! lines [])
   (let [w (into {} (map-indexed (fn [i k] [k (hexpr (str "(+ w0 " i ")"))]) keys))]
-    (emit-layer! (if rec? 0 3) w (hexpr "xin") (hexpr "xout") (when rec? (hexpr "ring")) (when rec? (hexpr "S")) (when-not rec? (hexpr "kc")) (when-not rec? (hexpr "vc")) m-ropeq-dyn m-ropek-dyn m-attn-dyn m-copy-dyn posbuf))
+    (emit-layer! (if rec? 0 3) w (hexpr "xin") (hexpr "xout") (when rec? (hexpr "ring")) (when rec? (hexpr "S")) (when-not rec? (hexpr "kc")) (when-not rec? (hexpr "vc")) m-ropeq-dyn m-ropek-dyn m-attn-dyn m-copy-dyn posbuf
+                 (when (and rec? prefill?) (hexpr (str "(+ S " (- (js/parseInt (first stepbufs)) (js/parseInt (first states))) ")")))))   ;; stepbuf handle = S + (SB0 - S0): both run one per recurrent layer
   (let [params (concat ["w0" "xin" "xout"] (if rec? ["ring" "S"] ["kc" "vc"])) body @lines]
     (str "(defn " fname " [" (str/join " " (map #(str % " :i64") params)) "] :string\n"
          "  (do\n" (str/join "\n" (map #(str "    (gpu " % ")") body)) "))\n")))
@@ -457,7 +465,7 @@
   (let [x-final (if (odd? (dec layers)) xb xa)]
     (step! (q "BEGIN"))
     (when resident? (dispatch! (ops "ctl") 1 1 1 m-incr zeros16 tokbuf ctrl zeros16 zeros16 posbuf))
-    (dispatch! embed 1 1 1 m-embed-dyn w-embd tokbuf x posbuf)
+    (dispatch! embed 1 PF 1 m-embed-dyn w-embd tokbuf x posbuf)
     (step! (str "(layers 0 " layers ")"))
     (dispatch! (ops "rmsnorm") PF 1 1 m-norm x-final w-out-norm zeros16 hN zeros16 zeros16)
     (if i8-lm
@@ -472,12 +480,14 @@
         (apply dispatch! (ops "sample_final") 1 1 1 h))
       (do (dispatch! (ops "argmax_partial") 61 1 1 m-am1 logits zeros16 zeros16 zeros16 amax-s amax-ids)
           (dispatch! (ops "argmax_final") 1 1 1 m-am2-dyn amax-s tokbuf posbuf amax-s amax-s amax-ids)))
-    (dispatch! (ops "pos_incr") 1 1 1 m-incr zeros16 zeros16 zeros16 zeros16 zeros16 posbuf)
+    (if prefill?
+      (dispatch! (ops "pos_add") 1 1 1 m-padd zeros16 zeros16 zeros16 zeros16 zeros16 posbuf)
+      (dispatch! (ops "pos_incr") 1 1 1 m-incr zeros16 zeros16 zeros16 zeros16 zeros16 posbuf))
     (str ";; one token: embed(tokbuf[pos]) -> layers -> lm_head -> argmax (appends tokbuf[pos+1]) -> pos+1; answers accumulate as ns|x|id joined by #\n"
          "(defn token-step [pos :i64 n :i64 acc :string] :string\n"
          "  (if (< pos n)\n    (do\n"
          (str/join "\n" (map #(if (str/starts-with? % "(layers") (str "      " %) (str "      (gpu " % ")")) @lines)) "\n"
-         "      (let [ns (gpu \"SUBMIT\")\n            xr (gpu \"READ " x-final " 0 8192\")\n            idr (gpu \"READ " amax-ids " 244 4\")]\n"
+         "      (let [ns (gpu \"SUBMIT\")\n            xr (gpu \"READ " x-final " 0 " (* PF 8192) "\")\n            idr (gpu \"READ " amax-ids " 244 4\")]\n"
          "        (token-step (+ pos 1) n (string-concat acc (string-concat (if (= pos 0) \"\" \"#\") (string-concat ns (string-concat \"|\" (string-concat xr (string-concat \"|\" idr)))))))))\n"
          "    acc))\n"
          (when resident?
