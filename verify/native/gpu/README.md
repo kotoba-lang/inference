@@ -121,13 +121,35 @@ dispatches per command buffer, 256 → 4096 buffers, the 1 MiB SOURCE bound that
 `extract-native` applied to a 1.09 MB artifact (now the 8 MiB EDN bound); and
 the guest needs `KEXE_PAIRS=1048576` (one pair per string) beyond ~300 requests.
 
-What this is not yet: the composed decode step over TOKENS. One token at
-position 0 runs end to end (embedding row → N layers → lm_head → argmax); remaining:
-the full 40 layers on a device with room (the serving process owns the memory on
-all three boxes today), the KV-cache append and rope position for tokens > 0,
-embedding lookup on the GPU (dequant the argmax'd row), the token loop in
-`.kotoba` (position as a per-token meta write), distribution parity with
-llama.cpp over a prompt, and the per-backend kernel layouts (Xavier). The intended end is amu's
-accelerator KIR emitting SPIR-V. Xavier
-runs this path instead of CUDA (JetPack 5.1.2 cannot run a vLLM that knows
-Nex; owner 2026-09-18).
+## Greedy decode over tokens, entirely on the device (2026-09-19, kaizen loop tick 1)
+
+`gen_decode_tokens_guest.cljk <gguf> <layers> <tokens> <prompt-id> <dir> <out>`:
+the prompt id is `WRITE`n once; `embed_iq4xs.comp` dequantises the token's
+embedding row on the device, reading the id from the prompt buffer for token 0
+and from the **argmax buffer** for every later token — no id ever crosses back
+to the host. State stays in device buffers across steps: conv ring, delta-net S,
+and the KV cache (`copy_at` appends this token's rope'd k and v at row `pos`;
+`attn_decode` runs with `T = pos + 1` and rope with `aux2 = pos`, all as
+per-position metas written before the first `BEGIN`). One command buffer per
+token. `decode_tokens_ref.py` is the stateful f64 oracle (ring / S / KV
+carried), `decode_tokens_check.py` compares every step:
+
+| box | layers | tokens | per-token command buffer | argmax per step |
+|---|---|---|---|---|
+| B70 (vLLM resident) | 4 | 3 | 16.8 / 11.2 / 6.7 ms | 59315, 149044, 169222 = ref |
+| K16 iGPU | 12 | 3 | 28.7 / 27.8 / 27.8 ms | 163967, 1320, 11278 = ref |
+| Xavier (aarch64 kexe) | 12 | 3 | 139.8 / 103.3 / 88.6 ms | 163967, 1320, 11278 = ref |
+
+x after the last layer: rel ≤ 7.5e-6 at every step on every box.
+
+A language ceiling met and routed around: binding every handle in one `let`
+(358 bindings + the request temporaries over ~1,400 requests) hits kotoba-mir's
+`:spill-frame-too-large` at 4,095 slots (the AArch64 `ldr [sp, #imm12*8]` reach).
+The loader assigns buffer and pipeline handles sequentially per kind, so the
+generator writes every handle as a literal and the program keeps nothing live
+between requests — 5× less machine code, and the bound is not approached.
+
+What this is not yet: the 40-layer model on a device with room (the serving
+processes own the memory), prompt-side prefill (tokens are fed one at a time),
+sampling other than argmax, distribution parity with llama.cpp over a real
+prompt, and the per-backend kernel layouts (Xavier).
