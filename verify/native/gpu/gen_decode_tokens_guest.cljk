@@ -14,7 +14,13 @@
 ;; Root ADR-2609182400 C.
 (require '["fs" :as fs] '[clojure.string :as str])
 (def args (vec *command-line-args*))
-(when-not (<= 6 (count args) 7) (println "usage: <file.gguf> <layers> <tokens> <prompt-token-id[,id...]> <dir-on-box> <out.kotoba> [anv|radv|nvgpu|nvgpu-h2]") (js/process.exit 2))
+(when-not (<= 6 (count args) 8) (println "usage: <file.gguf> <layers> <tokens> <prompt-token-id[,id...]> <dir-on-box> <out.kotoba> [anv|radv|nvgpu|nvgpu-h2] [stream]") (js/process.exit 2))
+;; stream: the layer weights are MAPped per layer per token and FREEd after the
+;; layer's command buffer, so the whole 40-layer model runs on a device that
+;; cannot hold it (K16 GTT 13 GiB vs 17.4 GB of weights) -- for parity, not
+;; speed (every token re-uploads the weights). The loader hands out the lowest
+;; free slot, so the generator keeps the same free list (iteration 14).
+(def stream? (= "stream" (get args 7)))
 (def gguf (args 0)) (def layers (js/parseInt (args 1))) (def ntok (js/parseInt (args 2))) (def box (args 4)) (def out (args 5))
 ;; <prompt-token-id> may be a comma-separated list: the first P steps are FORCED to
 ;; these tokens (prefill at decode speed, one command buffer per prompt token) and
@@ -82,25 +88,41 @@
 ;; same guest with literal handles compiles.
 (def lines (atom []))
 (def next-buffer (atom 1))
+(def free-slots (atom (sorted-set)))
+(defn alloc-slot! [] (if-let [f (first @free-slots)] (do (swap! free-slots disj f) f) (let [h @next-buffer] (swap! next-buffer inc) h)))
 (def next-pipeline (atom 1))
 (defn le32 [v] (let [b (js/Buffer.alloc 4)] (.writeUInt32LE b (js/Number v) 0) (.toString b "hex")))
 (defn lef32 [v] (let [b (js/Buffer.alloc 4)] (.writeFloatLE b v 0) (.toString b "hex")))
 (defn step! [req-expr] (swap! lines conj req-expr))
 (defn q [s] (str "\"" s "\""))
+(defn free! [h] (step! (q (str "FREE " h))) (swap! free-slots conj (js/parseInt h)))
 (defn cat [& xs] (reduce (fn [a b] (str "(string-concat " a " " b ")")) xs))
 (defn map-tensor! [nm]
-  (let [t (T* nm) h @next-buffer] (swap! next-buffer inc) (step! (q (str "MAP " box "/nex.gguf " (+ data-start (:offset t)) " " (tensor-bytes t)))) (str h)))
-(defn alloc! [bytes] (let [h @next-buffer] (swap! next-buffer inc) (step! (q (str "ALLOC " bytes))) (str h)))
+  (let [t (T* nm) h (alloc-slot!)] (step! (q (str "MAP " box "/nex.gguf " (+ data-start (:offset t)) " " (tensor-bytes t)))) (str h)))
+(defn alloc! [bytes] (let [h (alloc-slot!)] (step! (q (str "ALLOC " bytes))) (str h)))
 (defn zero! [h] (step! (q (str "ZERO " h))))
 (defn write! [h hex] (step! (q (str "WRITE " h " 0 " hex))))
 (defn pipeline! [spv bindings] (let [h @next-pipeline] (swap! next-pipeline inc) (step! (q (str "PIPELINE " box "/" spv " " bindings))) (str h)))
-(defn dispatch! [pipe x y z & handles] (step! (q (str "DISPATCH " pipe " " x " " y " " z " " (str/join " " handles)))))
+;; A handle written "$name" is a Kotoba VARIABLE of the generated program (stream
+;; mode: the layer body is a function of its weight handles); anything else is a
+;; literal. Consecutive literal pieces are merged into one quoted string.
+(defn sym? [h] (and (string? h) (str/starts-with? h "$")))
+(defn req-expr [pieces]
+  (let [parts (reduce (fn [acc p] (if (sym? p) (conj acc p)
+                                    (if (and (seq acc) (not (sym? (peek acc)))) (conj (pop acc) (str (peek acc) p)) (conj acc p))))
+                      [] pieces)]
+    (if (and (= 1 (count parts)) (not (sym? (first parts)))) (q (first parts))
+        (apply cat (map #(if (sym? %) (subs % 1) (q %)) parts)))))
+(defn dispatch-expr [op pipe x y z handles] (req-expr (concat [(str op " " pipe " " x " " y " " z)] (mapcat (fn [h] [" " h]) handles))))
+(defn dispatch! [pipe x y z & handles] (step! (dispatch-expr "DISPATCH" pipe x y z handles)))
 ;; DISPATCHC = no barrier before this dispatch (amu loader, 2026-09-19): the
 ;; generator asserts that it reads nothing written, and writes nothing touched,
 ;; since the last plain DISPATCH. Measured floor per dispatch with / without the
 ;; barrier: B70 13 / 0.18 us, K16 2.7 / 0.15, Xavier 3.5 / 0.35 (iteration 10).
-(defn dispatchc! [pipe x y z & handles] (step! (q (str "DISPATCHC " pipe " " x " " y " " z " " (str/join " " handles)))))
+(defn dispatchc! [pipe x y z & handles] (step! (dispatch-expr "DISPATCHC" pipe x y z handles)))
 (defn ops-meta! [n rows aux aux2 eps scale] (let [m (alloc! 32)] (write! m (str (le32 n) (le32 rows) (le32 aux) (le32 aux2) (lef32 eps) (lef32 scale) (lef32 0) (lef32 0))) m))
+;; p1 = 1: the kernel takes the position from the pos buffer (binding 6) -- nex_ops.comp dyn_pos
+(defn ops-meta-dyn! [n rows aux aux2 eps scale] (let [m (alloc! 32)] (write! m (str (le32 n) (le32 rows) (le32 aux) (le32 aux2) (lef32 eps) (lef32 scale) (lef32 0) (lef32 1))) m))
 (defn kdot-meta! [rows cols type positions input-per-expert] (let [m (alloc! 32)] (write! m (str (le32 rows) (le32 cols) (le32 type) (le32 positions) (le32 input-per-expert) (le32 0) (le32 0) (le32 0))) m))
 (def counter (atom 0))
 (defn fresh [prefix] (swap! counter inc) (str prefix @counter))
@@ -151,7 +173,11 @@
 (def m-ropek (vec (for [pos (range ntok)] (ops-meta! 256 2 nrot pos 0 rope-base))))
 (def m-attn (vec (for [pos (range ntok)] (ops-meta! 256 16 (inc pos) 2 -1.0 (/ 1.0 16.0)))))
 (def m-copy (vec (for [pos (range ntok)] (ops-meta! 512 1 0 (* pos 512) 0 0))))
-(def layer-w (vec (for [il (range layers)]
+;; stream mode: one meta per kind, position read from posbuf on the device
+(def posbuf (alloc! 16))
+(def m-ropeq-dyn (ops-meta-dyn! 256 16 nrot 0 0 rope-base)) (def m-ropek-dyn (ops-meta-dyn! 256 2 nrot 0 0 rope-base))
+(def m-attn-dyn (ops-meta-dyn! 256 16 0 2 -1.0 (/ 1.0 16.0))) (def m-copy-dyn (ops-meta-dyn! 512 1 0 512 0 0))
+(defn layer-weights! [il]
   (let [p (str "blk." il ".") m (fn [nm] (map-tensor! (str p nm)))]
     (merge {:norm (m "attn_norm.weight") :post (m "post_attention_norm.weight") :router (m "ffn_gate_inp.weight") :shgate-inp (m "ffn_gate_inp_shexp.weight")
             :gate-exps (m "ffn_gate_exps.weight") :up-exps (m "ffn_up_exps.weight") :down-exps (m "ffn_down_exps.weight")
@@ -159,20 +185,17 @@
            (if (= 1 (recurrent il))
              {:qkv (m "attn_qkv.weight") :gate (m "attn_gate.weight") :alpha (m "ssm_alpha.weight") :beta (m "ssm_beta.weight") :dt (m "ssm_dt.bias") :a (m "ssm_a")
               :conv (m "ssm_conv1d.weight") :ssm-norm (m "ssm_norm.weight") :out (m "ssm_out.weight")}
-             {:q (m "attn_q.weight") :k (m "attn_k.weight") :v (m "attn_v.weight") :qn (m "attn_q_norm.weight") :kn (m "attn_k_norm.weight") :o (m "attn_output.weight")}))))))
+             {:q (m "attn_q.weight") :k (m "attn_k.weight") :v (m "attn_v.weight") :qn (m "attn_q_norm.weight") :kn (m "attn_k_norm.weight") :o (m "attn_output.weight")}))))
+(def layer-w (if stream? nil (vec (for [il (range layers)] (layer-weights! il)))))
 ;; --- T tokens, one command buffer each; the answer is per-token "ns|x hex|argmax hex" joined by "#" ---
 (def token-answers (atom []))
 (def ans-binds (atom []))
-(doseq [pos (range ntok)]
-  (step! (q "BEGIN"))
-  (dispatch! embed 1 1 1 (if (< pos (count prompt)) (m-embedP pos) m-embed1) w-embd (if (< pos (count prompt)) prompt-ids amax-ids) x)
-  (let [rec-index (atom 0) att-index (atom 0)]
-    (doseq [il (range layers)]
-      (let [w (layer-w il) xin (if (zero? il) x (if (odd? il) xa xb)) xout (if (odd? il) xb xa)]
+
+;; one layer's dispatches, for any handle representation (literal or "$symbol")
+(defn emit-layer! [il w xin xout ring S kc vc mrq mrk mattn mcopy pb]
         (dispatch! (ops "rmsnorm") 1 1 1 m-norm xin (:norm w) zeros16 h zeros16 zeros16)
         (if (= 1 (recurrent il))
-          (let [ring (rings @rec-index) S (states @rec-index)]
-            (swap! rec-index inc)
+          (do
             (dispatch! kdot-wide (wg-of (:wide layouts) 8192) 1 1 m-qkv (:qkv w) h qkv zeros16)
             (dispatchc! kdot-wide (wg-of (:wide layouts) 4096) 1 1 m-gate (:gate w) h z zeros16)
             (dispatchc! kdot-narrow 32 1 1 m-ab (:alpha w) h alpha zeros16)
@@ -185,18 +208,17 @@
             (dispatch! deltanet 32 1 1 m-dn qn kn conv gb beta-only S dn)
             (dispatch! (ops "gated_rmsnorm") 32 1 1 m-gn dn (:ssm-norm w) z gnorm zeros16 zeros16)
             (dispatch! kdot-wide (wg-of (:wide layouts) 2048) 1 1 m-out (:out w) gnorm attn-out zeros16))
-          (let [kc (kcaches @att-index) vc (vcaches @att-index)]
-            (swap! att-index inc)
+          (do
             (dispatch! kdot-wide (wg-of (:wide layouts) 8192) 1 1 m-q (:q w) h qfull zeros16)
             (dispatchc! kdot-narrow 512 1 1 m-k (:k w) h kproj zeros16)
             (dispatchc! kdot-narrow 512 1 1 m-v (:v w) h vproj zeros16)
             (dispatch! (ops "rmsnorm") 16 1 1 m-qnorm qfull (:qn w) zeros16 qnorm zeros16 zeros16)
             (dispatchc! (ops "rmsnorm") 2 1 1 m-knorm kproj (:kn w) zeros16 knorm zeros16 zeros16)
-            (dispatch! (ops "rope_neox") 16 1 1 (m-ropeq pos) qnorm zeros16 zeros16 qrope zeros16 zeros16)
-            (dispatchc! (ops "rope_neox") 2 1 1 (m-ropek pos) knorm zeros16 zeros16 krope zeros16 zeros16)
-            (dispatchc! (ops "copy_at") 2 1 1 (m-copy pos) vproj zeros16 zeros16 vc zeros16 zeros16)
-            (dispatch! (ops "copy_at") 2 1 1 (m-copy pos) krope zeros16 zeros16 kc zeros16 zeros16)
-            (dispatch! (ops "attn_decode") 16 1 1 (m-attn pos) qrope kc vc attno qfull zeros16)
+            (dispatch! (ops "rope_neox") 16 1 1 mrq qnorm zeros16 zeros16 qrope zeros16 pb)
+            (dispatchc! (ops "rope_neox") 2 1 1 mrk knorm zeros16 zeros16 krope zeros16 pb)
+            (dispatchc! (ops "copy_at") 2 1 1 mcopy vproj zeros16 zeros16 vc zeros16 pb)
+            (dispatch! (ops "copy_at") 2 1 1 mcopy krope zeros16 zeros16 kc zeros16 pb)
+            (dispatch! (ops "attn_decode") 16 1 1 mattn qrope kc vc attno qfull pb)
             (dispatch! kdot-wide (wg-of (:wide layouts) 2048) 1 1 m-attn-o (:o w) attno attn-out zeros16)))
         (dispatch! (ops "add_rmsnorm") 1 1 1 m-addn xin attn-out (:post w) resid h2 zeros16)
         ;; barrier groups (DISPATCHC = independent of everything since the last DISPATCH)
@@ -212,19 +234,86 @@
         (dispatch! (ops "silu_mul") 16 1 1 m-silu8 gateE upE zeros16 actE zeros16 zeros16)
         (dispatch! kdot-narrow 2048 8 1 m-down-exps (:down-exps w) actE downE ids)
         (dispatch! (ops "weighted_sum") 8 1 1 m-wsum downE topw shdown ffn shlogit zeros16)
-        (dispatch! (ops "add") 8 1 1 m-add resid ffn zeros16 xout zeros16 zeros16))))
+        (dispatch! (ops "add") 8 1 1 m-add resid ffn zeros16 xout zeros16 zeros16))
+
+;; the token's tail: final norm, lm_head, argmax, SUBMIT (bound) and the read-backs
+(defn emit-lm-head! [pos]
   (let [x-final (if (odd? (dec layers)) xb xa)]
     (dispatch! (ops "rmsnorm") 1 1 1 m-norm x-final w-out-norm zeros16 hN zeros16 zeros16)
     (dispatch! kdot-lm (wg-of (:lm layouts) 248320) 1 1 m-lm w-lm hN logits zeros16)
     (dispatch! (ops "argmax_partial") 61 1 1 m-am1 logits zeros16 zeros16 zeros16 amax-s amax-ids)
     (dispatch! (ops "argmax_final") 1 1 1 m-am2 amax-s zeros16 zeros16 amax-s amax-s amax-ids)
     ;; SUBMIT and the read-backs are bound so their answers survive to the end
-    (let [ns (fresh "ns") xr (fresh "xr") idr (fresh "idr")]
-      (swap! ans-binds conj [ns (q "SUBMIT")] [xr (q (str "READ " x-final " 0 8192"))] [idr (q (str "READ " amax-ids " 244 4"))])
-      (swap! token-answers conj (cat ns (q "|") xr (q "|") idr)))))
+    (let [ns (fresh "ns") xr (fresh "xr") idr (fresh "idr") lg (fresh "lg") last? (= pos (dec ntok))]
+      (swap! ans-binds conj (cond-> [[ns (q "SUBMIT")] [xr (q (str "READ " x-final " 0 8192"))] [idr (q (str "READ " amax-ids " 244 4"))]]
+                              (and stream? last?) (conj [lg (q (str "READ " logits " 0 " (* 248320 4)))])))
+      (swap! token-answers conj (if (and stream? last?) (cat ns (q "|") xr (q "|") idr (q "|") lg) (cat ns (q "|") xr (q "|") idr))))))
+(when-not stream?
+  (doseq [pos (range ntok)]
+    (step! (q "BEGIN"))
+    (dispatch! embed 1 1 1 (if (< pos (count prompt)) (m-embedP pos) m-embed1) w-embd (if (< pos (count prompt)) prompt-ids amax-ids) x)
+    (let [rec-index (atom 0) att-index (atom 0)]
+      (doseq [il (range layers)]
+        (let [w (layer-w il) xin (if (zero? il) x (if (odd? il) xa xb)) xout (if (odd? il) xb xa)
+              rec? (= 1 (recurrent il))
+              ring (when rec? (rings @rec-index)) S (when rec? (states @rec-index))
+              kc (when-not rec? (kcaches @att-index)) vc (when-not rec? (vcaches @att-index))]
+          (if rec? (swap! rec-index inc) (swap! att-index inc))
+          (emit-layer! il w xin xout ring S kc vc (m-ropeq pos) (m-ropek pos) (m-attn pos) (m-copy pos) zeros16))))
+    (emit-lm-head! pos)))
+
+;; --- stream mode: the program is FUNCTIONS (the ABI allows 5 parameters, the
+;; module 64 KiB of string literals -- kotoba-sema max-parameters,
+;; kotoba.kir.value/string-value-byte-limit -- so a straight-line 40-layer x
+;; 5-token program (589 KB) is out). Weight handles are LITERAL even though the
+;; layers MAP/FREE per token: the loader hands out the lowest free slot, so
+;; every recurrent layer gets the same 19 slots and every attention layer the
+;; lowest 16 of them. The position is read on the device (posbuf, nex_ops
+;; dyn_pos), so a layer's dispatches are identical every token; the two layer
+;; bodies take only (xin xout ring S) / (xin xout kc vc), and each layer
+;; function takes the MAP prefix.
+(def rec-keys [:norm :post :router :shgate-inp :gate-exps :up-exps :down-exps :gate-sh :up-sh :down-sh :qkv :gate :alpha :beta :dt :a :conv :ssm-norm :out])
+(def att-keys [:norm :post :router :shgate-inp :gate-exps :up-exps :down-exps :gate-sh :up-sh :down-sh :q :k :v :qn :kn :o])
+(def tensor-name {:norm "attn_norm.weight" :post "post_attention_norm.weight" :router "ffn_gate_inp.weight" :shgate-inp "ffn_gate_inp_shexp.weight"
+                  :gate-exps "ffn_gate_exps.weight" :up-exps "ffn_up_exps.weight" :down-exps "ffn_down_exps.weight" :gate-sh "ffn_gate_shexp.weight" :up-sh "ffn_up_shexp.weight" :down-sh "ffn_down_shexp.weight"
+                  :qkv "attn_qkv.weight" :gate "attn_gate.weight" :alpha "ssm_alpha.weight" :beta "ssm_beta.weight" :dt "ssm_dt.bias" :a "ssm_a" :conv "ssm_conv1d.weight" :ssm-norm "ssm_norm.weight" :out "ssm_out.weight"
+                  :q "attn_q.weight" :k "attn_k.weight" :v "attn_v.weight" :qn "attn_q_norm.weight" :kn "attn_k_norm.weight" :o "attn_output.weight"})
+(def const-lines-snapshot (vec (take-while #(not= % (q "BEGIN")) @lines)))
+;; the slot sets: simulate one recurrent and one attention layer's MAP/FREE on the free list as it stands after the constant phase
+(defn simulate-slots! [keys] (let [hs (mapv (fn [_] (str (alloc-slot!))) keys)] (doseq [h hs] (swap! free-slots conj (js/parseInt h))) (zipmap keys hs)))
+(def rec-slots (when stream? (simulate-slots! rec-keys)))
+(def att-slots (when stream? (simulate-slots! att-keys)))
+(defn body-fn-src [fname keys slots rec?]
+  (reset! lines [])
+  (emit-layer! (if rec? 0 3) slots "$xin" "$xout" (when rec? "$ring") (when rec? "$S") (when-not rec? "$kc") (when-not rec? "$vc") m-ropeq-dyn m-ropek-dyn m-attn-dyn m-copy-dyn posbuf)
+  (let [params (concat ["xin" "xout"] (if rec? ["ring" "S"] ["kc" "vc"])) body @lines]
+    (str "(defn " fname " [" (str/join " " (map #(str % " :string") params)) "] :string\n"
+         "  (do\n    (gpu \"BEGIN\")\n" (str/join "\n" (map #(str "    (gpu " % ")") body)) "\n    (gpu \"SUBMIT\")))\n")))
+(def rec-body-src (when stream? (body-fn-src "recurrent-layer" rec-keys rec-slots true)))
+(def att-body-src (when stream? (body-fn-src "attention-layer" att-keys att-slots false)))
+(defn layer-fn-src [il]
+  (let [rec? (= 1 (recurrent il)) keys (if rec? rec-keys att-keys) slots (if rec? rec-slots att-slots) p (str "blk." il ".")
+        rec-i (count (filter #(= 1 (recurrent %)) (range il))) att-i (count (filter #(= 0 (recurrent %)) (range il)))
+        xin (if (zero? il) x (if (odd? il) xa xb)) xout (if (odd? il) xb xa)
+        state-args (if rec? [(rings rec-i) (states rec-i)] [(kcaches att-i) (vcaches att-i)])]
+    (str "(defn layer-" il " [g :string] :string\n  (do\n"
+         (str/join "\n" (map (fn [k] (let [t (T* (str p (tensor-name k)))] (str "    (gpu (string-concat g \" " (+ data-start (:offset t)) " " (tensor-bytes t) "\"))"))) keys)) "\n"
+         "    (" (if rec? "recurrent-layer" "attention-layer") " \"" xin "\" \"" xout "\" \"" (first state-args) "\" \"" (second state-args) "\")\n"
+         (str/join "\n" (map #(str "    (gpu \"FREE " (slots %) "\")") (reverse keys))) "))\n")))
+(def layer-fns-src (when stream? (apply str (map layer-fn-src (range layers)))))
+(when stream?
+  (reset! lines [])
+  (doseq [pos (range ntok)]
+    (write! posbuf (le32 pos))
+    (step! (q "BEGIN"))
+    (dispatch! embed 1 1 1 (if (< pos (count prompt)) (m-embedP pos) m-embed1) w-embd (if (< pos (count prompt)) prompt-ids amax-ids) x)
+    (step! (q "SUBMIT"))
+    (doseq [il (range layers)] (step! (str "(layer-" il " \"MAP " box "/nex.gguf\")")))
+    (step! (q "BEGIN"))
+    (emit-lm-head! pos)))
 ;; --- emit: the constant phase is one let; each token's SUBMIT/READs are nested lets ---
-(def const-steps (vec (take-while #(not= % (q "BEGIN")) @lines)))
-(def token-steps (vec (drop (count const-steps) @lines)))
+(def const-steps (if stream? const-lines-snapshot (vec (take-while #(not= % (q "BEGIN")) @lines))))
+(def token-steps (if stream? (vec @lines) (vec (drop (count const-steps) @lines))))
 ;; token-steps holds every BEGIN..last dispatch in order; SUBMIT/READ are in ans-binds, one triple per token.
 (defn emit-tokens [steps binds answers]
   ;; every token records the same number of lines (BEGIN + its dispatches), so
@@ -232,11 +321,9 @@
   ;; nested let so the answers survive to the final string.
   (let [per (quot (count steps) ntok)
         groups (vec (partition per steps))
-        triples (vec (partition 3 binds))
         body (apply str (map-indexed (fn [i g]
-                                       (let [[ns xr idr] (triples i)]
-                                         (str (str/join "\n" (map #(str "      (gpu " % ")") g)) "\n"
-                                              "      (let [" (first ns) " (gpu " (second ns) ")\n            " (first xr) " (gpu " (second xr) ")\n            " (first idr) " (gpu " (second idr) ")]\n")))
+                                       (str (str/join "\n" (map #(if (str/starts-with? % "(layer-") (str "      " %) (str "      (gpu " % ")")) g)) "\n"
+                                            "      (let [" (str/join "\n            " (map (fn [[nm req]] (str nm " (gpu " req ")")) (binds i))) "]\n"))
                                      groups))]
     (str body "        " (apply cat (interpose (q "#") answers)) (apply str (repeat (count groups) ")")))))
 (def src (str ";; GENERATED by verify/native/gpu/gen_decode_tokens_guest.cljk -- do not edit.\n"
@@ -245,8 +332,9 @@
               ";; Answer: per token \"<ns>|<hex x after the last layer>|<hex argmax id>\", tokens joined by \"#\".\n"
               "(ns gpu.decode-tokens (:export [main]))\n"
               "(defn gpu [r :string] :string\n  (typed-cap-call :gpu/compute :string :string r))\n"
+              (when stream? (str rec-body-src att-body-src layer-fns-src))
               "(defn main [] :string\n"
               "    (do\n" (str/join "\n" (map #(str "      (gpu " % ")") const-steps)) "\n"
               (emit-tokens token-steps @ans-binds @token-answers) "))\n"))
 (fs/writeFileSync out src)
-(println (str "wrote " out ": " (count @lines) " requests, layers " layers " tokens " ntok " buffers " (dec @next-buffer) " pipelines " (dec @next-pipeline) " backend " backend " layouts " (pr-str layouts)))
+(println (str "wrote " out ": " (count @lines) " requests, layers " layers " tokens " ntok " buffers " (dec @next-buffer) " pipelines " (dec @next-pipeline) " backend " backend " layouts " (pr-str layouts) (when stream? " STREAM (per-layer MAP/FREE; last token answers its full logits)")))

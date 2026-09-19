@@ -115,9 +115,16 @@ void op_gate_decay2() {
 }
 // KV-cache append: o[aux2 + i] = a[i] for i < n (aux2 = position * n, the
 // row of this token in a [T_max x heads_kv x d] cache). Copies only.
+// position from the device: when P.p1 != 0 the position is ids[0] (binding 6, a
+// 16-byte buffer the guest WRITEs once per token) instead of a per-position
+// Meta -- so a layer's dispatches are the same request every token and the
+// program can be functions (iteration 14). copy_at: aux2 is then the per-
+// position stride; rope_neox: the angle's position; attn_decode: T = pos + 1.
+uint dyn_pos() { return ids[0]; }
 void op_copy_at() {
   uint i = gl_GlobalInvocationID.x; if (i >= P.n) return;
-  o[P.aux2 + i] = a[i];
+  uint off = (P.p1 != 0.0) ? dyn_pos() * P.aux2 : P.aux2;
+  o[off + i] = a[i];
 }
 void op_weighted_sum() {
   uint i = gl_GlobalInvocationID.x; if (i >= P.n) return;
@@ -130,14 +137,14 @@ void op_rope_neox() {
   for (uint i = t; i < n; i += 256u) {
     if (i >= nrot) { o[base + i] = a[base + i]; continue; }
     uint pair = (i >= hlf) ? i - hlf : i;
-    float theta = float(P.aux2) * pow(P.scale, -2.0 * float(pair) / float(nrot));
+    float theta = float((P.p1 != 0.0) ? dyn_pos() : P.aux2) * pow(P.scale, -2.0 * float(pair) / float(nrot));
     float cs = cos(theta), sn = sin(theta);
     float x0 = a[base + pair], x1 = a[base + pair + hlf];
     o[base + i] = (i >= hlf) ? (x0 * sn + x1 * cs) : (x0 * cs - x1 * sn);
   }
 }
 void op_attn_decode() {
-  uint h = gl_WorkGroupID.x, t = gl_LocalInvocationID.x, d = P.n, T = P.aux; uint hkv = h / (P.rows / P.aux2);
+  uint h = gl_WorkGroupID.x, t = gl_LocalInvocationID.x, d = P.n, T = (P.p1 != 0.0) ? dyn_pos() + 1u : P.aux; uint hkv = h / (P.rows / P.aux2);
   float sc = -1e30;
   if (t < T) {
     float dt = 0.0;
