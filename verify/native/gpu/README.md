@@ -657,6 +657,34 @@ int→float conversions (the K-quant `codes` words are already byte-per-code, so
 the dot consumes them directly; mins and the Q6_K −32 fold into a Σx term).
 That is the next kernel, and its numerics are llama.cpp's own.
 
+**Tick 26 (iteration 31, B-8): the dp4a kdot, measured.** `nex_ops.comp`
+`quant_q8` (per 32-value block: scale = max|x|/127, int8 codes four to a word;
+thread = block) and `kdot_i8_r8.comp` (r8 shape; `dotPacked4x8EXT` on the
+byte-per-code K-quant words against the int8 activation word; the K-quant mins
+and Q6_K's −32 use one more dot with `0x01010101`; IQ4_XS packs the four
+codebook values into an int; six bindings). The system glslang (15.1) does not
+know `GL_EXT_integer_dot_product`; glslang 16.6 from the Khronos release does
+(`/opt/glslang-16.6`, `glslang16` on B70). `gen_kdot_guest.cljk … i8r8` runs the
+quantizer then the kdot. B70, pinned:
+
+| tensor | f32 r8 | **i8 r8** | i8 error vs f64 |
+|---|---|---|---|
+| attn_qkv Q5_K | 168 GB/s | **193** | rel-RMS 6.1e-3 (max-rel 0.20 on the 1e-2 floor) |
+| attn_gate IQ4_XS | 90 | 99 | |
+| ffn_gate_exps[0] | 13 | 14 | |
+| output Q6_K | 261 | **289** | rel-RMS 4.5e-3 |
+
+Correct at Q8-activation precision (the error is the quantization of a
+random-normal activation, llama.cpp's own regime) and **+11–15%** — not the 2×
+the floor suggested, so on ANV the K-quant kdot's remaining cost is not the
+multiply-accumulate either: what stays is the code extraction (shifts, masks)
+and the 4-byte-granular loads (the 598 GB/s floor was measured with 16-byte
+`vec4` loads; the block layout gives each thread 4-byte words). The lever that
+is left is layout: 16-byte loads per thread (`uvec4`, 16 values per thread per
+block) with rows in flight — an "r8 × x16" kernel. Wiring `i8r8` into the token
+loop needs a `quant_q8` before each of a layer's six kdot inputs; that is the
+generator work of the next tick if the layout idea does not beat it.
+
 What this is not yet: the 40-layer model on a device with room (the serving
 processes own the memory), prompt-side prefill (tokens are fed one at a time),
 sampling other than argmax, distribution parity with llama.cpp over a real
