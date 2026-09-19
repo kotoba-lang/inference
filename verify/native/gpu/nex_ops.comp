@@ -132,23 +132,26 @@ void op_weighted_sum() {   // workgroup y = token (prefill): a [(y*aux+e) x n], 
   for (uint e = 0u; e < P.aux; e++) acc += b[y * P.aux + e] * a[(y * P.aux + e) * P.n + i];
   o[y * P.n + i] = acc + c[y * P.n + i] * sigmoid(s[y]);
 }
-void op_rope_neox() {
+void op_rope_neox() {   // workgroup x = head row over all batch rows; P.rows = heads per token, so the token is h / rows (prefill, iteration 38)
   uint h = gl_WorkGroupID.x, t = gl_LocalInvocationID.x, n = P.n, nrot = P.aux, hlf = nrot / 2u, base = h * n;
+  uint tokrow = (P.rows > 0u) ? h / P.rows : 0u;
   for (uint i = t; i < n; i += 256u) {
     if (i >= nrot) { o[base + i] = a[base + i]; continue; }
     uint pair = (i >= hlf) ? i - hlf : i;
-    float theta = float((P.p1 != 0.0) ? dyn_pos() : P.aux2) * pow(P.scale, -2.0 * float(pair) / float(nrot));
+    float theta = float(((P.p1 != 0.0) ? dyn_pos() : P.aux2) + tokrow) * pow(P.scale, -2.0 * float(pair) / float(nrot));
     float cs = cos(theta), sn = sin(theta);
     float x0 = a[base + pair], x1 = a[base + pair + hlf];
     o[base + i] = (i >= hlf) ? (x0 * sn + x1 * cs) : (x0 * cs - x1 * sn);
   }
 }
-void op_attn_decode() {
-  uint h = gl_WorkGroupID.x, t = gl_LocalInvocationID.x, d = P.n, T = (P.p1 != 0.0) ? dyn_pos() + 1u : P.aux; uint hkv = h / (P.rows / P.aux2);
+void op_attn_decode() {   // workgroup y = query row of the batch (prefill): causal T = base + 1 + row, q / out / gate offset by the row (iteration 38)
+  uint h = gl_WorkGroupID.x, row = gl_WorkGroupID.y, t = gl_LocalInvocationID.x, d = P.n;
+  uint T = ((P.p1 != 0.0) ? dyn_pos() + 1u : P.aux) + row; uint hkv = h / (P.rows / P.aux2);
+  uint qoff = row * P.rows * d;
   float sc = -1e30;
   if (t < T) {
     float dt = 0.0;
-    for (uint i = 0u; i < d; i++) dt += a[h * d + i] * b[(t * P.aux2 + hkv) * d + i];
+    for (uint i = 0u; i < d; i++) dt += a[qoff + h * d + i] * b[(t * P.aux2 + hkv) * d + i];
     sc = dt * P.scale;
   }
   red[t] = sc; barrier();
@@ -161,8 +164,8 @@ void op_attn_decode() {
   for (uint i = t; i < d; i += 256u) {
     float acc = 0.0;
     for (uint tt = 0u; tt < T; tt++) acc += red[tt] * c[(tt * P.aux2 + hkv) * d + i];
-    uint gi = (P.eps < 0.0) ? ((h * 2u + 1u) * d + i) : (h * d + i);
-    o[h * d + i] = acc * sigmoid(s[gi]);
+    uint gi = (P.eps < 0.0) ? (row * P.rows * 2u * d + (h * 2u + 1u) * d + i) : (qoff + h * d + i);
+    o[qoff + h * d + i] = acc * sigmoid(s[gi]);
   }
 }
 void op_argmax_partial() {
