@@ -14,10 +14,15 @@
 ;; Root ADR-2609182400 C.
 (require '["fs" :as fs] '[clojure.string :as str])
 (def args (vec *command-line-args*))
-(when-not (<= 6 (count args) 9) (println "usage: <file.gguf> <layers> <tokens> <prompt-token-id[,id...]> <dir-on-box> <out.kotoba> [anv|radv|nvgpu|nvgpu-exact] [stream|flat|fn|prefill] [sample:<T>:<top_p>:<seed>]") (js/process.exit 2))
+(when-not (<= 6 (count args) 10) (println "usage: <file.gguf> <layers> <tokens> <prompt-token-id[,id...]> <dir-on-box> <out.kotoba> [anv|radv|nvgpu|nvgpu-exact] [stream|flat|fn|prefill] [sample:<T>:<top_p>:<seed>|-] [runtime]") (js/process.exit 2))
+;; runtime (fn mode, iteration 41): the prompt ids are read when the guest RUNS -- :env/read NEX_PROMPT
+;; ("760,6511,...") written to the device with WRITEDEC -- and main takes (prompt length, tokens to
+;; generate) as its two i64 arguments (the loader's argv; the native slice has string-from-i64 but no
+;; string->i64, string-length or split-count). The token buffer is 4096 slots. The serving shell's entry.
+(def runtime? (= "runtime" (get args 9)))
 ;; sample:T:top_p:seed (fn mode): nex_sample_topp replaces argmax_final -- the draw
 ;; u = hash(seed, pos) is reproduced by decode_tokens_ref.py --sample (iteration 18).
-(def sampling (when-let [a (get args 8)] (let [[_ T tp seed] (str/split a #":")] {:T (js/parseFloat T) :top-p (js/parseFloat tp) :seed (js/parseInt seed 0)})))
+(def sampling (when-let [a (get args 8)] (when (str/starts-with? a "sample:") (let [[_ T tp seed] (str/split a #":")] {:T (js/parseFloat T) :top-p (js/parseFloat tp) :seed (js/parseInt seed 0)}))))
 ;; stream: the layer weights are MAPped per layer per token and FREEd after the
 ;; layer's command buffer, so the whole 40-layer model runs on a device that
 ;; cannot hold it (K16 GTT 13 GiB vs 17.4 GB of weights) -- for parity, not
@@ -199,8 +204,8 @@
 (write! prompt-ids (apply str (map le32 prompt)))
 (def rings (vec (for [il (range layers) :when (= 1 (recurrent il))] (let [r (alloc! (if fused? 196608 98304))] (zero! r) r))))   ;; fused: 2 slots x 3 x 8192 (double-buffered by pos parity)
 (def states (vec (for [il (range layers) :when (= 1 (recurrent il))] (let [s (alloc! 2097152)] (zero! s) s))))
-(def kcaches (vec (for [il (range layers) :when (= 0 (recurrent il))] (let [b (alloc! (* (max ntok PF) 2048))] (zero! b) b))))
-(def vcaches (vec (for [il (range layers) :when (= 0 (recurrent il))] (let [b (alloc! (* (max ntok PF) 2048))] (zero! b) b))))
+(def kcaches (vec (for [il (range layers) :when (= 0 (recurrent il))] (let [b (alloc! (* (if runtime? 4096 (max ntok PF)) 2048))] (zero! b) b))))   ;; runtime: 4096-token context
+(def vcaches (vec (for [il (range layers) :when (= 0 (recurrent il))] (let [b (alloc! (* (if runtime? 4096 (max ntok PF)) 2048))] (zero! b) b))))   ;; runtime: 4096-token context
 (def ipe (if prefill? 1 0))   ;; kdots that read the batched activation: x row = position
 (def m-norm (ops-meta! 2048 PF 0 0 eps 0)) (def m-qkv (kdot-meta! 8192 2048 13 PF ipe)) (def m-gate (kdot-meta! 4096 2048 23 PF ipe))
 (def m-ab (kdot-meta! 32 2048 23 PF ipe)) (def m-gd (ops-meta! 32 32 32 0 0 0)) (def m-gd0 (ops-meta! 32 32 0 0 0 0)) (def m-conv (ops-meta! 8192 1 0 0 0 0))
@@ -238,7 +243,7 @@
 (def m-ropeq-dyn (ops-meta-dyn! 256 16 nrot 0 0 rope-base)) (def m-ropek-dyn (ops-meta-dyn! 256 2 nrot 0 0 rope-base))
 (def m-attn-dyn (ops-meta-dyn! 256 16 0 2 -1.0 (/ 1.0 16.0))) (def m-copy-dyn (ops-meta-dyn! 512 1 0 512 0 0))
 ;; fn mode: the token buffer holds the prompt, then argmax_final appends each next token; embed reads slot pos
-(def tokbuf (let [b (alloc! (max 16 (* 4 (+ ntok 1)) (* 4 (count prompt))))] (write! b (apply str (map le32 prompt))) b))   ;; holds the prompt and every decoded token
+(def tokbuf (let [b (alloc! (if runtime? (* 4 4096) (max 16 (* 4 (+ ntok 1)) (* 4 (count prompt)))))] (when-not runtime? (write! b (apply str (map le32 prompt)))) b))   ;; holds the prompt and every decoded token (runtime: 4096 slots, filled by WRITEDEC)
 (def m-embed-dyn (let [m (alloc! 16)] (write! m (str (le32 2048) (le32 0) (le32 1) (le32 0))) m))
 (def m-am2-dyn (let [m (alloc! 32)] (write! m (str (le32 248320) (le32 1) (le32 61) (le32 (count prompt)) (lef32 0) (lef32 0) (lef32 0) (lef32 1))) m))
 (def m-incr (ops-meta! 1 1 0 0 0 0))
@@ -480,12 +485,22 @@
               ";; Greedy decode of " ntok " tokens from prompt tokens " (str/join "," prompt) " (forced) through layers 0.." (dec layers) " + lm_head, entirely on :gpu/compute: "
               (count @lines) " requests, one command buffer per token, state carried in device buffers. Handles are literal (sequential per kind).\n"
               ";; Answer: per token \"<ns>|<hex x after the last layer>|<hex argmax id>\", tokens joined by \"#\".\n"
-              "(ns gpu.decode-tokens (:export [main]))\n"
+              (if runtime? "(ns gpu.decode-tokens (:export [main serve]))\n" "(ns gpu.decode-tokens (:export [main]))\n")
               "(defn gpu [r :string] :string\n  (typed-cap-call :gpu/compute :string :string r))\n"
               (when stream? (str rec-body-src att-body-src layer-fns-src))
               (when fn-mode? (str fn-rec-src fn-att-src fn-layers-src fn-token-src))
-              "(defn main [] :string\n"
+              ;; runtime: `main` must take no arguments (frontend rule), so the entry with arguments is the
+              ;; exported `serve [plen ntok]` -- extract-native --symbol serve, run with arity 2 and the two
+              ;; i64s on the loader's argv; `main` runs `serve` with the build-time counts.
+              (if runtime? (str "(defn main [] :string (serve " (count prompt) " " ntok "))\n(defn serve [plen :i64 ntok :i64] :string\n") "(defn main [] :string\n")
               "    (do\n" (str/join "\n" (map #(str "      (gpu " % ")") const-steps)) "\n"
-              (if fn-mode? (str "      (string-concat (token-step 0 " ntok " \"\") (string-concat \"|\" (gpu \"READ " logits " 0 " (* 248320 4) "\")))") (emit-tokens token-steps @ans-binds @token-answers)) "))\n"))
+              (if fn-mode?
+                (if runtime?
+                  (str "      (let [prompt (typed-cap-call :env/read :string :string \"NEX_PROMPT\")]\n"
+                       "        (do (gpu (string-concat \"WRITEDEC " tokbuf " 0 \" prompt))\n"
+                       "            (gpu (string-concat \"WRITEDEC " m-am2-dyn " 0 248320,1,61,\" (string-concat (string-from-i64 plen) \",0,0,0,1065353216\")))\n"
+                       "            (string-concat (token-step 0 (+ plen ntok) \"\") (string-concat \"|\" (gpu \"READ " logits " 0 " (* 248320 4) "\")))))")
+                  (str "      (string-concat (token-step 0 " ntok " \"\") (string-concat \"|\" (gpu \"READ " logits " 0 " (* 248320 4) "\")))"))
+                (emit-tokens token-steps @ans-binds @token-answers)) "))\n"))
 (fs/writeFileSync out src)
 (println (str "wrote " out ": " (if fn-mode? (str (count const-steps) " constant requests + a token-step function") (str (count @lines) " requests")) ", layers " layers " tokens " ntok " buffers " (dec @next-buffer) " pipelines " (dec @next-pipeline) " backend " backend " layouts " (pr-str layouts) (when stream? " STREAM (per-layer MAP/FREE; last token answers its full logits)")))
