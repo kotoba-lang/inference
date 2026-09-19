@@ -1,0 +1,64 @@
+#version 450
+// One recurrent (gated delta-net) step for ONE head per workgroup, fused (iteration 24):
+//   gate_decay2 (decay g, beta) + conv1d_step (+silu) on the head's q / k / v channels +
+//   l2norm of q (scaled) and k + the delta rule on S + gated rmsnorm x silu(z)
+// -- seven dispatches and five barriers of the unfused path become one dispatch.
+// The conv ring is DOUBLE-BUFFERED by the position's parity (pos from binding 12):
+// q / k channels are shared by two heads (h and h + 16), so every head reads slot
+// p and only the owning head (h == kh) writes slot 1 - p; v channels are per head.
+// Dispatch: (heads, 1, 1), 128 threads = the head's value dimension.
+layout(local_size_x = 128) in;
+layout(std430, binding = 0) readonly buffer Meta { uint heads; uint k_dim; uint v_dim; uint k_heads; uint v_off; uint n; float eps; float qscale; } P;
+layout(std430, binding = 1) readonly buffer QKV { float qkv[]; };      // kdot output: q | k | v, n channels
+layout(std430, binding = 2) readonly buffer CW { float convw[]; };     // (n, 4) channel-major
+layout(std430, binding = 3) buffer Ring { float ring[]; };             // 2 slots x 3 x n
+layout(std430, binding = 4) readonly buffer Al { float alpha[]; };
+layout(std430, binding = 5) readonly buffer Bl { float betaL[]; };
+layout(std430, binding = 6) readonly buffer Dt { float dt[]; };
+layout(std430, binding = 7) readonly buffer Aa { float ssm_a[]; };
+layout(std430, binding = 8) buffer St { float state[]; };
+layout(std430, binding = 9) readonly buffer Nw { float ssm_norm[]; };
+layout(std430, binding = 10) readonly buffer Z { float z[]; };
+layout(std430, binding = 11) buffer Out { float outp[]; };
+layout(std430, binding = 12) readonly buffer Pos { uint pos[]; };
+shared float sq[128]; shared float sk[128]; shared float red[128];
+float silu(float v) { return v / (1.0 + exp(-v)); }
+float sigmoid(float v) { return 1.0 / (1.0 + exp(-v)); }
+float softplus(float v) { return (v > 20.0) ? v : log(1.0 + exp(v)); }
+float wg_sum(uint t, float v) {
+  red[t] = v; barrier();
+  for (uint st = 64u; st > 0u; st >>= 1u) { if (t < st) red[t] += red[t + st]; barrier(); }
+  float r = red[0]; barrier(); return r;
+}
+// conv1d step + silu for channel c, reading ring slot p; returns the activation, writes slot 1-p if `own`
+float conv_step(uint c, uint p, bool own) {
+  uint n = P.n, rb = p * 3u * n, wb = (1u - p) * 3u * n;
+  float x0 = ring[rb + c], x1 = ring[rb + n + c], x2 = ring[rb + 2u * n + c], x3 = qkv[c];
+  float y = convw[c * 4u] * x0 + convw[c * 4u + 1u] * x1 + convw[c * 4u + 2u] * x2 + convw[c * 4u + 3u] * x3;
+  if (own) { ring[wb + c] = x1; ring[wb + n + c] = x2; ring[wb + 2u * n + c] = x3; }
+  return silu(y);
+}
+void main() {
+  uint h = gl_WorkGroupID.x, j = gl_LocalInvocationID.x;
+  uint K_ = P.k_dim, V_ = P.v_dim, kh = h % P.k_heads, p = pos[0] & 1u;
+  // conv on this head's channels: q (shared with head h + k_heads), k (same), v (own)
+  float qc = conv_step(kh * K_ + j, p, h == kh);
+  float kc = conv_step(P.k_heads * K_ + kh * K_ + j, p, h == kh);
+  float vc = conv_step(P.v_off + h * V_ + j, p, true);
+  // l2 norms of the head's q and k
+  float qn = qc * inversesqrt(wg_sum(j, qc * qc) + P.eps) * P.qscale;
+  float kn = kc * inversesqrt(wg_sum(j, kc * kc) + P.eps);
+  sq[j] = qn; sk[j] = kn; barrier();
+  // gate and beta
+  float decay = exp(softplus(alpha[h] + dt[h]) * ssm_a[h]), b = sigmoid(betaL[h]);
+  // delta rule on the head's state (K_ x V_), this thread owns column j
+  uint sbase = h * K_ * V_;
+  float kv_mem = 0.0;
+  for (uint i = 0u; i < K_; i++) { float s_ = state[sbase + i * V_ + j] * decay; state[sbase + i * V_ + j] = s_; kv_mem += s_ * sk[i]; }
+  float delta = (vc - kv_mem) * b;
+  float o = 0.0;
+  for (uint i = 0u; i < K_; i++) { float s_ = state[sbase + i * V_ + j] + sk[i] * delta; state[sbase + i * V_ + j] = s_; o += s_ * sq[i]; }
+  // gated rmsnorm over the head's V_ outputs, times silu(z)
+  float inv = inversesqrt(wg_sum(j, o * o) / float(V_) + P.eps);
+  outp[h * V_ + j] = o * inv * ssm_norm[j] * silu(z[h * V_ + j]);
+}

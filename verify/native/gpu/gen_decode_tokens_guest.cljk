@@ -23,12 +23,16 @@
 ;; cannot hold it (K16 GTT 13 GiB vs 17.4 GB of weights) -- for parity, not
 ;; speed (every token re-uploads the weights). The loader hands out the lowest
 ;; free slot, so the generator keeps the same free list (iteration 14).
-(def stream? (= "stream" (get args 7)))
+(def mode-arg (or (get args 7) "fn"))
+;; "<mode>-nofuse" keeps the seven-dispatch recurrent path (gate_decay2 x2, conv1d, l2norm x2,
+;; deltanet, gated_rmsnorm); the default since iteration 24 is deltanet_fused.comp, one dispatch.
+(def fused? (not (str/ends-with? mode-arg "-nofuse")))
+(def stream? (= "stream" (str/replace mode-arg "-nofuse" "")))
 ;; flat: the 2026-09-19 straight-line program (every request a literal, one copy
 ;; per token). Default since iteration 16 is the FUNCTION program: handles are
 ;; computed on the device side of the string (string-from-i64), layers and
 ;; tokens are recursions, the position and the token buffer live on the device.
-(def flat? (= "flat" (get args 7)))
+(def flat? (= "flat" (str/replace mode-arg "-nofuse" "")))
 (def fn-mode? (not (or stream? flat?)))
 (def gguf (args 0)) (def layers (js/parseInt (args 1))) (def ntok (js/parseInt (args 2))) (def box (args 4)) (def out (args 5))
 ;; <prompt-token-id> may be a comma-separated list: the first P steps are FORCED to
@@ -145,6 +149,7 @@
 (def kdot-lm (pipeline! (:lm layouts) 5))
 (defn wg-of [spv rows] (if (= spv "kdot_f32_r8.spv") (quot (+ rows 7) 8) rows))
 (def deltanet (pipeline! "deltanet_step.spv" 8))
+(def deltanet-fused (when fused? (pipeline! "deltanet_fused.spv" 13)))
 (def embed (pipeline! "embed_iq4xs.spv" 5))
 (def w-embd (map-tensor! "token_embd.weight"))
 (def prompt-ids (alloc! (max 16 (* 4 (count prompt)))))
@@ -158,7 +163,7 @@
 (def xa (alloc! 8192)) (def xb (alloc! 8192))
 (zero! zeros16)
 (write! prompt-ids (apply str (map le32 prompt)))
-(def rings (vec (for [il (range layers) :when (= 1 (recurrent il))] (let [r (alloc! 98304)] (zero! r) r))))
+(def rings (vec (for [il (range layers) :when (= 1 (recurrent il))] (let [r (alloc! (if fused? 196608 98304))] (zero! r) r))))   ;; fused: 2 slots x 3 x 8192 (double-buffered by pos parity)
 (def states (vec (for [il (range layers) :when (= 1 (recurrent il))] (let [s (alloc! 2097152)] (zero! s) s))))
 (def kcaches (vec (for [il (range layers) :when (= 0 (recurrent il))] (let [b (alloc! (* ntok 2048))] (zero! b) b))))
 (def vcaches (vec (for [il (range layers) :when (= 0 (recurrent il))] (let [b (alloc! (* ntok 2048))] (zero! b) b))))
@@ -166,6 +171,7 @@
 (def m-ab (kdot-meta! 32 2048 23 1 0)) (def m-gd (ops-meta! 32 32 32 0 0 0)) (def m-gd0 (ops-meta! 32 32 0 0 0 0)) (def m-conv (ops-meta! 8192 1 0 0 0 0))
 (def m-l2q (ops-meta! 128 16 0 0 eps (/ 1.0 (js/Math.sqrt 128)))) (def m-l2k (ops-meta! 128 16 0 2048 eps 0))
 (def m-dn (let [m (alloc! 32)] (write! m (str (le32 32) (le32 128) (le32 128) (le32 16) (le32 4096) (le32 0) (le32 0) (le32 0))) m))
+(def m-fused (when fused? (let [m (alloc! 32)] (write! m (str (le32 32) (le32 128) (le32 128) (le32 16) (le32 4096) (le32 8192) (lef32 eps) (lef32 (/ 1.0 (js/Math.sqrt 128))))) m)))
 (def m-gn (ops-meta! 128 32 0 0 eps 0)) (def m-out (kdot-meta! 2048 4096 23 1 0))
 (def m-q (kdot-meta! 8192 2048 23 1 0)) (def m-k (kdot-meta! 512 2048 23 1 0)) (def m-v (kdot-meta! 512 2048 13 1 0))
 (def m-qnorm (ops-meta! 256 16 512 0 eps 0)) (def m-knorm (ops-meta! 256 2 0 0 eps 0))
@@ -225,13 +231,16 @@
             (dispatchc! kdot-wide (wg-of (:wide layouts) 4096) 1 1 m-gate (:gate w) h z zeros16)
             (dispatchc! kdot-narrow 32 1 1 m-ab (:alpha w) h alpha zeros16)
             (dispatchc! kdot-narrow 32 1 1 m-ab (:beta w) h betaL zeros16)
-            (dispatch! (ops "gate_decay2") 1 1 1 m-gd alpha (:dt w) (:a w) gb betaL zeros16)
-            (dispatchc! (ops "gate_decay2") 1 1 1 m-gd0 alpha (:dt w) (:a w) beta-only betaL zeros16)
-            (dispatchc! (ops "conv1d_step") 32 1 1 m-conv qkv (:conv w) zeros16 conv ring zeros16)
-            (dispatch! (ops "l2norm") 16 1 1 m-l2q conv zeros16 zeros16 qn zeros16 zeros16)
-            (dispatchc! (ops "l2norm") 16 1 1 m-l2k conv zeros16 zeros16 kn zeros16 zeros16)
-            (dispatch! deltanet 32 1 1 m-dn qn kn conv gb beta-only S dn)
-            (dispatch! (ops "gated_rmsnorm") 32 1 1 m-gn dn (:ssm-norm w) z gnorm zeros16 zeros16)
+            (if fused?
+              (dispatch! deltanet-fused 32 1 1 m-fused qkv (:conv w) ring alpha betaL (:dt w) (:a w) S (:ssm-norm w) z gnorm pb)
+              (do
+                (dispatch! (ops "gate_decay2") 1 1 1 m-gd alpha (:dt w) (:a w) gb betaL zeros16)
+                (dispatchc! (ops "gate_decay2") 1 1 1 m-gd0 alpha (:dt w) (:a w) beta-only betaL zeros16)
+                (dispatchc! (ops "conv1d_step") 32 1 1 m-conv qkv (:conv w) zeros16 conv ring zeros16)
+                (dispatch! (ops "l2norm") 16 1 1 m-l2q conv zeros16 zeros16 qn zeros16 zeros16)
+                (dispatchc! (ops "l2norm") 16 1 1 m-l2k conv zeros16 zeros16 kn zeros16 zeros16)
+                (dispatch! deltanet 32 1 1 m-dn qn kn conv gb beta-only S dn)
+                (dispatch! (ops "gated_rmsnorm") 32 1 1 m-gn dn (:ssm-norm w) z gnorm zeros16 zeros16)))
             (dispatch! kdot-wide (wg-of (:wide layouts) 2048) 1 1 m-out (:out w) gnorm attn-out zeros16))
           (do
             (dispatch! kdot-wide (wg-of (:wide layouts) 8192) 1 1 m-q (:q w) h qfull zeros16)
@@ -275,6 +284,7 @@
       (swap! token-answers conj (if (and stream? last?) (cat ns (q "|") xr (q "|") idr (q "|") lg) (cat ns (q "|") xr (q "|") idr))))))
 (when flat?
   (doseq [pos (range ntok)]
+    (write! posbuf (le32 pos))   ;; the fused delta-net step reads the position's parity for its conv ring slot
     (step! (q "BEGIN"))
     (dispatch! embed 1 1 1 (if (< pos (count prompt)) (m-embedP pos) m-embed1) w-embd (if (< pos (count prompt)) prompt-ids amax-ids) x zeros16)
     (let [rec-index (atom 0) att-index (atom 0)]
@@ -284,7 +294,7 @@
               ring (when rec? (rings @rec-index)) S (when rec? (states @rec-index))
               kc (when-not rec? (kcaches @att-index)) vc (when-not rec? (vcaches @att-index))]
           (if rec? (swap! rec-index inc) (swap! att-index inc))
-          (emit-layer! il w xin xout ring S kc vc (m-ropeq pos) (m-ropek pos) (m-attn pos) (m-copy pos) zeros16))))
+          (emit-layer! il w xin xout ring S kc vc (m-ropeq pos) (m-ropek pos) (m-attn pos) (m-copy pos) posbuf))))
     (emit-lm-head! pos)))
 
 ;; --- stream mode: the program is FUNCTIONS (the ABI allows 5 parameters, the
