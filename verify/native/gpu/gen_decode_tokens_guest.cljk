@@ -167,14 +167,19 @@
 (def kdot-out (if (:out layouts) (pipeline! (:out layouts) 5) kdot-wide))
 ;; int8 activations (iteration 34): rows :wide-i8 / :lm-i8 / :expert-i8 name kdot_i8_* kernels (six bindings); the
 ;; activation they read is quantized once per layer by nex_quant_q8 into a paired (xq, xscale) buffer.
-(def i8-wide (when (:wide-i8 layouts) (pipeline! (:wide-i8 layouts) 6)))
-(def i8-lm (when (:lm-i8 layouts) (pipeline! (:lm-i8 layouts) 6)))
-(def i8-expert (when (:expert-i8 layouts) (pipeline! (:expert-i8 layouts) 6)))
+(def i8-wide (when (and (:wide-i8 layouts) (not prefill?)) (pipeline! (:wide-i8 layouts) 6)))   ;; prefill uses kdot_f32_p for the non-MoE kdots
+(def i8-lm (when (and (:lm-i8 layouts) (not prefill?)) (pipeline! (:lm-i8 layouts) 6)))
+(def i8-expert (when (and (:expert-i8 layouts) (not prefill?)) (pipeline! (:expert-i8 layouts) 6)))
 (def quant (when (or i8-wide i8-lm i8-expert) (pipeline! "nex_quant_q8.spv" 7)))
 (def out-spv (or (:out layouts) (:wide layouts)))
 ;; rows per workgroup from the kernel name: ...r8.spv -> 8, ...r4.spv -> 4, x8.spv / r1 / s* / h2_r1 -> 1
 (defn rows-of-spv [spv] (if-let [m (re-find #"r(\d+)\.spv$" spv)] (js/parseInt (second m)) 1))
 (defn wg-of [spv rows] (let [n (rows-of-spv spv)] (quot (+ rows n -1) n)))
+;; prefill (iteration 39): the non-MoE kdots run kdot_f32_p -- one workgroup per row, all P positions in the
+;; inner loop, weights read once. (rows, 1, 1) instead of (wg, P, 1).
+(def kdot-p (when prefill? (pipeline! "kdot_f32_p.spv" 5)))
+(defn pkdot! [pipe spv rows meta w x out ids] (if prefill? (dispatch! kdot-p rows 1 1 meta w x out ids) (dispatch! pipe (wg-of spv rows) PF 1 meta w x out ids)))
+(defn pkdotc! [pipe spv rows meta w x out ids] (if prefill? (dispatchc! kdot-p rows 1 1 meta w x out ids) (dispatchc! pipe (wg-of spv rows) PF 1 meta w x out ids)))
 (def expert-spv (or (:expert layouts) (:narrow layouts)))
 (def deltanet (pipeline! "deltanet_step.spv" 8))
 (def deltanet-fused (when fused? (pipeline! "deltanet_fused.spv" 13)))
@@ -270,10 +275,10 @@
                 (dispatch! i8-wide (wg-of (:wide-i8 layouts) 8192) PF 1 m-qkv (:qkv w) xq qkv zerosP xs)
                 (dispatchc! i8-wide (wg-of (:wide-i8 layouts) 4096) PF 1 m-gate (:gate w) xq z zerosP xs))
               (do
-                (dispatch! kdot-wide (wg-of (:wide layouts) 8192) PF 1 m-qkv (:qkv w) h qkv zerosP)
-                (dispatchc! kdot-wide (wg-of (:wide layouts) 4096) PF 1 m-gate (:gate w) h z zerosP)))
-            (dispatchc! kdot-narrow (wg-of (:narrow layouts) 32) PF 1 m-ab (:alpha w) h alpha zerosP)
-            (dispatchc! kdot-narrow (wg-of (:narrow layouts) 32) PF 1 m-ab (:beta w) h betaL zerosP)
+                (pkdot! kdot-wide (:wide layouts) 8192 m-qkv (:qkv w) h qkv zerosP)
+                (pkdotc! kdot-wide (:wide layouts) 4096 m-gate (:gate w) h z zerosP)))
+            (pkdotc! kdot-narrow (:narrow layouts) 32 m-ab (:alpha w) h alpha zerosP)
+            (pkdotc! kdot-narrow (:narrow layouts) 32 m-ab (:beta w) h betaL zerosP)
             (if fused?
               (if prefill?
                 (let [sb (stepbufs (count (filter #(= 1 (recurrent %)) (range il))))]
@@ -289,13 +294,13 @@
                 (dispatchc! (ops "l2norm") 16 1 1 m-l2k conv zeros16 zeros16 kn zeros16 zeros16)
                 (dispatch! deltanet 32 1 1 m-dn qn kn conv gb beta-only S dn)
                 (dispatch! (ops "gated_rmsnorm") 32 1 1 m-gn dn (:ssm-norm w) z gnorm zeros16 zeros16)))
-            (dispatch! kdot-out (wg-of out-spv 2048) PF 1 m-out (:out w) gnorm attn-out zerosP))
+            (pkdot! kdot-out out-spv 2048 m-out (:out w) gnorm attn-out zerosP))
           (do
             (if i8-wide
               (let [[xq xs] (quant! h 2048 h-i8)] (dispatch! i8-wide (wg-of (:wide-i8 layouts) 8192) PF 1 m-q (:q w) xq qfull zerosP xs))
-              (dispatch! kdot-wide (wg-of (:wide layouts) 8192) PF 1 m-q (:q w) h qfull zerosP))
-            (dispatchc! kdot-narrow (wg-of (:narrow layouts) 512) PF 1 m-k (:k w) h kproj zerosP)
-            (dispatchc! kdot-narrow (wg-of (:narrow layouts) 512) PF 1 m-v (:v w) h vproj zerosP)
+              (pkdot! kdot-wide (:wide layouts) 8192 m-q (:q w) h qfull zerosP))
+            (pkdotc! kdot-narrow (:narrow layouts) 512 m-k (:k w) h kproj zerosP)
+            (pkdotc! kdot-narrow (:narrow layouts) 512 m-v (:v w) h vproj zerosP)
             (dispatch! (ops "rmsnorm") (* 16 PF) 1 1 m-qnorm qfull (:qn w) zeros16 qnorm zeros16 zeros16)
             (dispatchc! (ops "rmsnorm") (* 2 PF) 1 1 m-knorm kproj (:kn w) zeros16 knorm zeros16 zeros16)
             (dispatch! (ops "rope_neox") (* 16 PF) 1 1 mrq qnorm zeros16 zeros16 qrope zeros16 pb)
@@ -303,27 +308,27 @@
             (dispatchc! (ops "copy_at") (* 2 PF) 1 1 mcopy vproj zeros16 zeros16 vc zeros16 pb)
             (dispatch! (ops "copy_at") (* 2 PF) 1 1 mcopy krope zeros16 zeros16 kc zeros16 pb)
             (dispatch! (ops "attn_decode") 16 PF 1 mattn qrope kc vc attno qfull pb)
-            (dispatch! kdot-out (wg-of out-spv 2048) PF 1 m-attn-o (:o w) attno attn-out zerosP)))
+            (pkdot! kdot-out out-spv 2048 m-attn-o (:o w) attno attn-out zerosP)))
         (dispatch! (ops "add_rmsnorm") PF 1 1 m-addn xin attn-out (:post w) resid h2 zeros16)
         ;; barrier groups (DISPATCHC = independent of everything since the last DISPATCH)
         (dispatch! (ops "f32_matvec") 256 PF 1 m-router (:router w) h2 zeros16 router zeros16 zeros16)
-        (dispatchc! kdot-narrow (wg-of (:narrow layouts) 512) PF 1 m-gate-sh (:gate-sh w) h2 sg zerosP)
-        (dispatchc! kdot-narrow (wg-of (:narrow layouts) 512) PF 1 m-gate-sh (:up-sh w) h2 su zerosP)
+        (pkdotc! kdot-narrow (:narrow layouts) 512 m-gate-sh (:gate-sh w) h2 sg zerosP)
+        (pkdotc! kdot-narrow (:narrow layouts) 512 m-gate-sh (:up-sh w) h2 su zerosP)
         (dispatchc! (ops "f32_matvec") 1 PF 1 m-shlogit (:shgate-inp w) h2 zeros16 shlogit zeros16 zeros16)
         (dispatch! (ops "softmax_topk") PF 1 1 m-topk router zeros16 zeros16 topw zeros16 ids)
         (dispatchc! (ops "silu_mul") (* 2 PF) 1 1 m-silu-sh sg su zeros16 sact zeros16 zeros16)
         (if kdot-expert-dual
           (do (dispatch! kdot-expert-dual (quot (+ 512 7) 8) 8 1 m-gate-exps (:gate-exps w) (:up-exps w) h2 actE ids)
-              (dispatchc! kdot-narrow (wg-of (:narrow layouts) 2048) PF 1 m-down-sh (:down-sh w) sact shdown zerosP))
+              (pkdotc! kdot-narrow (:narrow layouts) 2048 m-down-sh (:down-sh w) sact shdown zerosP))
           (if i8-expert
             (let [[xq xs] (quant! h2 2048 h2-i8)]
               (dispatch! i8-expert (wg-of (:expert-i8 layouts) 512) (* 8 PF) 1 m-gate-exps (:gate-exps w) xq gateE ids xs)
               (dispatchc! i8-expert (wg-of (:expert-i8 layouts) 512) (* 8 PF) 1 m-gate-exps (:up-exps w) xq upE ids xs)
-              (dispatchc! kdot-narrow (wg-of (:narrow layouts) 2048) PF 1 m-down-sh (:down-sh w) sact shdown zerosP)
+              (pkdotc! kdot-narrow (:narrow layouts) 2048 m-down-sh (:down-sh w) sact shdown zerosP)
               (dispatch! (ops "silu_mul") (* 16 PF) 1 1 m-silu8 gateE upE zeros16 actE zeros16 zeros16))
             (do (dispatch! kdot-expert (wg-of expert-spv 512) (* 8 PF) 1 m-gate-exps (:gate-exps w) h2 gateE ids)
                 (dispatchc! kdot-expert (wg-of expert-spv 512) (* 8 PF) 1 m-gate-exps (:up-exps w) h2 upE ids)
-                (dispatchc! kdot-narrow (wg-of (:narrow layouts) 2048) PF 1 m-down-sh (:down-sh w) sact shdown zerosP)
+                (pkdotc! kdot-narrow (:narrow layouts) 2048 m-down-sh (:down-sh w) sact shdown zerosP)
                 (dispatch! (ops "silu_mul") (* 16 PF) 1 1 m-silu8 gateE upE zeros16 actE zeros16 zeros16))))
         (if i8-expert
           (let [[xq xs] (quant! actE 4096 actE-i8)] (dispatch! i8-expert (wg-of (:expert-i8 layouts) 2048) (* 8 PF) 1 m-down-exps (:down-exps w) xq downE ids xs))

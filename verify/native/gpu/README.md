@@ -814,6 +814,21 @@ now the recurrent layers' P delta-net steps (9 layers × 8 dispatches); the
 attention layers are one pass. Decode re-verified on all three boxes after the
 kernel change (B70 2.58 ms, Xavier 36.8, K16 chain equal).
 
+**Tick 34 (iteration 39): where the prefill's time went, and the kdot that
+reads weights once.** `profile_guest.py` on the 12-layer prefill (407
+dispatches): the kdots were **105 of 122 ms**, the delta-net steps 12 — because
+the `(rows, positions)` dispatch gives every position its own workgroup and
+re-reads the row, so a P-token prefill read the weights P times exactly like
+decode (the 1.8× had come from amortised launches and the single lm_head).
+`kdot_f32_p.comp` puts the positions in the *inner loop*: one workgroup per
+row, the block dequantized once, multiplied against every position's
+activation (P ≤ 16), reduction per position. It serves every kdot whose
+weights do not depend on the position (all but the MoE experts). K16, 12
+layers, 8 tokens: prefill **122.5 → 84.5 ms** (decode 8 steps 217.3), all 8
+rows `x rel` ≤ 1.3e-5. Left in the prefill: the MoE expert kdots (their
+weights differ per position; sharing needs grouping by expert), the delta-net's
+P steps (~12 ms), the lm_head (~10 ms).
+
 What this is not yet: the 40-layer model on a device with room (the serving
 processes own the memory), prompt-side prefill (tokens are fed one at a time),
 sampling other than argmax, distribution parity with llama.cpp over a real
