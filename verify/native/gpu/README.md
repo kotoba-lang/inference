@@ -357,6 +357,28 @@ the two engines' rounding (llama.cpp quantizes activations to Q8 per 32-block).
 `parity_check.py <loader output> <ref npz> <llama json>` prints all of the above.
 The single-token probe of tick 8 was indeed the input, not the model.
 
+**Tick 10 (iteration 15): the same on Xavier, for the exact and the packed-half
+kernels — h2 becomes the nvgpu default.** Streaming fits beside the 17 GB
+llama-server (weights re-read from NVMe every token: 85 s for 5 tokens; the
+lm_head buffer is 18.1 ms). Same prompt, oracle copied from K16, CUDA
+llama-server on the box:
+
+| Xavier, 40 layers | s4 (exact f32) | **h2 (packed half)** |
+|---|---|---|
+| argmax chain vs oracle | 5/5 | 5/5 |
+| `x rel` per step | 8.7e-5, 5e-6, 4e-6, 1e-5, 6e-6 | 6.5e-2, 4.2e-3, 4.8e-3, 4.8e-3, 1.2e-1 |
+| final logits vs oracle | max\|Δ\| 6.7e-6, KL 8e-13 | max\|Δ\| 0.32, **KL(oracle‖gpu) 8.5e-4 nats** |
+| vs llama-server (CUDA) top-40 | top-1 Paris, **KL 0.0167** | top-1 Paris, **KL 0.0142** |
+| p(Paris) | 0.549 | 0.557 (llama 0.474) |
+
+h2's distance from the f64 oracle (8.5e-4 nats) is twenty times smaller than
+llama.cpp's own (~0.015), and its distance from llama.cpp equals the exact
+kernel's. So `nvgpu` now means h2 for the wide/narrow classes (the lm_head
+stays f32), and `nvgpu-exact` keeps s4. The hidden-state `x rel` of h2 is
+large on some coordinates (1.2e-1 at step 4) while the distribution moves
+8.5e-4 nats — the number that matters for serving is the second; both are
+recorded.
+
 What this is not yet: the 40-layer model on a device with room (the serving
 processes own the memory), prompt-side prefill (tokens are fed one at a time),
 sampling other than argmax, distribution parity with llama.cpp over a real
