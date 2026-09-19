@@ -149,6 +149,34 @@ The loader assigns buffer and pipeline handles sequentially per kind, so the
 generator writes every handle as a literal and the program keeps nothing live
 between requests — 5× less machine code, and the bound is not approached.
 
+## Xavier (2026-09-19, kaizen loop tick 2)
+
+Two findings, one lever pulled:
+
+- **The GPU clock governor was the largest Xavier cost.** `nvpmodel` said MAXN
+  but the GPU ran `nvhost_podgov` from 114 MHz, ramping per burst; our command
+  buffers are bursts. With `jetson_clocks` (min = max = 1377 MHz) the 12-layer ×
+  3-token chain went from 89–140 ms/token to a flat **59.7 ms/token** (1.5–2.3×).
+  kotoba-lang/murakumo already ships `murakumo-xavier-performance.service` for
+  exactly this; it was *disabled* on the box. Enabled and started 2026-09-19
+  (persists across boots). The production llama-server there: 18.4 → 18.7 tok/s
+  (sustained decode was already ramped; bursts were not).
+- **The r1 structure, not the dequant arithmetic, is what nvgpu dislikes.**
+  `kdot_ctrl_r1.comp` (r1 with a trivial one-load dequant — a probe, not a
+  kernel) reaches only 5.8 GB/s where the f32 `dot_rows` reaches 54. `kdot_x8.comp`
+  (256 threads per row, eight consecutive values per thread, `vec4` x loads,
+  contiguous warp loads) brings Q5_K attn_qkv from 1.3 → **14.1 GB/s** and IQ4_XS
+  attn_gate 4.4 → **10.5** — parity with r8 on nvgpu, and correct (rel ≤ 1.6e-5).
+  In the composed 12-layer step it is *slower* than r1 (69 vs 60 ms): the many
+  tiny kdots (32-row alpha/beta, 512-row experts) pay for 256-thread groups.
+  The lm_head Q6_K stays at 17–20 GB/s on every layout (the 210-byte blocks are
+  misaligned; a load-time repack is the next idea). Memory pressure is a confound
+  on this box: 26 of 31 GB used with swap active while the 17 GB llama-server is
+  resident.
+
+Layout choice is per (backend, tensor), as the Deno-era table already said; the
+generator will need that table.
+
 What this is not yet: the 40-layer model on a device with room (the serving
 processes own the memory), prompt-side prefill (tokens are fed one at a time),
 sampling other than argmax, distribution parity with llama.cpp over a real
