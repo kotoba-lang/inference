@@ -685,6 +685,26 @@ block) with rows in flight — an "r8 × x16" kernel. Wiring `i8r8` into the tok
 loop needs a `quant_q8` before each of a layer's six kdot inputs; that is the
 generator work of the next tick if the layout idea does not beat it.
 
+**Tick 27 (iteration 32, B-9): three more hypotheses for ANV's kdot ceiling,
+all measured, none it.** (1) *Load width*: `mem_probe_u32` streams the same
+1 GiB with 4-byte loads — **593 GB/s**, same as `vec4` (598); granularity is not
+the cause. (2) *Occupancy*: `kdot_f32_r8k4.comp`, the r8 kernel with the block
+loop split across four thread groups (256 threads per workgroup, same rows in
+flight): attn_qkv 162 → 162, attn_gate 91 → 111, lm_head 261 → 236. (3) *Load
+instruction count*: `kdot_s4_r8.comp`, block headers staged through shared
+memory once per block for all eight rows: attn_qkv 162 → **132**, lm_head 261 →
+196 — the added shared memory and per-block barriers cost more than the header
+loads they remove (the lm_head takes no staged path and still lost, so the
+shared allocation itself reduced occupancy). What is left, and consistent with
+every number so far: the *coalescing pattern inside a block*. In the r8 layout
+a 64-thread load instruction for one row touches 128 B of `qs` with 50%
+redundancy (threads t and t+8 read the same word for the two nibble halves)
+plus 32 B of `qh`, while the probe's instructions read 256 contiguous bytes;
+`kdot_x8` (eight consecutive values per thread, no redundancy) was the best
+r1-shaped kernel on B70 (143 vs 121) but is one row per workgroup. The next
+kernel is x8's thread mapping with r8's rows in flight ("x8 × r8"). Both
+negatives are kept for A/B.
+
 What this is not yet: the 40-layer model on a device with room (the serving
 processes own the memory), prompt-side prefill (tokens are fed one at a time),
 sampling other than argmax, distribution parity with llama.cpp over a real
