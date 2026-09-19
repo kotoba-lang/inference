@@ -399,6 +399,24 @@ order explicitly. Verified: K16 12 L, `9707,198,220` + 1 greedy — all four
 steps match the oracle at 27.2–27.7 ms/token (flat: 27.0–27.8); Xavier 12 L × 3
 (h2 default) 39.4 ms/token, chain 163967 → 1320 → 11278.
 
+**Tick 12 (iteration 17): the third box.** B70 (Intel Arc Pro B70, ANV) ran the
+same 40-layer streaming guest beside vLLM (27 of 30 GB held; the box has only
+15 GB of host RAM, so the 17.4 GB GGUF is re-read from disk every token:
+44.5 s for 5 tokens, lm_head buffer 6.6–8.6 ms). Same prompt, oracle from K16,
+llama.cpp reference from K16:
+
+| box, 40 layers, exact kernels | argmax vs oracle | final logits vs oracle | KL(llama‖gpu), top-40 | p(Paris) |
+|---|---|---|---|---|
+| K16 RADV | 5/5 | max\|Δ\| 1.5e-5 | 0.0143 | 0.549 |
+| Xavier nvgpu (s4) | 5/5 | 6.7e-6 | 0.0167 | 0.549 |
+| Xavier nvgpu (h2, default) | 5/5 | 0.32 (KL 8.5e-4) | 0.0142 | 0.557 |
+| **B70 ANV** | **5/5** | **1.7e-5** | **0.0143** | **0.549** |
+
+Three GPU architectures, three drivers, two ISAs of the same `.kotoba` program,
+one distribution. The llama.cpp distribution-parity item is closed for the
+fleet. Streaming stays a correctness tool: on a box that cannot page-cache the
+model it is disk-bound.
+
 What this is not yet: the 40-layer model on a device with room (the serving
 processes own the memory), prompt-side prefill (tokens are fed one at a time),
 sampling other than argmax, distribution parity with llama.cpp over a real
