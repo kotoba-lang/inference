@@ -800,6 +800,20 @@ them in prefill mode; `layers ≤ 3` on this model), so this is the recurrent
 half of C-1. Decode paths re-verified on K16 (3 L, 8/8) after the kernel
 changes; B70 and Xavier kernels rebuilt in tick 31's pass.
 
+**Tick 33 (iteration 38, C-1 second half): attention layers batched.** In
+prefill the attention layer is fully parallel over the prompt: q / k / v kdots
+with `positions = P`, the head-wise rmsnorm over `16P` / `2P` rows, `rope_neox`
+takes the token from the head row (`h / rows`, position `base + token`), the
+KV copies are one contiguous `512P` write, and `attn_decode` runs `(16, P)`
+workgroups — query row `y`, causal `T = base + 1 + y`, since all P keys are in
+the cache before the dispatch. Unlike the delta-net there is no sequential
+step. K16, 12 layers (9 recurrent + 3 attention), the same 8-token prompt:
+decode 8 steps **217.3 ms** (26.9–27.6 per token), prefill **122.5 ms** (1.8×),
+**8/8 rows `x rel` ≤ 1.3e-5**, argmax 240548 = oracle. The prefill's cost is
+now the recurrent layers' P delta-net steps (9 layers × 8 dispatches); the
+attention layers are one pass. Decode re-verified on all three boxes after the
+kernel change (B70 2.58 ms, Xavier 36.8, K16 chain equal).
+
 What this is not yet: the 40-layer model on a device with room (the serving
 processes own the memory), prompt-side prefill (tokens are fed one at a time),
 sampling other than argmax, distribution parity with llama.cpp over a real
