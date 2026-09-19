@@ -14,8 +14,21 @@
 ;; Root ADR-2609182400 C.
 (require '["fs" :as fs] '[clojure.string :as str])
 (def args (vec *command-line-args*))
-(when (not= 6 (count args)) (println "usage: <file.gguf> <layers> <tokens> <prompt-token-id> <dir-on-box> <out.kotoba>") (js/process.exit 2))
+(when-not (<= 6 (count args) 7) (println "usage: <file.gguf> <layers> <tokens> <prompt-token-id> <dir-on-box> <out.kotoba> [anv|radv|nvgpu]") (js/process.exit 2))
 (def gguf (args 0)) (def layers (js/parseInt (args 1))) (def ntok (js/parseInt (args 2))) (def tok0 (js/parseInt (args 3))) (def box (args 4)) (def out (args 5))
+(def backend (or (get args 6) "anv"))
+;; Kernel layout per (backend, tensor class) -- the co-scientist table (root
+;; ADR-2609182400 C, iterations 3 and 7). Classes: :wide = the 4096/8192-row
+;; projections (attn_qkv, attn_gate, attn_q, ssm_out, attn_output), :narrow =
+;; 32/512-row kdots (alpha/beta, k/v, experts, shared expert), :lm = the Q6_K
+;; lm_head. Measured 2026-09-19: on nvgpu x8 is 10x r1 on :wide and loses on
+;; :narrow; on RADV r8 wins attn_gate and loses the experts; on ANV r1 wins
+;; everything but the lm_head.
+(def layout-table
+  {"anv"   {:wide "kdot_f32_r1.spv" :narrow "kdot_f32_r1.spv" :lm "kdot_f32_r8.spv"}
+   "radv"  {:wide "kdot_f32_r8.spv" :narrow "kdot_f32_r1.spv" :lm "kdot_f32_r1.spv"}
+   "nvgpu" {:wide "kdot_x8.spv"     :narrow "kdot_f32_r1.spv" :lm "kdot_f32_r8.spv"}})
+(def layouts (or (layout-table backend) (do (println "REFUSE unknown backend" backend) (js/process.exit 2))))
 ;; --- GGUF directory (header only) ---
 (def fd (fs/openSync gguf "r"))
 (def head (js/Buffer.alloc (* 64 1024 1024)))
@@ -76,8 +89,10 @@
 ;; --- the plan ---
 (def zeros16 (alloc! 16))
 (def ops (into {} (for [op ["rmsnorm" "l2norm" "gated_rmsnorm" "silu_mul" "conv1d_step" "softmax_topk" "gate_decay2" "weighted_sum" "add" "f32_matvec" "add_rmsnorm" "rope_neox" "attn_decode" "argmax_partial" "argmax_final" "copy_at"]] [op (pipeline! (str "nex_" op ".spv") 7)])))
-(def kdot-r1 (pipeline! "kdot_f32_r1.spv" 5))
-(def kdot-r8 (pipeline! "kdot_f32_r8.spv" 5))
+(def kdot-wide (pipeline! (:wide layouts) 5))
+(def kdot-narrow (pipeline! (:narrow layouts) 5))
+(def kdot-lm (pipeline! (:lm layouts) 5))
+(defn wg-of [spv rows] (if (= spv "kdot_f32_r8.spv") (quot (+ rows 7) 8) rows))
 (def deltanet (pipeline! "deltanet_step.spv" 8))
 (def embed (pipeline! "embed_iq4xs.spv" 4))
 (def w-embd (map-tensor! "token_embd.weight"))
@@ -140,10 +155,10 @@
         (if (= 1 (recurrent il))
           (let [ring (rings @rec-index) S (states @rec-index)]
             (swap! rec-index inc)
-            (dispatch! kdot-r1 8192 1 1 m-qkv (:qkv w) h qkv zeros16)
-            (dispatch! kdot-r1 4096 1 1 m-gate (:gate w) h z zeros16)
-            (dispatch! kdot-r1 32 1 1 m-ab (:alpha w) h alpha zeros16)
-            (dispatch! kdot-r1 32 1 1 m-ab (:beta w) h betaL zeros16)
+            (dispatch! kdot-wide (wg-of (:wide layouts) 8192) 1 1 m-qkv (:qkv w) h qkv zeros16)
+            (dispatch! kdot-wide (wg-of (:wide layouts) 4096) 1 1 m-gate (:gate w) h z zeros16)
+            (dispatch! kdot-narrow 32 1 1 m-ab (:alpha w) h alpha zeros16)
+            (dispatch! kdot-narrow 32 1 1 m-ab (:beta w) h betaL zeros16)
             (dispatch! (ops "gate_decay2") 1 1 1 m-gd alpha (:dt w) (:a w) gb betaL zeros16)
             (dispatch! (ops "gate_decay2") 1 1 1 m-gd0 alpha (:dt w) (:a w) beta-only betaL zeros16)
             (dispatch! (ops "conv1d_step") 32 1 1 m-conv qkv (:conv w) zeros16 conv ring zeros16)
@@ -151,12 +166,12 @@
             (dispatch! (ops "l2norm") 16 1 1 m-l2k conv zeros16 zeros16 kn zeros16 zeros16)
             (dispatch! deltanet 32 1 1 m-dn qn kn conv gb beta-only S dn)
             (dispatch! (ops "gated_rmsnorm") 32 1 1 m-gn dn (:ssm-norm w) z gnorm zeros16 zeros16)
-            (dispatch! kdot-r1 2048 1 1 m-out (:out w) gnorm attn-out zeros16))
+            (dispatch! kdot-wide (wg-of (:wide layouts) 2048) 1 1 m-out (:out w) gnorm attn-out zeros16))
           (let [kc (kcaches @att-index) vc (vcaches @att-index)]
             (swap! att-index inc)
-            (dispatch! kdot-r1 8192 1 1 m-q (:q w) h qfull zeros16)
-            (dispatch! kdot-r1 512 1 1 m-k (:k w) h kproj zeros16)
-            (dispatch! kdot-r1 512 1 1 m-v (:v w) h vproj zeros16)
+            (dispatch! kdot-wide (wg-of (:wide layouts) 8192) 1 1 m-q (:q w) h qfull zeros16)
+            (dispatch! kdot-narrow 512 1 1 m-k (:k w) h kproj zeros16)
+            (dispatch! kdot-narrow 512 1 1 m-v (:v w) h vproj zeros16)
             (dispatch! (ops "rmsnorm") 16 1 1 m-qnorm qfull (:qn w) zeros16 qnorm zeros16 zeros16)
             (dispatch! (ops "rmsnorm") 2 1 1 m-knorm kproj (:kn w) zeros16 knorm zeros16 zeros16)
             (dispatch! (ops "rope_neox") 16 1 1 (m-ropeq pos) qnorm zeros16 zeros16 qrope zeros16 zeros16)
@@ -164,24 +179,24 @@
             (dispatch! (ops "copy_at") 2 1 1 (m-copy pos) krope zeros16 zeros16 kc zeros16 zeros16)
             (dispatch! (ops "copy_at") 2 1 1 (m-copy pos) vproj zeros16 zeros16 vc zeros16 zeros16)
             (dispatch! (ops "attn_decode") 16 1 1 (m-attn pos) qrope kc vc attno qfull zeros16)
-            (dispatch! kdot-r1 2048 1 1 m-attn-o (:o w) attno attn-out zeros16)))
+            (dispatch! kdot-wide (wg-of (:wide layouts) 2048) 1 1 m-attn-o (:o w) attno attn-out zeros16)))
         (dispatch! (ops "add_rmsnorm") 1 1 1 m-addn xin attn-out (:post w) resid h2 zeros16)
         (dispatch! (ops "f32_matvec") 256 1 1 m-router (:router w) h2 zeros16 router zeros16 zeros16)
         (dispatch! (ops "softmax_topk") 1 1 1 m-topk router zeros16 zeros16 topw zeros16 ids)
-        (dispatch! kdot-r1 512 8 1 m-gate-exps (:gate-exps w) h2 gateE ids)
-        (dispatch! kdot-r1 512 8 1 m-gate-exps (:up-exps w) h2 upE ids)
+        (dispatch! kdot-narrow 512 8 1 m-gate-exps (:gate-exps w) h2 gateE ids)
+        (dispatch! kdot-narrow 512 8 1 m-gate-exps (:up-exps w) h2 upE ids)
         (dispatch! (ops "silu_mul") 16 1 1 m-silu8 gateE upE zeros16 actE zeros16 zeros16)
-        (dispatch! kdot-r1 2048 8 1 m-down-exps (:down-exps w) actE downE ids)
-        (dispatch! kdot-r1 512 1 1 m-gate-sh (:gate-sh w) h2 sg zeros16)
-        (dispatch! kdot-r1 512 1 1 m-gate-sh (:up-sh w) h2 su zeros16)
+        (dispatch! kdot-narrow 2048 8 1 m-down-exps (:down-exps w) actE downE ids)
+        (dispatch! kdot-narrow 512 1 1 m-gate-sh (:gate-sh w) h2 sg zeros16)
+        (dispatch! kdot-narrow 512 1 1 m-gate-sh (:up-sh w) h2 su zeros16)
         (dispatch! (ops "silu_mul") 2 1 1 m-silu-sh sg su zeros16 sact zeros16 zeros16)
-        (dispatch! kdot-r1 2048 1 1 m-down-sh (:down-sh w) sact shdown zeros16)
+        (dispatch! kdot-narrow 2048 1 1 m-down-sh (:down-sh w) sact shdown zeros16)
         (dispatch! (ops "f32_matvec") 1 1 1 m-shlogit (:shgate-inp w) h2 zeros16 shlogit zeros16 zeros16)
         (dispatch! (ops "weighted_sum") 8 1 1 m-wsum downE topw shdown ffn shlogit zeros16)
         (dispatch! (ops "add") 8 1 1 m-add resid ffn zeros16 xout zeros16 zeros16))))
   (let [x-final (if (odd? (dec layers)) xb xa)]
     (dispatch! (ops "rmsnorm") 1 1 1 m-norm x-final w-out-norm zeros16 hN zeros16 zeros16)
-    (dispatch! kdot-r8 31040 1 1 m-lm w-lm hN logits zeros16)
+    (dispatch! kdot-lm (wg-of (:lm layouts) 248320) 1 1 m-lm w-lm hN logits zeros16)
     (dispatch! (ops "argmax_partial") 61 1 1 m-am1 logits zeros16 zeros16 zeros16 amax-s amax-ids)
     (dispatch! (ops "argmax_final") 1 1 1 m-am2 amax-s zeros16 zeros16 amax-s amax-s amax-ids)
     ;; SUBMIT and the read-backs are bound so their answers survive to the end
@@ -215,4 +230,4 @@
               "    (do\n" (str/join "\n" (map #(str "      (gpu " % ")") const-steps)) "\n"
               (emit-tokens token-steps @ans-binds @token-answers) "))\n"))
 (fs/writeFileSync out src)
-(println (str "wrote " out ": " (count @lines) " requests, layers " layers " tokens " ntok " buffers " (dec @next-buffer) " pipelines " (dec @next-pipeline)))
+(println (str "wrote " out ": " (count @lines) " requests, layers " layers " tokens " ntok " buffers " (dec @next-buffer) " pipelines " (dec @next-pipeline) " backend " backend " layouts " (pr-str layouts)))
