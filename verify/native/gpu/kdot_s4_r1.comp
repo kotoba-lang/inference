@@ -141,7 +141,7 @@ void main() {
   uint position = gl_WorkGroupID.y;
   uint t = gl_LocalInvocationID.x;
   uint expert = expert_ids[position];
-  uint in_row = (params.input_per_expert == 1u) ? ((params.pad0 > 1u) ? position / params.pad0 : position) : 0u;   // pad0 > 1: positions per input row (prefill MoE, iteration 36)
+  uint in_row = ((params.input_per_expert == 1u) ? ((params.pad0 > 1u) ? position / params.pad0 : position) : 0u) + params.pad1;   // pad0 > 1: positions per input row (prefill MoE); pad1: input row offset (the lm_head on a prefill's last row) -- iterations 36-37
   uint blocks = params.cols / 256u;
   uint tt = params.tensor_type;
   uint block_bytes = block_bytes_of(tt);

@@ -71,9 +71,9 @@ void op_conv1d_step() {
   o[ch] = silu(y);
   s[ch] = x1; s[n + ch] = x2; s[2u * n + ch] = x3;
 }
-void op_softmax_topk() {
-  uint t = gl_LocalInvocationID.x, n = P.n, k = P.aux;
-  float x = (t < n) ? a[t] : -1e30;
+void op_softmax_topk() {   // workgroup x = token (prefill): a [row x n], ids / o [row x k]
+  uint t = gl_LocalInvocationID.x, n = P.n, k = P.aux, row = gl_WorkGroupID.x;
+  float x = (t < n) ? a[row * n + t] : -1e30;
   red[t] = x; barrier();
   for (uint st = 128u; st > 0u; st >>= 1u) { if (t < st) red[t] = max(red[t], red[t + st]); barrier(); }
   float m = red[0]; barrier();
@@ -92,13 +92,13 @@ void op_softmax_topk() {
     }
     uint best = redi[0]; float bp = red[0];
     barrier();
-    if (t == 0u) { ids[round] = best; o[round] = bp; }
+    if (t == 0u) { ids[row * k + round] = best; o[row * k + round] = bp; }
     if (t == best) p = -1.0;
     wsum += bp;
     barrier();
   }
   memoryBarrierBuffer(); barrier();
-  if (t < k) o[t] = o[t] / wsum * P.scale;
+  if (t < k) o[row * k + t] = o[row * k + t] / wsum * P.scale;
 }
 void op_gate_decay() {
   uint h = gl_GlobalInvocationID.x; if (h >= P.rows) return;
@@ -126,11 +126,11 @@ void op_copy_at() {
   uint off = (P.p1 != 0.0) ? dyn_pos() * P.aux2 : P.aux2;
   o[off + i] = a[i];
 }
-void op_weighted_sum() {
-  uint i = gl_GlobalInvocationID.x; if (i >= P.n) return;
+void op_weighted_sum() {   // workgroup y = token (prefill): a [(y*aux+e) x n], b [y*aux+e], c / o [y x n], s [y]
+  uint i = gl_GlobalInvocationID.x, y = gl_WorkGroupID.y; if (i >= P.n) return;
   float acc = 0.0;
-  for (uint e = 0u; e < P.aux; e++) acc += b[e] * a[e * P.n + i];
-  o[i] = acc + c[i] * sigmoid(s[0]);
+  for (uint e = 0u; e < P.aux; e++) acc += b[y * P.aux + e] * a[(y * P.aux + e) * P.n + i];
+  o[y * P.n + i] = acc + c[y * P.n + i] * sigmoid(s[y]);
 }
 void op_rope_neox() {
   uint h = gl_WorkGroupID.x, t = gl_LocalInvocationID.x, n = P.n, nrot = P.aux, hlf = nrot / 2u, base = h * n;
@@ -339,28 +339,29 @@ void op_quant_q8() {
   }
 }
 void op_pos_incr() { if (gl_GlobalInvocationID.x == 0u) ids[0] += 1u; }   // the position counter, once per token
+void op_pos_incr2() { if (gl_GlobalInvocationID.x == 0u) { ids[0] += 1u; ids[1] += 1u; } }   // prefill: absolute position and batch row together
 void op_add() {
   uint i = gl_GlobalInvocationID.x; if (i >= P.n) return;
   o[i] = a[i] + b[i];
 }
-void op_f32_matvec() {
-  uint r = gl_WorkGroupID.x, t = gl_LocalInvocationID.x, n = P.n, base = r * n;
+void op_f32_matvec() {   // workgroup y = input row (prefill), x = output row
+  uint r = gl_WorkGroupID.x, y = gl_WorkGroupID.y, t = gl_LocalInvocationID.x, n = P.n, base = r * n;
   float acc = 0.0;
-  for (uint i = t; i < n; i += 256u) acc += a[base + i] * b[i];
+  for (uint i = t; i < n; i += 256u) acc += a[base + i] * b[y * n + i];
   float tot = wg_sum(t, acc);
-  if (t == 0u) o[r] = tot;
+  if (t == 0u) o[y * P.rows + r] = tot;
 }
-void op_add_rmsnorm() {
-  uint t = gl_LocalInvocationID.x, n = P.n;
+void op_add_rmsnorm() {   // workgroup x = row (prefill batches P rows; decode dispatches 1)
+  uint t = gl_LocalInvocationID.x, n = P.n, base = gl_WorkGroupID.x * n;
   float ss = 0.0;
-  for (uint i = t; i < n; i += 256u) { float v = a[i] + b[i]; o[i] = v; ss += v * v; }
+  for (uint i = t; i < n; i += 256u) { float v = a[base + i] + b[base + i]; o[base + i] = v; ss += v * v; }
   float tot = wg_sum(t, ss);
   float inv = inversesqrt(tot / float(n) + P.eps);
-  for (uint i = t; i < n; i += 256u) s[i] = o[i] * inv * c[i];
+  for (uint i = t; i < n; i += 256u) s[base + i] = o[base + i] * inv * c[i];
 }
 
 #ifndef OP
-#error "compile with -DOP=<rmsnorm|l2norm|gated_rmsnorm|silu_mul|conv1d_step|softmax_topk|gate_decay|gate_decay2|copy_at|weighted_sum|rope_neox|attn_decode|argmax_partial|argmax_final|add|f32_matvec|add_rmsnorm|pos_incr|sample_topp|sample_part|sample_probs|sample_bisect_part|sample_bisect_step|sample_final|quant_q8>"
+#error "compile with -DOP=<rmsnorm|l2norm|gated_rmsnorm|silu_mul|conv1d_step|softmax_topk|gate_decay|gate_decay2|copy_at|weighted_sum|rope_neox|attn_decode|argmax_partial|argmax_final|add|f32_matvec|add_rmsnorm|pos_incr|sample_topp|sample_part|sample_probs|sample_bisect_part|sample_bisect_step|sample_final|quant_q8|pos_incr2>"
 #endif
 #define CAT2(a, b) a##b
 #define CAT(a, b) CAT2(a, b)

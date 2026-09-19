@@ -14,7 +14,7 @@
 ;; Root ADR-2609182400 C.
 (require '["fs" :as fs] '[clojure.string :as str])
 (def args (vec *command-line-args*))
-(when-not (<= 6 (count args) 9) (println "usage: <file.gguf> <layers> <tokens> <prompt-token-id[,id...]> <dir-on-box> <out.kotoba> [anv|radv|nvgpu|nvgpu-exact] [stream|flat|fn] [sample:<T>:<top_p>:<seed>]") (js/process.exit 2))
+(when-not (<= 6 (count args) 9) (println "usage: <file.gguf> <layers> <tokens> <prompt-token-id[,id...]> <dir-on-box> <out.kotoba> [anv|radv|nvgpu|nvgpu-exact] [stream|flat|fn|prefill] [sample:<T>:<top_p>:<seed>]") (js/process.exit 2))
 ;; sample:T:top_p:seed (fn mode): nex_sample_topp replaces argmax_final -- the draw
 ;; u = hash(seed, pos) is reproduced by decode_tokens_ref.py --sample (iteration 18).
 (def sampling (when-let [a (get args 8)] (let [[_ T tp seed] (str/split a #":")] {:T (js/parseFloat T) :top-p (js/parseFloat tp) :seed (js/parseInt seed 0)})))
@@ -32,7 +32,12 @@
 ;; per token). Default since iteration 16 is the FUNCTION program: handles are
 ;; computed on the device side of the string (string-from-i64), layers and
 ;; tokens are recursions, the position and the token buffer live on the device.
-(def flat? (= "flat" (str/replace mode-arg "-nofuse" "")))
+(def prefill? (= "prefill" (str/replace mode-arg "-nofuse" "")))
+;; prefill (iteration 37): the P prompt tokens go through every layer as ONE batch -- the kdots
+;; with positions = P (weights read once), the row-wise ops with P rows, the delta-net step as
+;; P sequential dispatches on a per-layer step counter. Emitted as a single flat command buffer;
+;; the answer is "<ns>|<x of all P rows>|<argmax of the last row>". Recurrent layers only so far.
+(def flat? (or prefill? (= "flat" (str/replace mode-arg "-nofuse" ""))))
 (def fn-mode? (not (or stream? flat?)))
 (def gguf (args 0)) (def layers (js/parseInt (args 1))) (def ntok (js/parseInt (args 2))) (def box (args 4)) (def out (args 5))
 ;; <prompt-token-id> may be a comma-separated list: the first P steps are FORCED to
@@ -42,7 +47,9 @@
 ;; distributions on it.
 (def prompt (mapv js/parseInt (str/split (args 3) #",")))
 (def tok0 (first prompt))
-(when (< ntok (count prompt)) (println "REFUSE tokens" ntok "< prompt length" (count prompt)) (js/process.exit 2))
+(when (and (not prefill?) (< ntok (count prompt))) (println "REFUSE tokens" ntok "< prompt length" (count prompt)) (js/process.exit 2))
+(def PF (if prefill? (count prompt) 1))   ;; batch rows
+
 (def backend (or (get args 6) "anv"))
 ;; Kernel layout per (backend, tensor class) -- the co-scientist table (root
 ;; ADR-2609182400 C, iterations 3 and 7). Classes: :wide = the 4096/8192-row
@@ -97,6 +104,8 @@
 (defn T* [full] (or (get tensors full) (do (println "REFUSE no tensor" full) (js/process.exit 2))))
 (def interval (get kv "qwen35moe.full_attention_interval" 4))
 (def recurrent (vec (for [il (range 64)] (if (zero? (mod (inc il) interval)) 0 1))))  ;; llama.cpp: full attention every `interval`-th layer
+(when prefill? (when (some #(= 0 (recurrent %)) (range layers)) (println "REFUSE prefill: attention layers are not batched yet (use layers <= 3)") (js/process.exit 2))
+               (when (not= ntok 1) (println "REFUSE prefill: tokens must be 1 (the prompt is the batch)") (js/process.exit 2)))
 (def nrot (get kv "qwen35moe.rope.dimension_count")) (def rope-base (get kv "qwen35moe.rope.freq_base"))
 ;; --- emission helpers ---
 ;; The loader assigns buffer handles 1, 2, 3 ... in ALLOC/MAP order and pipeline
@@ -144,12 +153,12 @@
 (defn ops-meta! [n rows aux aux2 eps scale] (let [m (alloc! 32)] (write! m (str (le32 n) (le32 rows) (le32 aux) (le32 aux2) (lef32 eps) (lef32 scale) (lef32 0) (lef32 0))) m))
 ;; p1 = 1: the kernel takes the position from the pos buffer (binding 6) -- nex_ops.comp dyn_pos
 (defn ops-meta-dyn! [n rows aux aux2 eps scale] (let [m (alloc! 32)] (write! m (str (le32 n) (le32 rows) (le32 aux) (le32 aux2) (lef32 eps) (lef32 scale) (lef32 0) (lef32 1))) m))
-(defn kdot-meta! [rows cols type positions input-per-expert] (let [m (alloc! 32)] (write! m (str (le32 rows) (le32 cols) (le32 type) (le32 positions) (le32 input-per-expert) (le32 0) (le32 0) (le32 0))) m))
+(defn kdot-meta! [rows cols type positions input-per-expert & [pad0 pad1]] (let [m (alloc! 32)] (write! m (str (le32 rows) (le32 cols) (le32 type) (le32 positions) (le32 input-per-expert) (le32 (or pad0 0)) (le32 (or pad1 0)) (le32 0))) m))
 (def counter (atom 0))
 (defn fresh [prefix] (swap! counter inc) (str prefix @counter))
 ;; --- the plan ---
 (def zeros16 (alloc! 16))
-(def ops (into {} (for [op ["rmsnorm" "l2norm" "gated_rmsnorm" "silu_mul" "conv1d_step" "softmax_topk" "gate_decay2" "weighted_sum" "add" "f32_matvec" "add_rmsnorm" "rope_neox" "attn_decode" "argmax_partial" "argmax_final" "copy_at" "pos_incr" "sample_part" "sample_probs" "sample_bisect_part" "sample_bisect_step" "sample_final"]] [op (pipeline! (str "nex_" op ".spv") 7)])))
+(def ops (into {} (for [op ["rmsnorm" "l2norm" "gated_rmsnorm" "silu_mul" "conv1d_step" "softmax_topk" "gate_decay2" "weighted_sum" "add" "f32_matvec" "add_rmsnorm" "rope_neox" "attn_decode" "argmax_partial" "argmax_final" "copy_at" "pos_incr" "pos_incr2" "sample_part" "sample_probs" "sample_bisect_part" "sample_bisect_step" "sample_final"]] [op (pipeline! (str "nex_" op ".spv") 7)])))
 (def kdot-wide (pipeline! (:wide layouts) 5))
 (def kdot-narrow (pipeline! (:narrow layouts) 5))
 (def kdot-lm (pipeline! (:lm layouts) 5))
@@ -173,36 +182,40 @@
 (def embed (pipeline! "embed_iq4xs.spv" 5))
 (def w-embd (map-tensor! "token_embd.weight"))
 (def prompt-ids (alloc! (max 16 (* 4 (count prompt)))))
-(def x (alloc! 8192))
-(def h (alloc! 8192)) (def qkv (alloc! 32768)) (def z (alloc! 16384)) (def alpha (alloc! 128)) (def betaL (alloc! 128)) (def gb (alloc! 256)) (def beta-only (alloc! 256))
-(def conv (alloc! 32768)) (def qn (alloc! 8192)) (def kn (alloc! 8192)) (def dn (alloc! 16384)) (def gnorm (alloc! 16384)) (def attn-out (alloc! 8192))
+(def x (alloc! (* PF 8192)))
+(def h (alloc! (* PF 8192))) (def qkv (alloc! (* PF 32768))) (def z (alloc! (* PF 16384))) (def alpha (alloc! (* PF 128))) (def betaL (alloc! (* PF 128))) (def gb (alloc! 256)) (def beta-only (alloc! 256))
+(def conv (alloc! 32768)) (def qn (alloc! 8192)) (def kn (alloc! 8192)) (def dn (alloc! 16384)) (def gnorm (alloc! (* PF 16384))) (def attn-out (alloc! (* PF 8192)))
 (def qfull (alloc! 32768)) (def kproj (alloc! 2048)) (def vproj (alloc! 2048)) (def qnorm (alloc! 16384)) (def knorm (alloc! 2048)) (def qrope (alloc! 16384)) (def krope (alloc! 2048)) (def attno (alloc! 16384))
-(def resid (alloc! 8192)) (def h2 (alloc! 8192)) (def router (alloc! 1024)) (def ids (alloc! 64)) (def topw (alloc! 64))
-(def gateE (alloc! 16384)) (def upE (alloc! 16384)) (def actE (alloc! 16384)) (def downE (alloc! 65536))
-(def sg (alloc! 2048)) (def su (alloc! 2048)) (def sact (alloc! 2048)) (def shdown (alloc! 8192)) (def shlogit (alloc! 16)) (def ffn (alloc! 8192))
-(def xa (alloc! 8192)) (def xb (alloc! 8192))
+(def resid (alloc! (* PF 8192))) (def h2 (alloc! (* PF 8192))) (def router (alloc! (* PF 1024))) (def ids (alloc! (* PF 64))) (def topw (alloc! (* PF 64)))
+(def gateE (alloc! (* PF 16384))) (def upE (alloc! (* PF 16384))) (def actE (alloc! (* PF 16384))) (def downE (alloc! (* PF 65536)))
+(def sg (alloc! (* PF 2048))) (def su (alloc! (* PF 2048))) (def sact (alloc! (* PF 2048))) (def shdown (alloc! (* PF 8192))) (def shlogit (alloc! (max 16 (* PF 4)))) (def ffn (alloc! (* PF 8192)))
+(def xa (alloc! (* PF 8192))) (def xb (alloc! (* PF 8192)))
+(def zerosP (let [b (alloc! (max 16 (* 4 PF)))] (zero! b) b))   ;; expert_ids of zeros for the P-position non-MoE kdots
 (zero! zeros16)
 (write! prompt-ids (apply str (map le32 prompt)))
 (def rings (vec (for [il (range layers) :when (= 1 (recurrent il))] (let [r (alloc! (if fused? 196608 98304))] (zero! r) r))))   ;; fused: 2 slots x 3 x 8192 (double-buffered by pos parity)
 (def states (vec (for [il (range layers) :when (= 1 (recurrent il))] (let [s (alloc! 2097152)] (zero! s) s))))
 (def kcaches (vec (for [il (range layers) :when (= 0 (recurrent il))] (let [b (alloc! (* ntok 2048))] (zero! b) b))))
 (def vcaches (vec (for [il (range layers) :when (= 0 (recurrent il))] (let [b (alloc! (* ntok 2048))] (zero! b) b))))
-(def m-norm (ops-meta! 2048 1 0 0 eps 0)) (def m-qkv (kdot-meta! 8192 2048 13 1 0)) (def m-gate (kdot-meta! 4096 2048 23 1 0))
-(def m-ab (kdot-meta! 32 2048 23 1 0)) (def m-gd (ops-meta! 32 32 32 0 0 0)) (def m-gd0 (ops-meta! 32 32 0 0 0 0)) (def m-conv (ops-meta! 8192 1 0 0 0 0))
+(def ipe (if prefill? 1 0))   ;; kdots that read the batched activation: x row = position
+(def m-norm (ops-meta! 2048 PF 0 0 eps 0)) (def m-qkv (kdot-meta! 8192 2048 13 PF ipe)) (def m-gate (kdot-meta! 4096 2048 23 PF ipe))
+(def m-ab (kdot-meta! 32 2048 23 PF ipe)) (def m-gd (ops-meta! 32 32 32 0 0 0)) (def m-gd0 (ops-meta! 32 32 0 0 0 0)) (def m-conv (ops-meta! 8192 1 0 0 0 0))
 (def m-l2q (ops-meta! 128 16 0 0 eps (/ 1.0 (js/Math.sqrt 128)))) (def m-l2k (ops-meta! 128 16 0 2048 eps 0))
 (def m-dn (let [m (alloc! 32)] (write! m (str (le32 32) (le32 128) (le32 128) (le32 16) (le32 4096) (le32 0) (le32 0) (le32 0))) m))
 (def m-fused (when fused? (let [m (alloc! 32)] (write! m (str (le32 32) (le32 128) (le32 128) (le32 16) (le32 4096) (le32 8192) (lef32 eps) (lef32 (/ 1.0 (js/Math.sqrt 128))))) m)))
-(def m-gn (ops-meta! 128 32 0 0 eps 0)) (def m-out (kdot-meta! 2048 4096 23 1 0))
+(def stepbufs (when prefill? (vec (for [il (range layers) :when (= 1 (recurrent il))] (let [b (alloc! 16)] (zero! b) b)))))   ;; [abs pos, row] per layer, advanced by pos_incr2
+(def m-gn (ops-meta! 128 32 0 0 eps 0)) (def m-out (kdot-meta! 2048 4096 23 PF ipe))
 (def m-q (kdot-meta! 8192 2048 23 1 0)) (def m-k (kdot-meta! 512 2048 23 1 0)) (def m-v (kdot-meta! 512 2048 13 1 0))
 (def m-qnorm (ops-meta! 256 16 512 0 eps 0)) (def m-knorm (ops-meta! 256 2 0 0 eps 0))
 (def m-attn-o (kdot-meta! 2048 4096 23 1 0))
 (def m-addn (ops-meta! 2048 1 0 0 eps 0)) (def m-router (ops-meta! 2048 256 0 0 0 0)) (def m-topk (ops-meta! 256 1 8 0 0 1.0))
-(def m-gate-exps (kdot-meta! 512 2048 23 8 0)) (def m-down-exps (kdot-meta! 2048 512 23 8 1))
-(def m-silu8 (ops-meta! 4096 1 0 0 0 0)) (def m-gate-sh (kdot-meta! 512 2048 23 1 0)) (def m-down-sh (kdot-meta! 2048 512 23 1 0))
-(def m-silu-sh (ops-meta! 512 1 0 0 0 0)) (def m-shlogit (ops-meta! 2048 1 0 0 0 0)) (def m-wsum (ops-meta! 2048 1 8 0 0 0)) (def m-add (ops-meta! 2048 1 0 0 0 0))
+(def m-gate-exps (kdot-meta! 512 2048 23 (* 8 PF) ipe (if prefill? 8 0))) (def m-down-exps (kdot-meta! 2048 512 23 (* 8 PF) 1))
+(def m-silu8 (ops-meta! (* PF 4096) 1 0 0 0 0)) (def m-gate-sh (kdot-meta! 512 2048 23 PF ipe)) (def m-down-sh (kdot-meta! 2048 512 23 PF ipe))
+(def m-silu-sh (ops-meta! (* PF 512) 1 0 0 0 0)) (def m-shlogit (ops-meta! 2048 1 0 0 0 0)) (def m-wsum (ops-meta! 2048 1 8 0 0 0)) (def m-add (ops-meta! (* PF 2048) 1 0 0 0 0))
 (def w-out-norm (map-tensor! "output_norm.weight")) (def w-lm (map-tensor! "output.weight"))
-(def hN (alloc! 8192)) (def logits (alloc! (* 248320 4))) (def amax-s (alloc! 256)) (def amax-ids (alloc! 256))
-(def m-lm (kdot-meta! 248320 2048 14 1 0)) (def m-am1 (ops-meta! 248320 1 61 0 0 0)) (def m-am2 (ops-meta! 248320 1 61 0 0 0))
+(def hN (alloc! (* PF 8192))) (def logits (alloc! (* 248320 4))) (def amax-s (alloc! 256)) (def amax-ids (alloc! 256))
+(def m-lm (kdot-meta! 248320 2048 14 1 0 0 (dec PF)))   ;; prefill: the lm_head reads the last batch row (pad1)
+(def m-am1 (ops-meta! 248320 1 61 0 0 0)) (def m-am2 (ops-meta! 248320 1 61 0 0 0))
 ;; int8 twins of the activations the i8 kdots read: [xq xs] per buffer, and one quant meta per value count
 (def q-metas (when quant {2048 (ops-meta! 2048 1 0 0 0 0) 4096 (ops-meta! 4096 1 0 0 0 0)}))
 (defn i8-pair! [n] (when quant [(alloc! n) (alloc! (* 4 (quot n 32)))]))
@@ -221,7 +234,7 @@
 (def m-ropeq-dyn (ops-meta-dyn! 256 16 nrot 0 0 rope-base)) (def m-ropek-dyn (ops-meta-dyn! 256 2 nrot 0 0 rope-base))
 (def m-attn-dyn (ops-meta-dyn! 256 16 0 2 -1.0 (/ 1.0 16.0))) (def m-copy-dyn (ops-meta-dyn! 512 1 0 512 0 0))
 ;; fn mode: the token buffer holds the prompt, then argmax_final appends each next token; embed reads slot pos
-(def tokbuf (let [b (alloc! (max 16 (* 4 (+ ntok 1))))] (write! b (apply str (map le32 prompt))) b))
+(def tokbuf (let [b (alloc! (max 16 (* 4 (+ ntok 1)) (* 4 (count prompt))))] (write! b (apply str (map le32 prompt))) b))   ;; holds the prompt and every decoded token
 (def m-embed-dyn (let [m (alloc! 16)] (write! m (str (le32 2048) (le32 0) (le32 1) (le32 0))) m))
 (def m-am2-dyn (let [m (alloc! 32)] (write! m (str (le32 248320) (le32 1) (le32 61) (le32 (count prompt)) (lef32 0) (lef32 0) (lef32 0) (lef32 1))) m))
 (def m-incr (ops-meta! 1 1 0 0 0 0))
@@ -250,20 +263,25 @@
 
 ;; one layer's dispatches, for any handle representation (literal or "$symbol")
 (defn emit-layer! [il w xin xout ring S kc vc mrq mrk mattn mcopy pb]
-        (dispatch! (ops "rmsnorm") 1 1 1 m-norm xin (:norm w) zeros16 h zeros16 zeros16)
+        (dispatch! (ops "rmsnorm") PF 1 1 m-norm xin (:norm w) zeros16 h zeros16 zeros16)
         (if (= 1 (recurrent il))
           (do
             (if i8-wide
               (let [[xq xs] (quant! h 2048 h-i8)]
-                (dispatch! i8-wide (wg-of (:wide-i8 layouts) 8192) 1 1 m-qkv (:qkv w) xq qkv zeros16 xs)
-                (dispatchc! i8-wide (wg-of (:wide-i8 layouts) 4096) 1 1 m-gate (:gate w) xq z zeros16 xs))
+                (dispatch! i8-wide (wg-of (:wide-i8 layouts) 8192) PF 1 m-qkv (:qkv w) xq qkv zerosP xs)
+                (dispatchc! i8-wide (wg-of (:wide-i8 layouts) 4096) PF 1 m-gate (:gate w) xq z zerosP xs))
               (do
-                (dispatch! kdot-wide (wg-of (:wide layouts) 8192) 1 1 m-qkv (:qkv w) h qkv zeros16)
-                (dispatchc! kdot-wide (wg-of (:wide layouts) 4096) 1 1 m-gate (:gate w) h z zeros16)))
-            (dispatchc! kdot-narrow (wg-of (:narrow layouts) 32) 1 1 m-ab (:alpha w) h alpha zeros16)
-            (dispatchc! kdot-narrow (wg-of (:narrow layouts) 32) 1 1 m-ab (:beta w) h betaL zeros16)
+                (dispatch! kdot-wide (wg-of (:wide layouts) 8192) PF 1 m-qkv (:qkv w) h qkv zerosP)
+                (dispatchc! kdot-wide (wg-of (:wide layouts) 4096) PF 1 m-gate (:gate w) h z zerosP)))
+            (dispatchc! kdot-narrow (wg-of (:narrow layouts) 32) PF 1 m-ab (:alpha w) h alpha zerosP)
+            (dispatchc! kdot-narrow (wg-of (:narrow layouts) 32) PF 1 m-ab (:beta w) h betaL zerosP)
             (if fused?
-              (dispatch! deltanet-fused 32 1 1 m-fused qkv (:conv w) ring alpha betaL (:dt w) (:a w) S (:ssm-norm w) z gnorm pb)
+              (if prefill?
+                (let [sb (stepbufs (count (filter #(= 1 (recurrent %)) (range il))))]
+                  (dotimes [_ PF]
+                    (dispatch! deltanet-fused 32 1 1 m-fused qkv (:conv w) ring alpha betaL (:dt w) (:a w) S (:ssm-norm w) z gnorm sb)
+                    (dispatch! (ops "pos_incr2") 1 1 1 m-incr zeros16 zeros16 zeros16 zeros16 zeros16 sb)))
+                (dispatch! deltanet-fused 32 1 1 m-fused qkv (:conv w) ring alpha betaL (:dt w) (:a w) S (:ssm-norm w) z gnorm pb))
               (do
                 (dispatch! (ops "gate_decay2") 1 1 1 m-gd alpha (:dt w) (:a w) gb betaL zeros16)
                 (dispatchc! (ops "gate_decay2") 1 1 1 m-gd0 alpha (:dt w) (:a w) beta-only betaL zeros16)
@@ -272,7 +290,7 @@
                 (dispatchc! (ops "l2norm") 16 1 1 m-l2k conv zeros16 zeros16 kn zeros16 zeros16)
                 (dispatch! deltanet 32 1 1 m-dn qn kn conv gb beta-only S dn)
                 (dispatch! (ops "gated_rmsnorm") 32 1 1 m-gn dn (:ssm-norm w) z gnorm zeros16 zeros16)))
-            (dispatch! kdot-out (wg-of out-spv 2048) 1 1 m-out (:out w) gnorm attn-out zeros16))
+            (dispatch! kdot-out (wg-of out-spv 2048) PF 1 m-out (:out w) gnorm attn-out zerosP))
           (do
             (if i8-wide
               (let [[xq xs] (quant! h 2048 h-i8)] (dispatch! i8-wide (wg-of (:wide-i8 layouts) 8192) 1 1 m-q (:q w) xq qfull zeros16 xs))
@@ -287,37 +305,37 @@
             (dispatch! (ops "copy_at") 2 1 1 mcopy krope zeros16 zeros16 kc zeros16 pb)
             (dispatch! (ops "attn_decode") 16 1 1 mattn qrope kc vc attno qfull pb)
             (dispatch! kdot-out (wg-of out-spv 2048) 1 1 m-attn-o (:o w) attno attn-out zeros16)))
-        (dispatch! (ops "add_rmsnorm") 1 1 1 m-addn xin attn-out (:post w) resid h2 zeros16)
+        (dispatch! (ops "add_rmsnorm") PF 1 1 m-addn xin attn-out (:post w) resid h2 zeros16)
         ;; barrier groups (DISPATCHC = independent of everything since the last DISPATCH)
-        (dispatch! (ops "f32_matvec") 256 1 1 m-router (:router w) h2 zeros16 router zeros16 zeros16)
-        (dispatchc! kdot-narrow (wg-of (:narrow layouts) 512) 1 1 m-gate-sh (:gate-sh w) h2 sg zeros16)
-        (dispatchc! kdot-narrow (wg-of (:narrow layouts) 512) 1 1 m-gate-sh (:up-sh w) h2 su zeros16)
-        (dispatchc! (ops "f32_matvec") 1 1 1 m-shlogit (:shgate-inp w) h2 zeros16 shlogit zeros16 zeros16)
-        (dispatch! (ops "softmax_topk") 1 1 1 m-topk router zeros16 zeros16 topw zeros16 ids)
-        (dispatchc! (ops "silu_mul") 2 1 1 m-silu-sh sg su zeros16 sact zeros16 zeros16)
+        (dispatch! (ops "f32_matvec") 256 PF 1 m-router (:router w) h2 zeros16 router zeros16 zeros16)
+        (dispatchc! kdot-narrow (wg-of (:narrow layouts) 512) PF 1 m-gate-sh (:gate-sh w) h2 sg zerosP)
+        (dispatchc! kdot-narrow (wg-of (:narrow layouts) 512) PF 1 m-gate-sh (:up-sh w) h2 su zerosP)
+        (dispatchc! (ops "f32_matvec") 1 PF 1 m-shlogit (:shgate-inp w) h2 zeros16 shlogit zeros16 zeros16)
+        (dispatch! (ops "softmax_topk") PF 1 1 m-topk router zeros16 zeros16 topw zeros16 ids)
+        (dispatchc! (ops "silu_mul") (* 2 PF) 1 1 m-silu-sh sg su zeros16 sact zeros16 zeros16)
         (if kdot-expert-dual
           (do (dispatch! kdot-expert-dual (quot (+ 512 7) 8) 8 1 m-gate-exps (:gate-exps w) (:up-exps w) h2 actE ids)
-              (dispatchc! kdot-narrow (wg-of (:narrow layouts) 2048) 1 1 m-down-sh (:down-sh w) sact shdown zeros16))
+              (dispatchc! kdot-narrow (wg-of (:narrow layouts) 2048) PF 1 m-down-sh (:down-sh w) sact shdown zerosP))
           (if i8-expert
             (let [[xq xs] (quant! h2 2048 h2-i8)]
-              (dispatch! i8-expert (wg-of (:expert-i8 layouts) 512) 8 1 m-gate-exps (:gate-exps w) xq gateE ids xs)
-              (dispatchc! i8-expert (wg-of (:expert-i8 layouts) 512) 8 1 m-gate-exps (:up-exps w) xq upE ids xs)
-              (dispatchc! kdot-narrow (wg-of (:narrow layouts) 2048) 1 1 m-down-sh (:down-sh w) sact shdown zeros16)
-              (dispatch! (ops "silu_mul") 16 1 1 m-silu8 gateE upE zeros16 actE zeros16 zeros16))
-            (do (dispatch! kdot-expert (wg-of expert-spv 512) 8 1 m-gate-exps (:gate-exps w) h2 gateE ids)
-                (dispatchc! kdot-expert (wg-of expert-spv 512) 8 1 m-gate-exps (:up-exps w) h2 upE ids)
-                (dispatchc! kdot-narrow (wg-of (:narrow layouts) 2048) 1 1 m-down-sh (:down-sh w) sact shdown zeros16)
-                (dispatch! (ops "silu_mul") 16 1 1 m-silu8 gateE upE zeros16 actE zeros16 zeros16))))
+              (dispatch! i8-expert (wg-of (:expert-i8 layouts) 512) (* 8 PF) 1 m-gate-exps (:gate-exps w) xq gateE ids xs)
+              (dispatchc! i8-expert (wg-of (:expert-i8 layouts) 512) (* 8 PF) 1 m-gate-exps (:up-exps w) xq upE ids xs)
+              (dispatchc! kdot-narrow (wg-of (:narrow layouts) 2048) PF 1 m-down-sh (:down-sh w) sact shdown zerosP)
+              (dispatch! (ops "silu_mul") (* 16 PF) 1 1 m-silu8 gateE upE zeros16 actE zeros16 zeros16))
+            (do (dispatch! kdot-expert (wg-of expert-spv 512) (* 8 PF) 1 m-gate-exps (:gate-exps w) h2 gateE ids)
+                (dispatchc! kdot-expert (wg-of expert-spv 512) (* 8 PF) 1 m-gate-exps (:up-exps w) h2 upE ids)
+                (dispatchc! kdot-narrow (wg-of (:narrow layouts) 2048) PF 1 m-down-sh (:down-sh w) sact shdown zerosP)
+                (dispatch! (ops "silu_mul") (* 16 PF) 1 1 m-silu8 gateE upE zeros16 actE zeros16 zeros16))))
         (if i8-expert
-          (let [[xq xs] (quant! actE 4096 actE-i8)] (dispatch! i8-expert (wg-of (:expert-i8 layouts) 2048) 8 1 m-down-exps (:down-exps w) xq downE ids xs))
-          (dispatch! kdot-expert (wg-of expert-spv 2048) 8 1 m-down-exps (:down-exps w) actE downE ids))
-        (dispatch! (ops "weighted_sum") 8 1 1 m-wsum downE topw shdown ffn shlogit zeros16)
-        (dispatch! (ops "add") 8 1 1 m-add resid ffn zeros16 xout zeros16 zeros16))
+          (let [[xq xs] (quant! actE 4096 actE-i8)] (dispatch! i8-expert (wg-of (:expert-i8 layouts) 2048) (* 8 PF) 1 m-down-exps (:down-exps w) xq downE ids xs))
+          (dispatch! kdot-expert (wg-of expert-spv 2048) (* 8 PF) 1 m-down-exps (:down-exps w) actE downE ids))
+        (dispatch! (ops "weighted_sum") 8 PF 1 m-wsum downE topw shdown ffn shlogit zeros16)
+        (dispatch! (ops "add") (* 8 PF) 1 1 m-add resid ffn zeros16 xout zeros16 zeros16))
 
 ;; the token's tail: final norm, lm_head, argmax, SUBMIT (bound) and the read-backs
 (defn emit-lm-head! [pos]
   (let [x-final (if (odd? (dec layers)) xb xa)]
-    (dispatch! (ops "rmsnorm") 1 1 1 m-norm x-final w-out-norm zeros16 hN zeros16 zeros16)
+    (dispatch! (ops "rmsnorm") PF 1 1 m-norm x-final w-out-norm zeros16 hN zeros16 zeros16)
     (if i8-lm
       (let [[xq xs] (quant! hN 2048 hN-i8)] (dispatch! i8-lm (wg-of (:lm-i8 layouts) 248320) 1 1 m-lm w-lm xq logits zeros16 xs))
       (dispatch! kdot-lm (wg-of (:lm layouts) 248320) 1 1 m-lm w-lm hN logits zeros16))
@@ -325,14 +343,14 @@
     (dispatch! (ops "argmax_final") 1 1 1 m-am2 amax-s zeros16 zeros16 amax-s amax-s amax-ids)
     ;; SUBMIT and the read-backs are bound so their answers survive to the end
     (let [ns (fresh "ns") xr (fresh "xr") idr (fresh "idr") lg (fresh "lg") last? (= pos (dec ntok))]
-      (swap! ans-binds conj (cond-> [[ns (q "SUBMIT")] [xr (q (str "READ " x-final " 0 8192"))] [idr (q (str "READ " amax-ids " 244 4"))]]
+      (swap! ans-binds conj (cond-> [[ns (q "SUBMIT")] [xr (q (str "READ " x-final " 0 " (* PF 8192)))] [idr (q (str "READ " amax-ids " 244 4"))]]
                               (and stream? last?) (conj [lg (q (str "READ " logits " 0 " (* 248320 4)))])))
       (swap! token-answers conj (if (and stream? last?) (cat ns (q "|") xr (q "|") idr (q "|") lg) (cat ns (q "|") xr (q "|") idr))))))
 (when flat?
   (doseq [pos (range ntok)]
     (write! posbuf (le32 pos))   ;; the fused delta-net step reads the position's parity for its conv ring slot
     (step! (q "BEGIN"))
-    (dispatch! embed 1 1 1 (if (< pos (count prompt)) (m-embedP pos) m-embed1) w-embd (if (< pos (count prompt)) prompt-ids amax-ids) x zeros16)
+    (dispatch! embed 1 PF 1 (if (< pos (count prompt)) (m-embedP pos) m-embed1) w-embd (if (< pos (count prompt)) prompt-ids amax-ids) x zeros16)
     (let [rec-index (atom 0) att-index (atom 0)]
       (doseq [il (range layers)]
         (let [w (layer-w il) xin (if (zero? il) x (if (odd? il) xa xb)) xout (if (odd? il) xb xa)
@@ -418,7 +436,7 @@
     (step! (q "BEGIN"))
     (dispatch! embed 1 1 1 m-embed-dyn w-embd tokbuf x posbuf)
     (step! (str "(layers 0 " layers ")"))
-    (dispatch! (ops "rmsnorm") 1 1 1 m-norm x-final w-out-norm zeros16 hN zeros16 zeros16)
+    (dispatch! (ops "rmsnorm") PF 1 1 m-norm x-final w-out-norm zeros16 hN zeros16 zeros16)
     (if i8-lm
       (let [[xq xs] (quant! hN 2048 hN-i8)] (dispatch! i8-lm (wg-of (:lm-i8 layouts) 248320) 1 1 m-lm w-lm xq logits zeros16 xs))
       (dispatch! kdot-lm (wg-of (:lm layouts) 248320) 1 1 m-lm w-lm hN logits zeros16))
