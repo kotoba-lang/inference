@@ -14,7 +14,7 @@
 ;; Root ADR-2609182400 C.
 (require '["fs" :as fs] '[clojure.string :as str])
 (def args (vec *command-line-args*))
-(when-not (<= 6 (count args) 10) (println "usage: <file.gguf> <layers> <tokens> <prompt-token-id[,id...]> <dir-on-box> <out.kotoba> [anv|radv|nvgpu|nvgpu-exact] [stream|flat|fn|prefill] [sample:<T>:<top_p>:<seed>|-] [runtime|resident]") (js/process.exit 2))
+(when-not (<= 6 (count args) 10) (println "usage: <file.gguf> <layers> <tokens> <prompt-token-id[,id...]> <dir-on-box> <out.kotoba> [anv|radv|nvgpu|nvgpu-exact] [stream|flat|fn|prefill] [sample:<T>:<top_p>:<seed>|-] [runtime|resident|resident-replay]") (js/process.exit 2))
 ;; runtime (fn mode, iteration 41): the prompt ids are read when the guest RUNS -- :env/read NEX_PROMPT
 ;; ("760,6511,...") written to the device with WRITEDEC -- and main takes (prompt length, tokens to
 ;; generate) as its two i64 arguments (the loader's argv; the native slice has string-from-i64 but no
@@ -26,7 +26,11 @@
 ;; (wire 37; the loader buffers standard output, so an empty :io/write-error -- wire 39, which flushes
 ;; standard output first -- follows every reply). The shell feeds the prompt and then feeds each argmax back. No state is zeroed on a reset:
 ;; the kernels read no history at position 0 (deltanet_fused `fresh`, attn_decode T = pos + 1).
-(def resident? (= "resident" (get args 9)))
+;; resident-replay (iteration 44): the step's command buffer is recorded ONCE (BEGINK 0 .. SUBMIT, one warm-up step
+;; on zero state that the first request's rewind discards) and each step is REPLAY 0 -- 4 gpu requests per step
+;; (WRITEDEC, REPLAY, READ, and the reply) instead of one per dispatch. Needs the loader with kept command buffers (amu #1036).
+(def replay? (= "resident-replay" (get args 9)))
+(def resident? (or (= "resident" (get args 9)) replay?))
 (def runtime? (or (= "runtime" (get args 9)) resident?))
 ;; sample:T:top_p:seed (fn mode): nex_sample_topp replaces argmax_final -- the draw
 ;; u = hash(seed, pos) is reproduced by decode_tokens_ref.py --sample (iteration 18).
@@ -478,12 +482,21 @@
          "    acc))\n"
          (when resident?
            (str ";; resident (iteration 43): one message per step from standard input until EOF; the argmax id answers on standard output\n"
+                (when replay?
+                  (str ";; resident-replay (iteration 44): the step is recorded once as kept command buffer 0 and replayed per message\n"
+                       "(defn record-step [] :string\n  (do\n"
+                       (str/join "\n" (map #(cond (str/starts-with? % "(layers") (str "      " %)
+                                                   (= % (q "BEGIN")) "      (gpu \"BEGINK 0\")"
+                                                   :else (str "      (gpu " % ")")) @lines)) "\n"
+                       "      (gpu \"SUBMIT\")))\n"))
                 "(defn serve-loop [n :i64] :i64\n"
                 "  (let [line (typed-cap-call :io/read :string :string \"64\")]\n"
                 "    (if (string=? line \"\")\n      n\n      (do\n"
                 "      (gpu (string-concat \"WRITEDEC " ctrl " 0 \" line))\n"
-                (str/join "\n" (map #(if (str/starts-with? % "(layers") (str "      " %) (str "      (gpu " % ")")) @lines)) "\n"
-                "      (let [ns (gpu \"SUBMIT\")\n            idr (gpu \"READ " amax-ids " 244 4\")]\n"
+                (if replay?
+                  ""   ;; the step is one REPLAY below
+                  (str/join "\n" (map #(if (str/starts-with? % "(layers") (str "      " %) (str "      (gpu " % ")")) @lines))) "\n"
+                "      (let [ns (gpu \"" (if replay? "REPLAY 0" "SUBMIT") "\")\n            idr (gpu \"READ " amax-ids " 244 4\")]\n"
                 "        (do (typed-cap-call :io/write :string :string (string-concat ns (string-concat \"|\" (string-concat idr \"\\n\"))))\n"
                 "            (typed-cap-call :io/write-error :string :string \"\")\n"   ;; the loader buffers standard output (64 KiB) and flushes it before any diagnostic write: an empty one is the flush
                 "            (serve-loop (+ n 1))))))))\n"))))))
@@ -519,6 +532,7 @@
               "    (do\n" (str/join "\n" (map #(str "      (gpu " % ")") const-steps)) "\n"
               (if fn-mode?
                 (cond
+                  replay? "      (record-step)\n      (string-from-i64 (serve-loop 0))"
                   resident? "      (string-from-i64 (serve-loop 0))"
                   runtime?
                   (str "      (let [prompt (typed-cap-call :env/read :string :string \"NEX_PROMPT\")]\n"

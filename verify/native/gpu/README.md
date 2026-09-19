@@ -930,3 +930,27 @@ in this README is the SUBMIT ns — GPU time — so the served rate is lower tha
 dispatch are not separated yet. Since fn mode made every step's dispatches identical (device-side pos
 and token), the whole step is ONE reusable command buffer: record once, replay per step — a loader
 request (`BEGIN keep` / `REPLAY`) that turns 291–942 round trips into 1. That is the next item.
+
+## Tick 39 (2026-09-20, B / C-3-4): the step as one kept command buffer — `resident-replay`
+
+The loader (amu #1036, `kexe-loader-gpu6` on the boxes until merged) gains kept command buffers:
+`BEGINK <slot>` records a replayable buffer, `SUBMIT` submits it once and keeps it, `REPLAY <slot>`
+submits it again, `DROP <slot>` frees it; `FREE` of a buffer a kept buffer binds is refused by name.
+`… fn - resident-replay` uses it: `record-step` records the token step once (`BEGINK 0` … `SUBMIT`: one
+warm-up step on zero state that the first request's rewind discards), and `serve-loop` is 4 `gpu`
+requests per step — `WRITEDEC` ctrl, `REPLAY 0`, `READ` argmax, plus the two io writes — instead of 291.
+
+Measured (12 layers, France prompt + 8, `resident_drive.py`, 3 requests; GPU ns unchanged, ids oracle 8/8
+on every box, `resident_mix.py` 6/6 on K16):
+
+| box | GPU ms/token | wall / 12 steps | host per step, tick 38 → now | guest pool + pairs per step |
+|---|---|---|---|---|
+| K16 radv | 27.1 | 0.374 → **0.340 s** | 4.1 → **1.2 ms** | 11.3 KiB / 3.5 K → 0.42 KiB / 142 |
+| B70 anv | 4.97 | 0.112 → **0.064 s** | 4.4 → **0.36 ms** | same |
+| Xavier nvgpu | 37.5 | 0.669 → **0.462 s** | 18.6 → **1.0 ms** | same |
+
+HTTP on K16 (`curl … max_tokens 8`, 5 runs): **0.331–0.354 s** (tick 38: 0.381–0.395). The remaining
+host cost per step is the 4 round trips + the `READ` (its own copy command buffer + fence) + the pipe;
+the guest's life is no longer bounded by its allocators in practice (2^26 pairs / 142 ≈ 470 k steps).
+For the served rate this is the correction of tick 38's correction: Xavier 40 layers ≈ 87 ms GPU + ~3 ms
+host, B70 40 layers ≈ 10 ms GPU + ~1 ms.
