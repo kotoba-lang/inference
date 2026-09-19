@@ -1,0 +1,12 @@
+The capital of France is
+Hello, world!  Multiple   spaces and a tab	here.
+東京都千代田区は日本の首都の中心です。
+Ich weiß nicht, ob's stimmt — aber vielleicht.
+def fib(n):
+    return n if n < 2 else fib(n-1) + fib(n-2)
+Prices: $1,234.56 (approx. €1.1k) on 2026-09-20 at 16:45.
+🙂 emoji and 日本語 mixed with English words like GPU/Vulkan.
+It's we're they'll I'd you've can't DON'T
+   leading spaces and trailing spaces   
+https://kotobase.net/ipfs/bafy... path/with/slashes?x=1&y=2
+한국어 텍스트와 русский текст
