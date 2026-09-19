@@ -54,7 +54,7 @@
 ;; on RADV r8 wins attn_gate and loses the experts, and s2 LOSES (one wave64 per
 ;; workgroup pays the barriers); on ANV r1 wins everything but the lm_head.
 (def layout-table
-  {"anv"   {:wide "kdot_f32_r8.spv" :narrow "kdot_f32_r1.spv" :lm "kdot_f32_r8.spv" :expert "kdot_f32_r8.spv" :out "kdot_f32_r1.spv"}   ;; wide -> r8 (iteration 25), experts -> r8 (iteration 27), out projections back to r1 (iteration 28: 256 workgroups starve r8)
+  {"anv"   {:wide "kdot_x8r4.spv" :narrow "kdot_f32_r1.spv" :lm "kdot_x8r4.spv" :expert "kdot_f32_r8.spv" :out "kdot_f32_r1.spv"}   ;; wide / lm -> x8r4 (iteration 33: 2.97 -> 2.82 ms; experts on x8r8 lose, 3.27), experts r8 (iteration 27), out r1 (iteration 28)
    "anv-dual" {:wide "kdot_f32_r8.spv" :narrow "kdot_f32_r1.spv" :lm "kdot_f32_r8.spv" :expert "kdot_f32_r8.spv" :expert-dual "kdot_f32_r8_dual.spv"}   ;; experiment: gate + up + silu in one dispatch (iteration 28)
    "radv"  {:wide "kdot_f32_r8.spv" :narrow "kdot_f32_r1.spv" :lm "kdot_f32_r1.spv"}
    ;; nvgpu default = packed-half dequant (kdot_h2_r1) since iteration 15: over all
@@ -153,7 +153,9 @@
 ;; :out = the 2048-row x 4096-col output projections (ssm_out, attn_output): on r8 they get only 256 workgroups (iteration 28)
 (def kdot-out (if (:out layouts) (pipeline! (:out layouts) 5) kdot-wide))
 (def out-spv (or (:out layouts) (:wide layouts)))
-(defn wg-of [spv rows] (if (= spv "kdot_f32_r8.spv") (quot (+ rows 7) 8) rows))
+;; rows per workgroup from the kernel name: ...r8.spv -> 8, ...r4.spv -> 4, x8.spv / r1 / s* / h2_r1 -> 1
+(defn rows-of-spv [spv] (if-let [m (re-find #"r(\d+)\.spv$" spv)] (js/parseInt (second m)) 1))
+(defn wg-of [spv rows] (let [n (rows-of-spv spv)] (quot (+ rows n -1) n)))
 (def expert-spv (or (:expert layouts) (:narrow layouts)))
 (def deltanet (pipeline! "deltanet_step.spv" 8))
 (def deltanet-fused (when fused? (pipeline! "deltanet_fused.spv" 13)))
