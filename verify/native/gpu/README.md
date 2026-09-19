@@ -743,6 +743,17 @@ distribution. `anv` = int8 wide / lm, `anv-exact` keeps f32. Session tally, B70
 **10 ms, ~100 tok/s class** — vLLM's 103 is within reach of the estimate; a
 resident run is what turns it into a measurement.
 
+**Tick 30 (iteration 35): the same int8 path on K16 — measured, not adopted.**
+RADV also exposes the 4×8 integer dot; glslang 16.6 installed on K16 and the
+same kernels compiled. K16 (GB/s): attn_qkv f32 r8 25.7 / r1 22.3 / **i8 x8r4
+21.9** / i8 r8 20.0; lm_head f32 r1 43.1 / r8 38.2 / **i8 x8r4 44.2** / i8 r8
+38.4; attn_gate i8 x8r4 17.4. Against a 46 GB/s floor the K16 kdots were already
+at 55–95%, and the int8 path buys nothing (qkv loses, lm_head +2%) while
+adding the Q8 numerics — so `radv` stays f32 (wide r8 / narrow r1 / lm r1).
+Per box, the kdot story is now: K16 bandwidth-bound (nothing left in the
+kernel), B70 issue/coalescing-bound (int8 × x8r4 landed), Xavier
+instruction-bound without an integer dot (h2 landed, dp4a unavailable).
+
 What this is not yet: the 40-layer model on a device with room (the serving
 processes own the memory), prompt-side prefill (tokens are fed one at a time),
 sampling other than argmax, distribution parity with llama.cpp over a real
