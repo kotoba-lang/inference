@@ -1,0 +1,36 @@
+#version 450
+// Token embedding lookup on the device: dequantise ONE IQ4_XS row of
+// token_embd.weight into f32 -- the row named by ids[meta.slot]. Written so a
+// greedy loop never leaves the GPU: token 0 reads the prompt id the host
+// WROTE, token t>0 reads the argmax the previous step's argmax_final left in
+// its ids buffer. One workgroup: thread t < blocks*8 owns sub-block t (32 values).
+// Root ADR-2609182400 C.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer Meta { uint cols; uint slot; uint pad0; uint pad1; } P;
+layout(std430, binding = 1) readonly buffer W { uint weights[]; };     // IQ4_XS rows, 136 B per 256 values
+layout(std430, binding = 2) readonly buffer I { uint ids[]; };
+layout(std430, binding = 3) buffer O { float o[]; };
+uint weight_byte(uint offset) { return (weights[offset >> 2u] >> ((offset & 3u) * 8u)) & 255u; }
+float weight_half(uint offset) { vec2 pr = unpackHalf2x16(weights[offset >> 2u]); return ((offset & 2u) != 0u) ? pr.y : pr.x; }
+int kvalue(uint i) {
+  uint w = (i < 4u) ? 0xBFAD9881u : (i < 8u) ? 0xF6EADDCFu : (i < 12u) ? 0x26190D01u : 0x71594535u;
+  return bitfieldExtract(int(w), int((i & 3u) * 8u), 8);
+}
+void main() {
+  uint t = gl_LocalInvocationID.x;
+  uint blocks = P.cols / 256u;
+  if (t >= blocks * 8u) return;
+  uint tok = ids[P.slot];
+  uint blk = t / 8u, ib = t & 7u;
+  uint base = (tok * blocks + blk) * 136u;
+  float d = weight_half(base);
+  uint scales_h = weights[base >> 2u] >> 16u;
+  uint scales_l = weight_byte(base + 4u + ib / 2u);
+  int ls = int(((scales_l >> (4u * (ib & 1u))) & 15u) | (((scales_h >> (2u * ib)) & 3u) << 4u));
+  float dl = d * float(ls - 32);
+  for (uint j = 0u; j < 16u; j++) {
+    uint q = weight_byte(base + 8u + ib * 16u + j);
+    o[blk * 256u + ib * 32u + j] = dl * float(kvalue(q & 15u));
+    o[blk * 256u + ib * 32u + 16u + j] = dl * float(kvalue(q >> 4u));
+  }
+}

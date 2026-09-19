@@ -113,6 +113,12 @@ void op_gate_decay2() {
   o[h] = softplus(a[h] + b[h]) * c[h];
   o[P.aux + h] = sigmoid(s[h]);
 }
+// KV-cache append: o[aux2 + i] = a[i] for i < n (aux2 = position * n, the
+// row of this token in a [T_max x heads_kv x d] cache). Copies only.
+void op_copy_at() {
+  uint i = gl_GlobalInvocationID.x; if (i >= P.n) return;
+  o[P.aux2 + i] = a[i];
+}
 void op_weighted_sum() {
   uint i = gl_GlobalInvocationID.x; if (i >= P.n) return;
   float acc = 0.0;
@@ -195,7 +201,7 @@ void op_add_rmsnorm() {
 }
 
 #ifndef OP
-#error "compile with -DOP=<rmsnorm|l2norm|gated_rmsnorm|silu_mul|conv1d_step|softmax_topk|gate_decay|gate_decay2|weighted_sum|rope_neox|attn_decode|argmax_partial|argmax_final|add|f32_matvec|add_rmsnorm>"
+#error "compile with -DOP=<rmsnorm|l2norm|gated_rmsnorm|silu_mul|conv1d_step|softmax_topk|gate_decay|gate_decay2|copy_at|weighted_sum|rope_neox|attn_decode|argmax_partial|argmax_final|add|f32_matvec|add_rmsnorm>"
 #endif
 #define CAT2(a, b) a##b
 #define CAT(a, b) CAT2(a, b)
