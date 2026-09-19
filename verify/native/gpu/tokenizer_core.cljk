@@ -72,6 +72,10 @@
         (if-not m (into out (encode-plain (subs text i)))
           (let [j (.-index m) tok (aget m 0)]
             (recur (+ j (count tok)) (-> out (into (encode-plain (subs text i j))) (conj (token->id tok))))))))))
+(defn token-bytes
+  "One token's bytes (a Buffer); a token can end inside a UTF-8 sequence, so streaming decodes with TextDecoder {stream true}."
+  [id]
+  (js/Buffer.from (clj->js (mapv #(char->byte %) (array-seq (js/Array.from (tokens id)))))))
 (defn decode [ids]
   (let [units (apply str (map #(tokens %) ids))
         bytes (js/Buffer.from (clj->js (mapv #(char->byte %) (array-seq (js/Array.from units)))))]

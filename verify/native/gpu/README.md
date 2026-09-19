@@ -979,3 +979,34 @@ engine at `/opt/kbb-engine`, `steps-per-life` 400000), enabled. It is NOT yet th
 stopped llama-server unit): the shell has no `stream: true` (SSE) and prompt tokens are still fed one step
 each (21 prompt tokens = 1.8 s of the 2.26 s above) — the prefill mode of tick 33 has to enter the resident
 protocol first. Those two are the next items; B70's 40 layers still wait on the vLLM 27 GB decision.
+
+## Tick 41 (2026-09-20, A / C-3-6): streaming, and Xavier's native surface takes the gateway's fallback head
+
+`serve_http.cljk` `stream: true`: SSE, one `data:` chunk per generated token as the guest returns it — text
+through `TextDecoder {stream: true}` over `token-bytes` (a token can end inside a UTF-8 sequence; 日本の首都は →
+「東京」 arrived whole), chat as `delta.reasoning_content` until `</think>` then `delta.content` (the template's
+newlines after the think block dropped), a final chunk with `finish_reason` + `usage` + `timing`, `data: [DONE]`.
+Also `GET /health`, `/slots` (llama-server's shape, one slot, `is_processing` while a step is in flight),
+`/v1/models`; OpenAI content-parts arrays (text joined; an `image_url` part is refused with 400 — no vision on
+the native path, the mmproj stays with llama.cpp); a thrown refusal answers 400 instead of ending the server.
+
+**The gateway's Xavier head is now this surface.** cloud-murakumo-api `src/xavier_hosted_model.js` routes
+`nex-n2.5-mini-uncensored` to heads in order 6600hs1 (B70 vLLM, 64 slots) → xavier (`192.168.1.28:8090`,
+1 slot, taken when the primary is unreachable) → k16 (:8097 llama-server). Xavier's llama-server unit has been
+stopped since tick 36 (owner: 「xavier の serving を止めて ok」), so :8090 was dead; `murakumo-xavier-nex-native.service`
+now listens there (moved from :8091). Through the gateway the model answered `system_fingerprint: vllm-0.29.0`
+both times — the primary is up and takes the traffic, as designed; the native head is the fallback, reachable
+and answering `/health` `/slots` `/v1/models` locally. Not exercised via the gateway this tick (that would mean
+taking the primary down). Note for the gateway repo: `worker.cljk`'s `probe-xavier` still expects model id
+`murakumo-main` / alias `qwen3.8-27b` / 27.3 B params — stale since Xavier moved to Nex, independent of this work.
+
+**Prefill on Xavier, measured before building it into the resident protocol**: a 40-layer `prefill` guest does
+not compile (`module string literals exceed UTF-8 byte limit` — prefill mode is still the literal program; it
+needs fn mode's functions). 12 layers, the 5-token France prompt, Xavier: **174 ms batched vs 5 × 36.6 =
+183 ms decode — 5 % faster**, where K16 got 2.6× (84.5 vs 217 ms for 8 tokens). Xavier is instruction-bound and
+`kdot_f32_p` is f32: the batched kdot saves weight reads Xavier was never short of. Also found: Xavier's
+`kdot_h2_r1.spv` / `kdot_h2q6_r1.spv` predated the `pad1` row offset (built 23:56, source changed 00:36) — the
+prefill's lm_head read row 0 (argmax 163967 = the prompt's first step) until the rebuild; then 128186 = oracle,
+rows `x rel` ≤ 2.2e-3 (h2 experts). Decode re-checked after the rebuild (36.6 ms/token, 8/8). Conclusion for
+the next item: on Xavier a resident prefill needs an h2 positions-inner-loop kdot before it is worth its
+complexity; on B70 / K16 the f32 one already pays.
