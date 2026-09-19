@@ -193,6 +193,29 @@ in 28 ms ≈ 32 GB/s of ~44), and Xavier's 60 ms is ~15 GB/s, i.e. the kdot
 ceiling above plus per-dispatch cost. The next Xavier levers are the dequant
 path (s1, then fewer loads per value) and fewer dispatches per layer.
 
+**Tick 4 (iteration 9): `kdot_s2_r1.comp`** = s1 for every format (Q4/Q5 header,
+IQ4_XS 8-byte header, Q6_K 16 scales + d through `weight_u32_at`) plus the
+activation as one `vec4` load. Xavier, pinned clocks, 10 dispatches in one
+command buffer, all oracle-exact (rel ≤ 1e-5):
+
+| tensor | r1 | s1 | **s2** | x8 | s2-on-x8 (`kdot_s2_x8.comp`) |
+|---|---|---|---|---|---|
+| attn_qkv Q5_K | 14.0 GB/s | 17.0 | **18.9** | 14.0 | 14.4 |
+| attn_gate IQ4_XS | 11.0 | 11.8 | **12.6** | 10.5 | 10.3 |
+| ffn_gate_exps[0] IQ4_XS | 7.2 | 8.5 | **9.2** | 6.5 | 8.0 |
+| output Q6_K | 20.1 | 20.1 | **20.6** | 17.6 | 14.8 |
+
+Header staging does nothing for x8 (a warp's header loads were already one
+broadcast); the gain is in the 64-thread r1 shape. With the nvgpu row of
+`layout-table` set to s2 for all three classes the composed 12-layer × 3-token
+step goes **60.0 → 54.0 ms/token** (argmax chain unchanged: 163967 → 1320 →
+11278). On the K16 iGPU (RADV, one wave64 per workgroup) s2 is *slower* than r1
+(attn_qkv 31.9 → 22.5 GB/s, experts 16.5 → 9.5; lm_head equal), so s2 stays
+nvgpu-only — the layout table is no longer neutral, it carries this. Remaining
+Xavier gap: 54 ms ≈ 17 GB/s against the 33 GB/s control probe, and ~0.5 ms of
+per-dispatch cost × 29 dispatches per layer; the next lever is fusing
+dispatches inside the layer (rmsnorm+kdot, silu_mul+down, weighted_sum+add).
+
 What this is not yet: the 40-layer model on a device with room (the serving
 processes own the memory), prompt-side prefill (tokens are fed one at a time),
 sampling other than argmax, distribution parity with llama.cpp over a real
