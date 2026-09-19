@@ -246,6 +246,32 @@ Fusing kernels (rmsnorm+kdot etc.) would remove the same barriers and is now
 worth less than it looked; the Xavier budget is still the kdot bandwidth
 (~12.6 GB/s over the layers, 20 on the lm_head).
 
+**Tick 6 (iteration 11): what the Xavier kdot ceiling actually is.** Three
+probes on top of s2, all oracle-exact (Xavier, pinned clocks, GB/s):
+
+| tensor | s2 | s3 (`subgroupAdd` reduction) | s3_r8 (8 rows/wg, named accumulators) | **s4** (all headers staged once, 2 blocks/iter) |
+|---|---|---|---|---|
+| attn_qkv Q5_K | 19.0 | 19.7 | 20.1 | 19.6 |
+| attn_gate IQ4_XS | 12.1 | 13.0 | 11.3 | **13.7** |
+| ffn_gate_exps[0] IQ4_XS | 8.4 | 9.2 | 6.4 | **9.6** |
+| output Q6_K | 21.0 | 21.6 | 16.9 | **23.7** |
+
+Refuted: the reduction tree (s3: +3%), the workgroup count (s3_r8: no
+better), and the Q5_K "one word per four values" repack premise — the r1 layout
+already touches each qs word twice and each qh word eight times from L1, so
+the traffic is minimal and a 20-bit packing would add 55% bytes. What the
+numbers say instead: in **values per second** every format sits at 26–29 G/s
+(Q5_K 28.5, IQ4_XS 25.8, Q6_K 28.9) while the f32 kernel does 19.8 and the
+trivial-dequant control 48 — an **instruction-issue ceiling** (~25
+instructions per value on 512 cores × 1.377 GHz), not a memory one. s4 is the
+nvgpu row now: composed 12-layer × 3-token **52.8 → 48.6 ms/token**.
+
+Next levers are per-value instruction count: the Xavier driver reports
+`shaderFloat16` + `shaderInt8` + 16-bit storage but **no
+`VK_KHR_shader_integer_dot_product`**, so packed `f16vec2` FMAs (two values per
+instruction) and the exponent-trick int→float conversion are the candidates;
+`dp4a`-style int8 activations are not available on this driver.
+
 What this is not yet: the 40-layer model on a device with room (the serving
 processes own the memory), prompt-side prefill (tokens are fed one at a time),
 sampling other than argmax, distribution parity with llama.cpp over a real
