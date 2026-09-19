@@ -345,7 +345,8 @@ void op_pos_incr() { if (gl_GlobalInvocationID.x == 0u) ids[0] += 1u; }   // the
 // ctl (resident serving, iteration 43): one message = "<token id>,<reset flag>" WRITEDEC'd into c (uint bits);
 // a set flag rewinds the position to 0 (the kernels read no history at position 0, so nothing else is
 // reset), then the token goes to the token buffer at the position: b[pos] = token, as argmax_final writes it.
-void op_ctl() { if (gl_GlobalInvocationID.x == 0u) { if (floatBitsToUint(c[1]) != 0u) ids[0] = 0u; b[ids[0]] = c[0]; } }
+// iteration 49: P.n tokens (1 in decode) then the flag at c[n]: tokbuf[pos + i] = token i -- the prefill message
+void op_ctl() { if (gl_GlobalInvocationID.x == 0u) { uint n = P.n; if (floatBitsToUint(c[n]) != 0u) ids[0] = 0u; for (uint i = 0u; i < n; i++) b[ids[0] + i] = c[i]; } }
 void op_pos_add() { if (gl_GlobalInvocationID.x == 0u) ids[0] += P.n; }   // prefill in fn mode (iteration 47): the position advances by the batch
 void op_pos_seed() { if (gl_GlobalInvocationID.x == 0u) { ids[0] = floatBitsToUint(a[0]); ids[1] = 0u; } }   // a layer's stepbuf = [the step's base position, row 0] before its P delta-net steps
 void op_pos_incr2() { if (gl_GlobalInvocationID.x == 0u) { ids[0] += 1u; ids[1] += 1u; } }   // prefill: absolute position and batch row together
