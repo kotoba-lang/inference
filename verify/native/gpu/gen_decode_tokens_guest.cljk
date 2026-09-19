@@ -35,6 +35,10 @@
 (def PB (when-let [a (get args 10)] (when (str/starts-with? a "prefill:") (js/parseInt (subs a 8)))))
 (def replay? (= "resident-replay" (get args 9)))
 (when (and PB (not replay?)) (println "REFUSE prefill:<P> needs resident-replay") (js/process.exit 2))
+;; resident sampling (iteration 50): every resident-replay guest also records kept command buffer 2, the SAMPLED decode
+;; step -- the message "t,f,Tbits,top_p_bits,seed" (5 words) copies its three parameters into the sampler's meta
+;; (op params) and replays the nex_sample_* chain instead of argmax. So a prefill message may not be 5 words: P != 4.
+(when (and PB (contains? #{1 4} PB)) (println "REFUSE prefill:" PB "-- P+1 words would collide with the 2-word decode / 5-word sampled message") (js/process.exit 2))
 (def resident? (or (= "resident" (get args 9)) replay?))
 (def runtime? (or (= "runtime" (get args 9)) resident?))
 ;; sample:T:top_p:seed (fn mode): nex_sample_topp replaces argmax_final -- the draw
@@ -186,7 +190,7 @@
 (defn fresh [prefix] (swap! counter inc) (str prefix @counter))
 ;; --- the plan ---
 (def zeros16 (alloc! 16))
-(def ops (into {} (for [op ["rmsnorm" "l2norm" "gated_rmsnorm" "silu_mul" "conv1d_step" "softmax_topk" "gate_decay2" "weighted_sum" "add" "f32_matvec" "add_rmsnorm" "rope_neox" "attn_decode" "argmax_partial" "argmax_final" "copy_at" "pos_incr" "pos_incr2" "sample_part" "sample_probs" "sample_bisect_part" "sample_bisect_step" "sample_final" "ctl" "pos_add" "pos_seed"]] [op (pipeline! (str "nex_" op ".spv") 7)])))
+(def ops (into {} (for [op ["rmsnorm" "l2norm" "gated_rmsnorm" "silu_mul" "conv1d_step" "softmax_topk" "gate_decay2" "weighted_sum" "add" "f32_matvec" "add_rmsnorm" "rope_neox" "attn_decode" "argmax_partial" "argmax_final" "copy_at" "pos_incr" "pos_incr2" "sample_part" "sample_probs" "sample_bisect_part" "sample_bisect_step" "sample_final" "ctl" "pos_add" "pos_seed" "params"]] [op (pipeline! (str "nex_" op ".spv") 7)])))
 (def kdot-wide (pipeline! (:wide layouts) 5))
 (def kdot-narrow (pipeline! (:narrow layouts) 5))
 (def kdot-lm (pipeline! (:lm layouts) 5))
@@ -304,13 +308,16 @@
 (def tokbuf (let [b (alloc! (if runtime? (* 4 4096) (max 16 (* 4 (+ ntok 1)) (* 4 (count prompt)))))] (when-not runtime? (write! b (apply str (map le32 prompt)))) b))   ;; holds the prompt and every decoded token (runtime: 4096 slots, filled by WRITEDEC)
 (def m-embed-dyn (let [m (alloc! 16)] (write! m (str (le32 2048) (le32 0) (le32 1) (le32 0))) m))
 (def m-am2-dyn (let [m (alloc! 32)] (write! m (str (le32 248320) (le32 1) (le32 61) (le32 (if resident? 4096 (count prompt))) (lef32 0) (lef32 0) (lef32 0) (lef32 1))) m))   ;; resident: the shell is the only writer of the token buffer
-(def ctrl (when resident? (alloc! (max 16 (* 4 (inc (or PB 1)))))))   ;; resident: "<token id>,<reset flag>" (or P tokens + flag) lands here (WRITEDEC), read by ctl
+(def ctrl (when resident? (alloc! (max 20 (* 4 (inc (or PB 1)))))))   ;; >= 5 words: the sampled message   ;; resident: "<token id>,<reset flag>" (or P tokens + flag) lands here (WRITEDEC), read by ctl
 (def m-ctlP (when PB (ops-meta! PB 1 0 0 0 0)))   ;; ctl with n = P tokens
 (def m-incr (ops-meta! 1 1 0 0 0 0))
 ;; sampler meta: n rows aux(=ids slot 61) aux2(=prompt length) eps(=T) scale(=top_p) p0(=seed bits) p1(=1)
 (def m-sample (when sampling (let [m (alloc! 32)] (write! m (str (le32 248320) (le32 1) (le32 61) (le32 (count prompt)) (lef32 (:T sampling)) (lef32 (:top-p sampling)) (le32 (:seed sampling)) (lef32 1))) m)))
-(def sample-o (when sampling (alloc! 1024)))          ;; partial max / Z / mass, lo / hi
-(def sample-s (when sampling (alloc! (* 248320 4))))  ;; p_i
+(def sample-o (when (or sampling replay?) (alloc! 1024)))          ;; partial max / Z / mass, lo / hi
+(def sample-s (when (or sampling replay?) (alloc! (* 248320 4))))  ;; p_i
+;; resident sampling: the sampler meta whose eps / scale / p0 (T, top_p, seed) the params op rewrites from each message
+(def m-sample-dyn (when replay? (let [m (alloc! 32)] (write! m (str (le32 248320) (le32 1) (le32 61) (le32 4096) (lef32 1.0) (lef32 1.0) (le32 0) (lef32 1))) m)))
+(def m-params (when replay? (ops-meta! 3 1 0 0 0 0)))
 (def rec-keys [:norm :post :router :shgate-inp :gate-exps :up-exps :down-exps :gate-sh :up-sh :down-sh :qkv :gate :alpha :beta :dt :a :conv :ssm-norm :out])
 (def att-keys [:norm :post :router :shgate-inp :gate-exps :up-exps :down-exps :gate-sh :up-sh :down-sh :q :k :v :qn :kn :o])
 (def tensor-name {:norm "attn_norm.weight" :post "post_attention_norm.weight" :router "ffn_gate_inp.weight" :shgate-inp "ffn_gate_inp_shexp.weight"
@@ -510,20 +517,21 @@
 (defn step-lines!
   "The token step's request lines for the CURRENT phase: BEGIN, ctl (resident), embed of PF rows, the layer recursion
    LAYERS-NAME, final norm, lm_head, argmax / sampler, position advance. Leaves them in `lines`."
-  [ctl-meta layers-name]
+  [ctl-meta layers-name & [sampled?]]
   (reset! lines [])
   (let [x-final (if (odd? (dec layers)) xb xa)]
     (step! (q "BEGIN"))
     (when resident? (dispatch! (ops "ctl") 1 1 1 ctl-meta zeros16 tokbuf ctrl zeros16 zeros16 posbuf))
+    (when sampled? (dispatch! (ops "params") 1 1 1 m-params zeros16 zeros16 ctrl m-sample-dyn zeros16 zeros16))   ;; T / top_p / seed from the message
     (dispatch! embed 1 PF 1 m-embed-dyn w-embd tokbuf x posbuf)
     (step! (str "(" layers-name " 0 " layers ")"))
     (dispatch! (ops "rmsnorm") PF 1 1 m-norm x-final w-out-norm zeros16 hN zeros16 zeros16)
     (if i8-lm
       (let [[xq xs] (quant! hN 2048 hN-i8)] (dispatch! i8-lm (wg-of (:lm-i8 layouts) 248320) 1 1 m-lm w-lm xq logits zeros16 xs))
       (dispatch! kdot-lm (wg-of (:lm layouts) 248320) 1 1 m-lm w-lm hN logits zeros16))
-    (if sampling
+    (if (or sampling sampled?)
       ;; multi-workgroup sampler (iteration 19): 61-workgroup passes, 30 bisection rounds on tau, one final pass
-      (let [h [m-sample logits tokbuf posbuf sample-o sample-s amax-ids]]
+      (let [h [(if sampled? m-sample-dyn m-sample) logits tokbuf posbuf sample-o sample-s amax-ids]]
         (apply dispatch! (ops "sample_part") 61 1 1 h)
         (apply dispatch! (ops "sample_probs") 61 1 1 h)
         (dotimes [_ 30] (apply dispatch! (ops "sample_bisect_part") 61 1 1 h) (apply dispatch! (ops "sample_bisect_step") 1 1 1 h))
@@ -536,6 +544,7 @@
     @lines))
 (defn indent-lines [ls] (str/join "\n" (map #(if (str/starts-with? % "(layers") (str "      " %) (str "      (gpu " % ")")) ls)))
 (def prefill-step-lines (when PB (with-phase phase-prefill #(step-lines! m-ctlP "layers-p"))))
+(def sampled-step-lines (when replay? (step-lines! m-incr "layers" true)))
 (def fn-token-src (when fn-mode?
   (step-lines! m-incr "layers")
   (let [x-final (if (odd? (dec layers)) xb xa)]
@@ -555,6 +564,13 @@
                                                    (= % (q "BEGIN")) "      (gpu \"BEGINK 0\")"
                                                    :else (str "      (gpu " % ")")) @lines)) "\n"
                        "      (gpu \"SUBMIT\")))\n"))
+                (when replay?
+                  (str ";; sampled decode (iteration 50): kept command buffer 2 -- ctl, params (T / top_p / seed from the message), the step, the nex_sample_* chain\n"
+                       "(defn record-sampled [] :string\n  (do\n"
+                       (str/join "\n" (map #(cond (str/starts-with? % "(layers") (str "      " %)
+                                                   (= % (q "BEGIN")) "      (gpu \"BEGINK 2\")"
+                                                   :else (str "      (gpu " % ")")) sampled-step-lines)) "\n"
+                       "      (gpu \"SUBMIT\")))\n"))
                 (when PB
                   (str ";; prefill:" PB " (iteration 49): the P-token step as kept command buffer 1; a message of P tokens + flag replays it\n"
                        "(defn record-prefill [] :string\n  (do\n"
@@ -565,9 +581,9 @@
                 "(defn serve-loop [n :i64] :i64\n"
                 "  (let [line (typed-cap-call :io/read :string :string \"" (max 64 (* 8 (inc (or PB 1)))) "\")]\n"
                 "    (if (string=? line \"\")\n      n\n      (do\n"
-                (if PB
+                (if replay?
                   (str "      (let [nw (gpu (string-concat \"WRITEDEC " ctrl " 0 \" line))]\n"
-                       "      (let [ns (if (string=? nw \"2\") (gpu \"REPLAY 0\") (gpu \"REPLAY 1\"))\n            idr (gpu \"READ " amax-ids " 244 4\")]\n"
+                       "      (let [ns (if (string=? nw \"2\") (gpu \"REPLAY 0\") (if (string=? nw \"5\") (gpu \"REPLAY 2\") (gpu \"REPLAY 1\")))\n            idr (gpu \"READ " amax-ids " 244 4\")]\n"
                        (when (aget js/process.env "NEX_DEBUG_TOKBUF") (str "      (typed-cap-call :io/write-error :string :string (string-concat \"TOKBUF \" (string-concat (gpu \"READ " tokbuf " 0 64\") (string-concat \" POS \" (string-concat (gpu \"READ " posbuf " 0 4\") \"\\n\")))))\n")))
                   (str "      (gpu (string-concat \"WRITEDEC " ctrl " 0 \" line))\n"
                        (if replay?
@@ -576,7 +592,7 @@
                        "      (let [ns (gpu \"" (if replay? "REPLAY 0" "SUBMIT") "\")\n            idr (gpu \"READ " amax-ids " 244 4\")]\n"))
                 "        (do (typed-cap-call :io/write :string :string (string-concat ns (string-concat \"|\" (string-concat idr \"\\n\"))))\n"
                 "            (typed-cap-call :io/write-error :string :string \"\")\n"   ;; the loader buffers standard output (64 KiB) and flushes it before any diagnostic write: an empty one is the flush
-                "            (serve-loop (+ n 1))))" (when PB ")") "))))\n"))))))
+                "            (serve-loop (+ n 1))))" (when replay? ")") "))))\n"))))))
 ;; --- emit: the constant phase is one let; each token's SUBMIT/READs are nested lets ---
 (def const-steps (if flat? (vec (take-while #(not= % (q "BEGIN")) @lines)) const-lines-snapshot))
 (def token-steps (cond flat? (vec (drop (count const-steps) @lines)) stream? (vec @lines) :else []))
@@ -609,7 +625,7 @@
               "    (do\n" (str/join "\n" (map #(str "      (gpu " % ")") const-steps)) "\n"
               (if fn-mode?
                 (cond
-                  replay? (str "      (record-step)\n" (when PB "      (record-prefill)\n") "      (string-from-i64 (serve-loop 0))")
+                  replay? (str "      (record-step)\n      (record-sampled)\n" (when PB "      (record-prefill)\n") "      (string-from-i64 (serve-loop 0))")
                   resident? "      (string-from-i64 (serve-loop 0))"
                   runtime?
                   (str "      (let [prompt (typed-cap-call :env/read :string :string \"NEX_PROMPT\")]\n"

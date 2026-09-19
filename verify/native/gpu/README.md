@@ -1108,3 +1108,32 @@ is h2 (rows `x rel` ≤ 1.35e-2 at 40 L), so near-ties fall differently; on the 
 Answer in one word." (21 prompt tokens = 2 chunks + 5) → `"Paris"`, 11 steps, **1.65–1.70 s (tick 40: 2.26 s)**;
 the haiku (17 tokens) 163 steps in 15.0 s. Prompt cost per token on Xavier is now ~292/8 ≈ 37 ms in the
 chunks against 86 ms per decode step; a longer bucket (16) would take it further for long prompts.
+
+## Tick 45 (2026-09-20, C-3-9): sampling in the resident protocol — temperature / top_p / seed per request
+
+Every `resident-replay` guest now records a THIRD kept command buffer (2): the decode step with the
+`nex_sample_*` chain (tick 19) in place of argmax, preceded by a `params` op that copies words 2..4 of the
+control buffer into the sampler meta's `eps / scale / p0` (T, top_p, seed). The message is
+`"t,f,Tbits,top_p_bits,seed"` — 5 words — so `serve-loop` routes by `WRITEDEC`'s count: 2 → `REPLAY 0`
+(greedy), 5 → `REPLAY 2` (sampled), else → `REPLAY 1` (prefill; the generator refuses `prefill:4` and `:1`,
+whose P+1 would collide). The draw is `u = hash(seed, position)` as before, so `decode_tokens_ref.py
+--sample T top_p seed` is the oracle for any (T, top_p, seed).
+
+K16 12 L, France prompt + 8, T 0.7 / top_p 0.9 / seed 42: the guest answers **80072, 80072, 35222, 35533,
+143898, 131822, 194349, 157676 — the f64 oracle's eight picks, 8/8**, across 3 requests; greedy on the same
+guest still 8/8; the sampled step costs 335 vs 326 ms per 12 steps (+0.75 ms/token). B70 12 L: greedy 8/8;
+sampled 80072, 80072 then diverges (33546 …) — the int8 anv path's logits differ at KL 0.0054 and the draw
+falls on the other side of a boundary; expected, the f32 path reproduces the oracle exactly.
+
+`serve_http.cljk`: `temperature` (default 1.0; 0 = greedy), `top_p` (default 1.0), `seed` (default a fresh
+random u32, echoed in the answer with `temperature` and `top_p`); the last prompt token and every generated
+token ride the 5-word message, so a prefill chunk is taken only while strictly more than P prompt tokens
+remain (the reply of the last prompt message is the first pick). Over HTTP on K16: T 0 → the greedy ids;
+T 0.7 / 0.9 / seed 42 twice → the oracle's eight, identical; no seed → a different sequence with the seed
+reported. `resident_drive.py` takes `T top_p seed` as its last three arguments.
+
+**Xavier's head (:8090) runs the sampling guest** (`rs40-nv.bin`, 40 layers, P = 8): T 0 → `"Paris"` in 1.67 s
+as before; the haiku at T 0.7 / top_p 0.9: seed 7 → a finished haiku in 22 tokens (2.9 s), seed 8 → 120
+tokens of reasoning about syllables (11.5 s) — sampled steps cost ≈ 90–95 ms against 86 greedy. When the
+120-token cap lands inside the think block, the whole text comes back as `content` (there was no `</think>`
+to split on) — same as a truncated llama-server answer, noted.

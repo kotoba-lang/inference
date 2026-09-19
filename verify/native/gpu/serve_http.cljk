@@ -7,7 +7,10 @@
 ;; bump allocators (measured K16 12L: 11.3 KiB and 3.5 K pairs per step), so the shell respawns the guest
 ;; after `steps-per-life` steps (default 15000: the loader ceilings are a 1 GiB pool and 2^26 pairs, 2^26 / 3.5 K = 19 k steps), when it exits, or when the
 ;; loader's 86400 s wall ceiling ends it (a day per guest life; a respawn is the MAP cost, 1.3 s for 12 layers on K16).
-;; Greedy only (the guest's sampling row is a build-time choice for now). Generation stops at an end-of-generation
+;; Sampling (iteration 50): `temperature` (default 1.0; 0 = greedy), `top_p` (default 1.0) and `seed` (default: a fresh
+;; random u32, echoed in the answer) ride on the 5-word message "t,f,Tbits,top_p_bits,seed" for the last prompt token
+;; and every generated token; the guest replays its sampled step (nex_sample_* chain, u = hash(seed, position)), which
+;; decode_tokens_ref.py --sample reproduces in f64. Generation stops at an end-of-generation
 ;; token (<|im_end|> / <|endoftext|>, finish_reason "stop") or at max_tokens ("length").
 ;; POST /v1/chat/completions (iteration 45) renders the model's ChatML template the way llama-server's
 ;; /apply-template does for this GGUF -- "<|im_start|>{role}\n{content}<|im_end|>\n" per message, earlier assistant
@@ -52,13 +55,16 @@
                     (when-let [w @(:waiter g)] (reset! (:waiter g) nil) (w nil))))
     (reset! guest g)
     g))
+(defn f32-bits [x] (let [b (js/Buffer.alloc 4)] (.writeFloatLE b x 0) (.readUInt32LE b 0)))
 (defn step!
-  "Feed one token (or a vector of exactly prefill-bucket tokens: one batched step); resolves to [ns argmax-id] or nil if the guest died."
-  [g tok reset?]
+  "Feed one token (or a vector of exactly prefill-bucket tokens: one batched step); with SAMPLE {:T :top-p :seed} the
+   message carries the sampler's parameters (the guest's sampled step). Resolves to [ns id] or nil if the guest died."
+  [g tok reset? & [sample]]
   (js/Promise. (fn [resolve _]
                  (reset! (:waiter g) (fn [line] (swap! (:steps g) inc)
                                        (resolve (when line (let [[ns idhex] (str/split line #"\|")] [(js/parseInt ns) (.readUInt32LE (js/Buffer.from idhex "hex") 0)])))))
-                 (.write (.-stdin (:proc g)) (str (if (vector? tok) (str/join "," tok) tok) "," (if reset? 1 0))))))
+                 (.write (.-stdin (:proc g)) (str (if (vector? tok) (str/join "," tok) tok) "," (if reset? 1 0)
+                                                  (when sample (str "," (f32-bits (:T sample)) "," (f32-bits (:top-p sample)) "," (:seed sample))))))))
 (defn ensure-guest! []
   (let [g @guest]
     (if (and g (< @(:steps g) steps-per-life)) g
@@ -67,14 +73,16 @@
 (defn run-request
   "Prompt ids -> promise of {:generated [...] :ns [...] :finish \"stop\"|\"length\"} (greedy: each argmax is the next input;
    an end-of-generation id ends the request and is not part of the answer)."
-  [ids max-tokens & [on-token]]
+  [ids max-tokens & [on-token sample]]
   (let [g (ensure-guest!) out (atom []) nss (atom []) P prefill-bucket]
     (letfn [(feed [i tok]
-              ;; i = index of the first token this message carries; a chunk of P prompt tokens when the bucket allows
-              (let [chunk? (and (pos? P) (not (vector? tok)) (<= (+ i P) (count ids)))
+              ;; i = index of the first token this message carries; a chunk of P prompt tokens when strictly more than a
+              ;; chunk of prompt is left (the last prompt token is always a single message: its reply is the first pick)
+              (let [chunk? (and (pos? P) (not (vector? tok)) (< (+ i P) (count ids)))
                     msg (if chunk? (subvec ids i (+ i P)) tok)
-                    nxt (+ i (if chunk? P 1))]
-              (.then (step! g msg (= i 0))
+                    nxt (+ i (if chunk? P 1))
+                    sampled (when (and sample (>= nxt (count ids))) sample)]   ;; the message whose reply is kept
+              (.then (step! g msg (= i 0) sampled)
                      (fn [r]
                        (if-not r {:error "guest died"}
                          (let [[ns am] r] (swap! nss conj ns)
@@ -108,16 +116,23 @@
     (if (neg? i) ["" text] [(str/trim (subs text 0 i)) (str/replace (subs text (+ i 8)) #"^\n+" "")])))
 (def queue (atom (js/Promise.resolve nil)))   ;; requests serialized: one step in flight at a time
 (defn enqueue [thunk] (let [p (.then @queue (fn [_] (thunk)))] (reset! queue (.catch p (fn [_] nil))) p))
+(defn sample-of
+  "The request's sampler parameters, or nil for greedy (temperature 0)."
+  [body]
+  (let [T (if (some? (.-temperature body)) (js/Number (.-temperature body)) 1.0)
+        tp (if (some? (.-top_p body)) (js/Number (.-top_p body)) 1.0)
+        seed (if (some? (.-seed body)) (bit-and (js/Number (.-seed body)) 0xFFFFFFFF) (js/Math.floor (* (js/Math.random) 4294967296)))]
+    (when (pos? T) {:T T :top-p tp :seed seed})))
 ;; --- streaming ---
 (defn sse-writer [res]
   (.writeHead res 200 #js {"Content-Type" "text/event-stream" "Cache-Control" "no-cache" "Connection" "keep-alive"})
   (fn [obj] (.write res (str "data: " (if (string? obj) obj (js/JSON.stringify obj)) "\n\n"))))
 (defn stream-request
   "Run IDS and write SSE chunks: (chunk-fn text-delta) per token, (final-fn finish usage timing) at the end."
-  [res ids max-tokens chunk-fn final-fn]
+  [res ids max-tokens chunk-fn final-fn sample]
   (let [send (sse-writer res) dec (js/TextDecoder. "utf-8") t0 (js/Date.now)
         on-token (fn [id] (let [text (.decode dec (token-bytes id) #js {:stream true})] (when (seq text) (when-let [c (chunk-fn text)] (send c)))))]
-    (.then (enqueue #(run-request ids max-tokens on-token))
+    (.then (enqueue #(run-request ids max-tokens on-token sample))
            (fn [{:keys [generated ns error finish]}]
              (if error (send #js {:error #js {:message error :type "server_error"}})
                (let [tail (.decode dec)]   ;; whatever an incomplete trailing sequence held
@@ -129,7 +144,8 @@
   (let [id (str "cmpl-" (js/Date.now)) created (quot (js/Date.now) 1000)]
     (stream-request res ids max-tokens
                     (fn [text] #js {:id id :object "text_completion" :created created :model "nex-n2.5-mini/kotoba-native" :choices #js [#js {:index 0 :text text :finish_reason nil}]})
-                    (fn [finish usage timing] #js {:id id :object "text_completion" :created created :model "nex-n2.5-mini/kotoba-native" :choices #js [#js {:index 0 :text "" :finish_reason finish}] :usage usage :timing timing}))))
+                    (fn [finish usage timing] #js {:id id :object "text_completion" :created created :model "nex-n2.5-mini/kotoba-native" :choices #js [#js {:index 0 :text "" :finish_reason finish}] :usage usage :timing timing})
+                    (sample-of body))))
 (defn stream-chat [res body ids max-tokens]
   (let [id (str "chatcmpl-" (js/Date.now)) created (quot (js/Date.now) 1000) phase (atom :reasoning) buf (atom "")
         ;; after </think> the newlines the template puts there are dropped; the first real text opens the content
@@ -145,31 +161,34 @@
                                     #js {:content text})]
                         (when delta
                           #js {:id id :object "chat.completion.chunk" :created created :model "nex-n2.5-mini/kotoba-native" :choices #js [#js {:index 0 :delta delta :finish_reason nil}]})))
-                    (fn [finish usage timing] #js {:id id :object "chat.completion.chunk" :created created :model "nex-n2.5-mini/kotoba-native" :choices #js [#js {:index 0 :delta #js {} :finish_reason finish}] :usage usage :timing timing}))))
+                    (fn [finish usage timing] #js {:id id :object "chat.completion.chunk" :created created :model "nex-n2.5-mini/kotoba-native" :choices #js [#js {:index 0 :delta #js {} :finish_reason finish}] :usage usage :timing timing})
+                    (sample-of body))))
 (defn completion [body]
-  (let [prompt (or (.-prompt body) "") max-tokens (or (.-max_tokens body) 16) ids (encode prompt) t0 (js/Date.now)]
+  (let [prompt (or (.-prompt body) "") max-tokens (or (.-max_tokens body) 16) ids (encode prompt) t0 (js/Date.now) sample (sample-of body)]
     (if (empty? ids)
       (js/Promise.resolve #js {:error #js {:message "empty prompt" :type "invalid_request_error"}})
-      (.then (enqueue #(run-request ids max-tokens))
+      (.then (enqueue #(run-request ids max-tokens nil sample))
              (fn [{:keys [generated ns error finish]}]
                (if error
                  #js {:error #js {:message error :type "server_error"}}
                  #js {:id (str "cmpl-" (js/Date.now)) :object "text_completion" :created (quot (js/Date.now) 1000) :model "nex-n2.5-mini/kotoba-native"
+                      :seed (:seed sample) :temperature (:T sample 0) :top_p (:top-p sample)
                       :choices #js [#js {:index 0 :text (decode generated) :finish_reason finish :token_ids (clj->js generated)}]
                       :usage #js {:prompt_tokens (count ids) :completion_tokens (count generated) :total_tokens (+ (count ids) (count generated))}
                       :timing #js {:ms_per_token (/ (reduce + ns) (max 1 (count ns)) 1e6) :steps (count ns) :wall_ms (- (js/Date.now) t0) :guest_steps @(:steps @guest)}}))))))
 (defn chat-completion [body]
   (let [messages (or (.-messages body) #js []) max-tokens (or (.-max_tokens body) 256)
         thinking? (not (false? (some-> body .-chat_template_kwargs .-enable_thinking)))
-        prompt (render-chat messages thinking?) ids (encode prompt) t0 (js/Date.now)]
+        prompt (render-chat messages thinking?) ids (encode prompt) t0 (js/Date.now) sample (sample-of body)]
     (if (zero? (.-length messages))
       (js/Promise.resolve #js {:error #js {:message "no messages" :type "invalid_request_error"}})
-      (.then (enqueue #(run-request ids max-tokens))
+      (.then (enqueue #(run-request ids max-tokens nil sample))
              (fn [{:keys [generated ns error finish]}]
                (if error
                  #js {:error #js {:message error :type "server_error"}}
                  (let [[reasoning content] (split-think (decode generated))]
                    #js {:id (str "chatcmpl-" (js/Date.now)) :object "chat.completion" :created (quot (js/Date.now) 1000) :model "nex-n2.5-mini/kotoba-native"
+                        :seed (:seed sample) :temperature (:T sample 0) :top_p (:top-p sample)
                         :choices #js [#js {:index 0 :message #js {:role "assistant" :content content :reasoning_content reasoning} :finish_reason finish}]
                         :usage #js {:prompt_tokens (count ids) :completion_tokens (count generated) :total_tokens (+ (count ids) (count generated))}
                         :timing #js {:ms_per_token (/ (reduce + ns) (max 1 (count ns)) 1e6) :steps (count ns) :wall_ms (- (js/Date.now) t0) :guest_steps @(:steps @guest)}})))))))
