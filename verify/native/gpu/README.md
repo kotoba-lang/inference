@@ -773,6 +773,33 @@ weight traffic per prompt drops 16×, the dispatch count 5×. The generator's
 `prefill` mode (batched layer bodies, a `stepbuf` for the recurrences, MoE ids
 `[P × 8]`, lm_head on the last row) is the next tick.
 
+**Tick 32 (iteration 37, C-1): batched prefill, recurrent layers.**
+`gen_decode_tokens_guest.cljk … <backend> prefill` (the prompt is the batch,
+`tokens` = 1): every buffer that holds an activation is `P` rows; the kdots run
+with `positions = P`, `input_per_expert = 1` and a zero `expert_ids` of P
+entries (the MoE experts with `8P` positions and `pad0 = 8`); `rmsnorm`,
+`add_rmsnorm`, `f32_matvec`, `softmax_topk`, `weighted_sum` and the embedding
+gained a row dimension (workgroup x or y = row; decode dispatches shape 1 and is
+unchanged); the delta-net step runs P dispatches on a per-layer `stepbuf`
+advanced by `pos_incr2` (absolute position and batch row together); the final
+norm runs on all rows and the lm_head reads the last one (`pad1`). The answer
+is `ns | x of all P rows | argmax`; `prefill_check.py` compares every row with
+the oracle's per-step hidden states (same math, so they must agree). K16,
+3 recurrent layers, the 8-token prompt "The capital of France is. The capital":
+
+| | dispatches | time | vs oracle |
+|---|---|---|---|
+| decode, 8 steps | 8 × (21 + tail) | 118.6 ms (14.1–16.1 per token) | 8/8 argmax, `x rel` ≤ 5e-6 |
+| **prefill, one command buffer** | 113 | **40.2 ms** | **8/8 rows `x rel` ≤ 5e-6**, argmax 261 = oracle |
+
+2.9× on the whole; the lm_head (~10 ms on K16) is paid once either way, so the
+layers went from ~37 ms to ~30 — the batched kdots read the weights once but
+the delta-net's P sequential dispatches remain the prefill's cost on a
+recurrent layer. Attention layers are not batched yet (the generator refuses
+them in prefill mode; `layers ≤ 3` on this model), so this is the recurrent
+half of C-1. Decode paths re-verified on K16 (3 L, 8/8) after the kernel
+changes; B70 and Xavier kernels rebuilt in tick 31's pass.
+
 What this is not yet: the 40-layer model on a device with room (the serving
 processes own the memory), prompt-side prefill (tokens are fed one at a time),
 sampling other than argmax, distribution parity with llama.cpp over a real

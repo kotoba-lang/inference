@@ -21,7 +21,8 @@ void main() {
   uint t = gl_LocalInvocationID.x;
   uint blocks = P.cols / 256u;
   if (t >= blocks * 8u) return;
-  uint tok = ids[(P.dyn != 0u) ? pos[0] : P.slot];
+  uint row = gl_WorkGroupID.y;   // prefill: token row of the batch (decode dispatches y = 1)
+  uint tok = ids[((P.dyn != 0u) ? pos[0] : P.slot) + row];
   uint blk = t / 8u, ib = t & 7u;
   uint base = (tok * blocks + blk) * 136u;
   float d = weight_half(base);
@@ -31,7 +32,7 @@ void main() {
   float dl = d * float(ls - 32);
   for (uint j = 0u; j < 16u; j++) {
     uint q = weight_byte(base + 8u + ib * 16u + j);
-    o[blk * 256u + ib * 32u + j] = dl * float(kvalue(q & 15u));
-    o[blk * 256u + ib * 32u + 16u + j] = dl * float(kvalue(q >> 4u));
+    o[row * P.cols + blk * 256u + ib * 32u + j] = dl * float(kvalue(q & 15u));
+    o[row * P.cols + blk * 256u + ib * 32u + 16u + j] = dl * float(kvalue(q >> 4u));
   }
 }
