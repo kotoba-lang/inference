@@ -14,7 +14,7 @@
 ;; Root ADR-2609182400 C.
 (require '["fs" :as fs] '[clojure.string :as str])
 (def args (vec *command-line-args*))
-(when-not (<= 6 (count args) 7) (println "usage: <file.gguf> <layers> <tokens> <prompt-token-id> <dir-on-box> <out.kotoba> [anv|radv|nvgpu]") (js/process.exit 2))
+(when-not (<= 6 (count args) 7) (println "usage: <file.gguf> <layers> <tokens> <prompt-token-id> <dir-on-box> <out.kotoba> [anv|radv|nvgpu|nvgpu-h2]") (js/process.exit 2))
 (def gguf (args 0)) (def layers (js/parseInt (args 1))) (def ntok (js/parseInt (args 2))) (def tok0 (js/parseInt (args 3))) (def box (args 4)) (def out (args 5))
 (def backend (or (get args 6) "anv"))
 ;; Kernel layout per (backend, tensor class) -- the co-scientist table (root
@@ -29,7 +29,10 @@
 (def layout-table
   {"anv"   {:wide "kdot_f32_r1.spv" :narrow "kdot_f32_r1.spv" :lm "kdot_f32_r8.spv"}
    "radv"  {:wide "kdot_f32_r8.spv" :narrow "kdot_f32_r1.spv" :lm "kdot_f32_r1.spv"}
-   "nvgpu" {:wide "kdot_s4_r1.spv"  :narrow "kdot_s4_r1.spv"  :lm "kdot_s4_r1.spv"}})
+   "nvgpu" {:wide "kdot_s4_r1.spv"  :narrow "kdot_s4_r1.spv"  :lm "kdot_s4_r1.spv"}
+   ;; packed-half dequant (kdot_h2_r1): faster on nvgpu, NOT oracle-exact (rel-RMS
+   ;; ~8e-4 vs f64 on random activations, iteration 12). Opt-in row, not the default.
+   "nvgpu-h2" {:wide "kdot_h2_r1.spv" :narrow "kdot_h2_r1.spv" :lm "kdot_s4_r1.spv"}})
 (def layouts (or (layout-table backend) (do (println "REFUSE unknown backend" backend) (js/process.exit 2))))
 ;; --- GGUF directory (header only) ---
 (def fd (fs/openSync gguf "r"))

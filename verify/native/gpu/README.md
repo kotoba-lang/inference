@@ -272,6 +272,36 @@ Next levers are per-value instruction count: the Xavier driver reports
 instruction) and the exponent-trick int→float conversion are the candidates;
 `dp4a`-style int8 activations are not available on this driver.
 
+**Tick 7 (iteration 12): packed-half dequant, `kdot_h2_r1.comp`** — Q4_K / Q5_K
+codes become two `f16vec2` by the exponent trick (`0x6400 | q` is the half
+1024 + q), IQ4_XS through a 16-entry half codebook in shared memory (one LDS
+per value instead of three selects), the activation converted to halves once
+per block, products as two packed multiplies. Q6_K keeps the f32 path. Xavier,
+pinned clocks:
+
+| tensor | s4 (exact) | h2 | h2 max rel err (random-normal x, 1e-2 floor) |
+|---|---|---|---|
+| attn_qkv Q5_K | 19.1 GB/s | **21.9** | 4.0e-2 |
+| attn_gate IQ4_XS | 13.5 | **22.2** | 1.8e-2 |
+| ffn_gate_exps[0] IQ4_XS | 8.7 | **13.7** | 4.5e-3 |
+| output Q6_K | 23.7 | 24.1 (same path) | 1.4e-6 |
+
+The error is the format, not a bug: against a reference computed with the
+activation rounded to f16 the kernel's rel-RMS error is 8.6e-4 (attn_qkv), of
+which the f16 rounding of x alone is 2.2e-4; the max-rel column is the
+worst-case row of a random-normal dot with Σ|p|/|Σp| ≈ 120–170. The first
+version summed the four products in a packed FMA chain (`qlo*ylo + qhi*yhi`
+in f16) and drifted **3e-2** (`x rel`) over 12 layers; summing the four
+products in f32 (two packed multiplies, four converts) brings that to
+**6e-4 – 3e-3** at the same speed. Composed 12-layer × 3-token on Xavier:
+**48.5 → 39.3 ms/token**, argmax chain unchanged.
+
+This is a numerics decision, so h2 is an **opt-in row** (`nvgpu-h2`) and the
+`nvgpu` default stays the exact s4. For comparison llama.cpp's Vulkan path
+quantizes activations to Q8 per 32-block (≈4e-3 relative per activation),
+coarser than f16; a like-for-like distribution comparison against llama.cpp
+is the open parity item.
+
 What this is not yet: the 40-layer model on a device with room (the serving
 processes own the memory), prompt-side prefill (tokens are fed one at a time),
 sampling other than argmax, distribution parity with llama.cpp over a real
