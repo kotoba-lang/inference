@@ -14,7 +14,7 @@
 ;; Root ADR-2609182400 C.
 (require '["fs" :as fs] '[clojure.string :as str])
 (def args (vec *command-line-args*))
-(when-not (<= 6 (count args) 8) (println "usage: <file.gguf> <layers> <tokens> <prompt-token-id[,id...]> <dir-on-box> <out.kotoba> [anv|radv|nvgpu|nvgpu-h2] [stream]") (js/process.exit 2))
+(when-not (<= 6 (count args) 8) (println "usage: <file.gguf> <layers> <tokens> <prompt-token-id[,id...]> <dir-on-box> <out.kotoba> [anv|radv|nvgpu|nvgpu-exact] [stream]") (js/process.exit 2))
 ;; stream: the layer weights are MAPped per layer per token and FREEd after the
 ;; layer's command buffer, so the whole 40-layer model runs on a device that
 ;; cannot hold it (K16 GTT 13 GiB vs 17.4 GB of weights) -- for parity, not
@@ -43,10 +43,12 @@
 (def layout-table
   {"anv"   {:wide "kdot_f32_r1.spv" :narrow "kdot_f32_r1.spv" :lm "kdot_f32_r8.spv"}
    "radv"  {:wide "kdot_f32_r8.spv" :narrow "kdot_f32_r1.spv" :lm "kdot_f32_r1.spv"}
-   "nvgpu" {:wide "kdot_s4_r1.spv"  :narrow "kdot_s4_r1.spv"  :lm "kdot_s4_r1.spv"}
-   ;; packed-half dequant (kdot_h2_r1): faster on nvgpu, NOT oracle-exact (rel-RMS
-   ;; ~8e-4 vs f64 on random activations, iteration 12). Opt-in row, not the default.
-   "nvgpu-h2" {:wide "kdot_h2_r1.spv" :narrow "kdot_h2_r1.spv" :lm "kdot_s4_r1.spv"}})
+   ;; nvgpu default = packed-half dequant (kdot_h2_r1) since iteration 15: over all
+   ;; 40 layers KL(oracle||h2) = 8.5e-4 nats and KL(llama.cpp||h2) = 0.0142, the same
+   ;; as the exact kernel's 0.0167 -- llama.cpp itself is ~0.015 from the f64 oracle.
+   ;; 12L x 3T 48.5 -> 39.3 ms/token. "nvgpu-exact" keeps the f32 path (s4).
+   "nvgpu"       {:wide "kdot_h2_r1.spv" :narrow "kdot_h2_r1.spv" :lm "kdot_s4_r1.spv"}
+   "nvgpu-exact" {:wide "kdot_s4_r1.spv" :narrow "kdot_s4_r1.spv" :lm "kdot_s4_r1.spv"}})
 (def layouts (or (layout-table backend) (do (println "REFUSE unknown backend" backend) (js/process.exit 2))))
 ;; --- GGUF directory (header only) ---
 (def fd (fs/openSync gguf "r"))
