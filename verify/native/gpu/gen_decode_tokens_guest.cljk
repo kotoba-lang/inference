@@ -199,7 +199,9 @@
 (defn wg-of [spv rows] (let [n (rows-of-spv spv)] (quot (+ rows n -1) n)))
 ;; prefill (iteration 39): the non-MoE kdots run kdot_f32_p -- one workgroup per row, all P positions in the
 ;; inner loop, weights read once. (rows, 1, 1) instead of (wg, P, 1).
-(def kdot-p (when prefill? (pipeline! "kdot_f32_p.spv" 5)))
+;; kdot_f32_p<P>.spv = kdot_f32_p.comp built with -DPFIX=<P> (iteration 48): a constant position count keeps the
+;; per-position accumulators in registers (Xavier 12L 174 -> 99 ms, 40L 545 -> 317 ms; K16 -4 %, B70 -6 %).
+(def kdot-p (when prefill? (pipeline! (str "kdot_f32_p" PF ".spv") 5)))
 (defn pkdot! [pipe spv rows meta w x out ids] (if prefill? (dispatch! kdot-p rows 1 1 meta w x out ids) (dispatch! pipe (wg-of spv rows) PF 1 meta w x out ids)))
 (defn pkdotc! [pipe spv rows meta w x out ids] (if prefill? (dispatchc! kdot-p rows 1 1 meta w x out ids) (dispatchc! pipe (wg-of spv rows) PF 1 meta w x out ids)))
 (def expert-spv (or (:expert layouts) (:narrow layouts)))
