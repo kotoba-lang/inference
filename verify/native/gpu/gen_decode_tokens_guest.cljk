@@ -242,7 +242,8 @@
 (def embed (pipeline! "embed_iq4xs.spv" 5))
 (def deltanet-fused-b (when BB (pipeline! "deltanet_fused_b.spv" 13)))
 (def embed-b (when BB (pipeline! "embed_iq4xs_b.spv" 5)))
-(def batch-op-names ["copy_at" "rope_neox" "attn_decode" "argmax_partial" "argmax_final" "pos_incr" "ctl"])
+(def batch-op-names ["copy_at" "rope_neox" "attn_decode" "argmax_partial" "argmax_final" "pos_incr" "ctl"
+                     "params" "sample_part" "sample_probs" "sample_bisect_part" "sample_bisect_step" "sample_final"])   ;; iteration 55: per-row sampling
 (def ^:dynamic batch? false)   ;; the batch phase is being emitted
 (def w-embd (map-tensor! "token_embd.weight"))
 (def prompt-ids (alloc! (max 16 (* 4 (count prompt)))))
@@ -332,10 +333,15 @@
 (def m-embed-dyn (let [m (alloc! 16)] (write! m (str (le32 2048) (le32 0) (le32 1) (le32 0))) m))
 ;; batch: rowpos = one absolute position per sequence; the token buffer row stride is 4096 (embed pad1, ctl aux)
 (def rowpos (when BB (let [b (alloc! (max 16 (* 4 BB)))] (zero! b) b)))
+;; batch sampling (iteration 55): per-row (T, top_p, seed, -) from the message; the sampler's scratch per row
+(def sparams (when BB (let [b (alloc! (* 16 BB))] (zero! b) b)))
+(def sample-o-b (when BB (alloc! (* 1024 BB))))
+(def sample-s-b (when BB (alloc! (* 248320 4 BB))))
+(def m-sample-b (when BB (let [m (alloc! 32)] (write! m (str (le32 248320) (le32 1) (le32 61) (le32 4096) (lef32 1.0) (lef32 1.0) (le32 0) (lef32 1))) m)))
 (def m-embed-b (when BB (let [m (alloc! 16)] (write! m (str (le32 2048) (le32 0) (le32 1) (le32 4096))) m)))
 (def m-copy-b (when BB (ops-meta! 512 1 (* 4096 512) 512 0 0)))   ;; n per row, aux = cache stride per sequence, aux2 = per position
 (def m-am2-dyn (let [m (alloc! 32)] (write! m (str (le32 248320) (le32 1) (le32 61) (le32 (if resident? 4096 (count prompt))) (lef32 0) (lef32 0) (lef32 0) (lef32 1))) m))   ;; resident: the shell is the only writer of the token buffer
-(def ctrl (when resident? (alloc! (max 20 (* 4 (inc (or PB 1))) (* 8 (or BB 1))))))   ;; >= 5 words: the sampled message   ;; resident: "<token id>,<reset flag>" (or P tokens + flag) lands here (WRITEDEC), read by ctl
+(def ctrl (when resident? (alloc! (max 20 (* 4 (inc (or PB 1))) (* 20 (or BB 1))))))   ;; batch: 5B words (tokens, flags, T/top_p/seed per row)   ;; >= 5 words: the sampled message   ;; resident: "<token id>,<reset flag>" (or P tokens + flag) lands here (WRITEDEC), read by ctl
 (def m-ctlP (when PB (ops-meta! PB 1 0 0 0 0)))   ;; ctl with n = P tokens
 (def m-ctlBs (when BBs (into {} (for [b BBs] [b (ops-meta! b 1 4096 0 0 0)]))))   ;; batch ctl per B: n = B rows, aux = token-buffer row stride
 (def m-incrBs (when BBs (into {} (for [b BBs] [b (ops-meta! b 1 0 0 0 0)]))))   ;; batch pos_incr per B: every row
@@ -561,6 +567,7 @@
     (step! (q "BEGIN"))
     (when resident? (dispatch! (op* "ctl") 1 1 1 ctl-meta zeros16 tokbuf ctrl zeros16 zeros16 (if batch? rowpos posbuf)))
     (when sampled? (dispatch! (ops "params") 1 1 1 m-params zeros16 zeros16 ctrl m-sample-dyn zeros16 zeros16))   ;; T / top_p / seed from the message
+    (when batch? (dispatch! (op* "params") 1 1 1 m-incrB* zeros16 zeros16 ctrl sparams zeros16 zeros16))   ;; batch: every row's (T, top_p, seed) from the message
     (if batch?
       (dispatch! embed-b 1 PF 1 m-embed-b w-embd tokbuf x rowpos)
       (dispatch! embed 1 PF 1 m-embed-dyn w-embd tokbuf x posbuf))
@@ -582,7 +589,14 @@
         (dotimes [_ 30] (apply dispatch! (ops "sample_bisect_part") 61 1 1 h) (apply dispatch! (ops "sample_bisect_step") 1 1 1 h))
         (apply dispatch! (ops "sample_final") 1 1 1 h))
       (do (dispatch! (op* "argmax_partial") 61 (if batch? PF 1) 1 m-am1 logits zeros16 zeros16 zeros16 amax-s amax-ids)
-          (dispatch! (op* "argmax_final") 1 (if batch? PF 1) 1 m-am2-dyn amax-s tokbuf posbuf amax-s amax-s amax-ids)))
+          (dispatch! (op* "argmax_final") 1 (if batch? PF 1) 1 m-am2-dyn amax-s tokbuf posbuf amax-s amax-s amax-ids)
+          (when batch?
+            ;; per-row sampling (iteration 55): the chain over B rows, T == 0 rows keep the argmax pick
+            (let [h [m-sample-b logits sparams rowpos sample-o-b sample-s-b amax-ids]]
+              (apply dispatch! (op* "sample_part") 61 PF 1 h)
+              (apply dispatch! (op* "sample_probs") 61 PF 1 h)
+              (dotimes [_ 30] (apply dispatch! (op* "sample_bisect_part") 61 PF 1 h) (apply dispatch! (op* "sample_bisect_step") 1 PF 1 h))
+              (apply dispatch! (op* "sample_final") 1 PF 1 h)))))
     (cond
       batch? (dispatch! (op* "pos_incr") 1 1 1 m-incrB* zeros16 zeros16 zeros16 zeros16 zeros16 rowpos)
       prefill? (dispatch! (ops "pos_add") 1 1 1 m-padd zeros16 zeros16 zeros16 zeros16 zeros16 posbuf)
@@ -644,12 +658,13 @@
                                                    :else (str "      (gpu " % ")")) prefill-step-lines)) "\n"
                        "      (gpu \"SUBMIT\")))\n"))
                 "(defn serve-loop [n :i64] :i64\n"
-                "  (let [line (typed-cap-call :io/read :string :string \"" (max 64 (* 8 (inc (or PB 1))) (* 16 (or BB 1))) "\")]\n"
+                "  (let [line (typed-cap-call :io/read :string :string \"" (max 64 (* 8 (inc (or PB 1))) (* 64 (or BB 1))) "\")]\n"
                 "    (if (string=? line \"\")\n      n\n      (do\n"
                 (if replay?
                   (str "      (let [nw (gpu (string-concat \"WRITEDEC " ctrl " 0 \" line))]\n"
                        (if adaptive?
-                         (str "      (let [ns " (reduce (fn [acc b] (str "(if (string=? nw \"" (* 2 b) "\") (gpu \"REPLAY " (batch-slot b) "\") " acc ")"))
+                         ;; batch messages are 5B words (tokens, flags, T / top_p / seed per row); 2B (no sampler words) still routes
+                         (str "      (let [ns " (reduce (fn [acc b] (str "(if (string=? nw \"" (* 5 b) "\") (gpu \"REPLAY " (batch-slot b) "\") (if (string=? nw \"" (* 2 b) "\") (gpu \"REPLAY " (batch-slot b) "\") " acc "))"))
                                                         (str "(gpu \"REPLAY " (batch-slot (last BBs)) "\")") (reverse (butlast BBs))) "\n")
                          (str "      (let [ns (if (string=? nw \"2\") (gpu \"REPLAY 0\") (if (string=? nw \"5\") (gpu \"REPLAY 2\") "
                               (if BB (str "(if (string=? nw \"" (* 2 BB) "\") (gpu \"REPLAY 3\") (gpu \"REPLAY 1\"))") "(gpu \"REPLAY 1\")") "))\n"))
