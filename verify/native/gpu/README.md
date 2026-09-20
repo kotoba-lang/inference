@@ -1344,3 +1344,49 @@ The adaptive anv guest hit the loader's `pipeline table full` (64): 23 ops + 13 
 twins + the kdot layouts with their int8 forms + a positions kernel per phase + three embed / delta-net variants
 + the quantizer ≈ 70. amu #1039 raises `KGPU_MAX_PIPELINES` to 128; built on the three boxes as `kexe-loader-gpu7`
 (promoted to `kexe-loader-gpu` when the PR lands). K16 and Xavier were under the old limit by a few entries.
+
+## Tick 53 (2026-09-20): Q8_0 / Q4_0 / F16 in the K-quant kdots — measured on K16 against the f64 oracle
+
+`kdot_f32_r1.comp` / `kdot_f32_r8.comp` / `kdot_f32_p.comp` take three more ggml types: **Q8_0 (8)**, **Q4_0 (2)**,
+**F16 (1)**. They are not super-blocks: Q8_0 is 32-value blocks of 34 B (f16 d + 32 int8), Q4_0 32-value blocks of
+18 B (f16 d + 16 B of nibbles, value j < 16 the low nibble of byte j, j + 16 the high nibble, code q − 8), F16 has
+no blocks. `block_bytes_of()` answers bytes per 256 values (272 / 144 / 512), so the 256-group loop and `wb` are the
+same; the thread's block sits at `wb + (index / 32) * 34` (or 18). Rows are **not** 256-multiples in the target
+model (Qwen2.5-0.5B: cols 896 = 28 blocks), so for these types the group count is `ceil(cols / 256)`,
+`row_bytes = ceil(cols / 32) * 34` (18 / 64) and the tail group is masked (`block*256 + index >= cols` → skip; the
+check never fires for K-quant, whose cols are 256-multiples). Block starts are 2-byte aligned, so the codes go
+through `weight_u32_at` (q6's unaligned read); the F16 halves are two aligned words. `kdot_ref.py` has `deq_q8_0`
+/ `deq_q4_0` / `deq_f16` (256-group, in `BLOCK`) built on 32-value `BLOCK32` units, and `row_geometry()` picks the
+native unit per type; `gen_kdot_guest.cljk` knows the three types and a `p` layout (`kdot_f32_p1.spv`, built
+`-DPFIX=1`); `kdot_check.py` takes any tensor name plus the byte count.
+
+Oracle sanity before trusting a green: the byte rule reproduces every tensor's gap to the next directory entry in
+all three GGUFs; the Q8_0 rows dequantize to within 0.0042 × block-max of the F16 rows of the same weights
+(1/254 = 0.0039 is the quantization step; corr 0.99998), Q4_0 within 0.125 (corr 0.995); the old K-quant
+`.ref.npy` files are reproduced bit-identical. `Qwen/Qwen2.5-0.5B-Instruct-GGUF` q8_0 / q4_0 / fp16 in
+`/root/kgpu/models/` on K16 (sha256 = the HF LFS etags: `ca59ca7f…`, `7671c0c3…`, `8e0ae260…`).
+
+K16 (RADV, `kexe-loader-gpu7`), first 64 rows, `max |gpu − f64| / max(|f64|, 1e-2)`, 10 dispatches in one buffer:
+
+| type | tensor (rows × cols, bytes) | r1 | r8 | p (PFIX=1) |
+|---|---|---|---|---|
+| Q8_0 | `blk.0.attn_q` (896 × 896, 853 KB) | **9.40e-6** 18.7 GB/s | 9.40e-6 11.8 | 9.40e-6 12.7 |
+| Q8_0 | `blk.0.attn_k` (128 × 896, 122 KB) | 1.21e-6 | 1.21e-6 | 1.21e-6 |
+| Q8_0 | `blk.0.ffn_down` (896 × 4864, 4.6 MB) | 3.11e-6 14.4 | 3.11e-6 **24.0** | 3.11e-6 12.5 |
+| Q4_0 | `blk.0.attn_q` (896 × 896, 452 KB) | **1.01e-5** 9.1 | 1.01e-5 8.5 | 1.01e-5 14.3 |
+| Q4_0 | `blk.0.attn_k` (128 × 896, 65 KB) | 1.32e-6 | 1.32e-6 | 1.32e-6 |
+| Q4_0 | `blk.0.ffn_down` (896 × 4864, 2.5 MB) | 3.33e-6 11.3 | 3.33e-6 11.1 | 3.33e-6 11.0 |
+| F16 | `blk.0.attn_q` (896 × 896, 1.6 MB) | 9.91e-6 10.4 | 9.91e-6 11.3 | **1.59e-5** 21.8 |
+| F16 | `blk.0.attn_k` (128 × 896, 229 KB) | 9.42e-6 | 9.42e-6 | 3.46e-6 |
+| F16 | `blk.0.ffn_down` (896 × 4864, 8.7 MB) | 9.85e-6 15.2 | 9.85e-6 **31.9** | 2.59e-6 23.1 |
+
+Every cell is ≤ 1.01e-5 except F16 attn_q on the p kernel, 1.59e-5: that is row 12, whose true dot is −0.010037
+(at the metric's 1e-2 floor); the absolute error is 1.59e-7 against r1's 0.99e-7, the max absolute error over the
+64 rows is 4.49e-7 for all three kernels, and numpy's own f32 `dot` of the same row is 1.81e-5 off the f64 value —
+the f32 accumulation floor, not the layout (the p kernel rounds `dot()` before `ws *` where r1 fuses `dot()` into
+the accumulator; at ws = 1.0 that is the only difference). Q4_0 has no stated bound; 1.01e-5 is the same metric.
+The rebuilt `kdot_f32_r1.spv` / `kdot_f32_r8.spv` / `kdot_f32_p1.spv` on K16 re-ran the Nex K-quant guests:
+Q5_K attn_qkv 6.10e-6, IQ4_XS attn_gate 9.98e-6, Q6_K lm_head 1.55e-6 on r1 / r8 / p (unchanged; the K-quant
+arms were not touched). Small-tensor GB/s (attn_k) is launch-bound and not listed. Not measured: a row whose
+block count is odd (the last block's unaligned word read straddles the row end by 2 B — inside the buffer except
+at the tensor's last row), Q4_K (12, no Nex tensor and no oracle), and the other two boxes.
