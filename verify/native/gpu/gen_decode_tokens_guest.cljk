@@ -167,13 +167,17 @@
 (when (> NPARTS 63) (println "REFUSE vocab" NV "-- more than 63 argmax partials, the row stride is 64 slots") (js/process.exit 2))
 (def block-bytes {12 144 13 176 14 210 23 136 0 nil})
 (defn tensor-bytes [{:keys [dims type]}]
-  ;; iteration 59: F32 (0) / F16 (1) per value; Q8_0 (8) 34 B and Q4_0 (2) 18 B per 32 values; K-quants per 256
+  ;; iteration 59: F32 (0) / F16 (1) per value; Q8_0 (8) 34 B and Q4_0 (2) 18 B per 32 values; K-quants per 256.
+  ;; 53b: Q4_1 (3) 20 B, Q5_0 (6) 22 B, Q5_1 (7) 24 B per 32 values (the kdot_f32_* arms of the same tick).
   (let [cols (first dims) rows (reduce * 1 (rest dims))]
     (case type
       0 (* rows cols 4)
       1 (* rows cols 2)
       8 (* rows (quot (+ cols 31) 32) 34)
       2 (* rows (quot (+ cols 31) 32) 18)
+      3 (* rows (quot (+ cols 31) 32) 20)
+      6 (* rows (quot (+ cols 31) 32) 22)
+      7 (* rows (quot (+ cols 31) 32) 24)
       (* rows (quot cols 256) (block-bytes type)))))
 ;; the weight file on the box: <dir-on-box>/<basename of the GGUF given>, or NEX_BOX_GGUF (iteration 59; it was nex.gguf --
 ;; the Nex runs read a local header dump `nex-iq4xs-head64m.bin` and the box holds `nex.gguf`, so they pass NEX_BOX_GGUF=nex.gguf)
