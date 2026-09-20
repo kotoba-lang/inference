@@ -127,7 +127,7 @@ ivec4 pq2_0_word_values(uint base, uint index) {
                int((w >> (s + 6u)) & 3u) - 1);
 }
 uint ptq1_pow3(uint n) {
-  // Co-scientist iteration 63: the PTQ byte holds five radix-3 digits.
+  // Co-scientist iteration 64: the PTQ byte holds five radix-3 digits.
   // A fixed factor replaces the old variable-trip multiply loop.
   return n == 0u ? 1u : n == 1u ? 3u : n == 2u ? 9u : n == 3u ? 27u : 81u;
 }

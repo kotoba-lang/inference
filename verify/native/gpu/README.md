@@ -90,7 +90,7 @@ The 2026-09-20 M1 Max measurements and their scope are recorded in
 there are real kernel timings accumulated over the model's tensor inventory,
 not a completed token or HTTP measurement.
 
-Co-scientist iteration 63 removed PTQ1's four variable-trip radix loops per
+Co-scientist iteration 64 removed PTQ1's four variable-trip radix loops per
 four weights. Because a shader invocation always asks for four consecutive
 trits, it now loads their packed word once and applies one fixed `3^n` vector
 operation. `blk.0.ffn_gate.weight` improved by **1.84–2.42x** across Metal,

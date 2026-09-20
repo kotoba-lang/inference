@@ -1,6 +1,6 @@
 {
   "schema": "murakumo.inference-coscientist.ptq1-radix-decode.v1",
-  "iteration": 63,
+  "iteration": 64,
   "measured_at": "2026-09-20",
   "model": {
     "repository": "https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf",
