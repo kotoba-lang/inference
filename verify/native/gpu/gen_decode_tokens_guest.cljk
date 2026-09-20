@@ -134,21 +134,24 @@
 (def pos (atom 0))
 (defn- u8 [] (let [v (.readUInt8 buf @pos)] (swap! pos + 1) v))
 (defn- u32 [] (let [v (.readUInt32LE buf @pos)] (swap! pos + 4) v))
+(defn- i32 [] (let [v (.readInt32LE buf @pos)] (swap! pos + 4) v))
 (defn- u64 [] (let [v (.readBigUInt64LE buf @pos)] (swap! pos + 8) (js/Number v)))
 (defn- f32 [] (let [v (.readFloatLE buf @pos)] (swap! pos + 4) v))
 (defn- gstr [] (let [k (u64) s (.toString buf "utf8" @pos (+ @pos k))] (swap! pos + k) s))
+(def keep-array? (atom false))
 (declare read-value)
 (defn- read-value [t]
-  (case t 0 (u8) 1 (u8) 2 (do (swap! pos + 2) 0) 3 (do (swap! pos + 2) 0) 4 (u32) 5 (u32) 6 (f32) 7 (u8) 8 (gstr)
-    9 (let [et (u32) k (u64)] (doall (repeatedly k #(read-value et))) nil) 10 (u64) 11 (u64) 12 (do (swap! pos + 8) 0)))
+  (case t 0 (u8) 1 (u8) 2 (do (swap! pos + 2) 0) 3 (do (swap! pos + 2) 0) 4 (u32) 5 (i32) 6 (f32) 7 (u8) 8 (gstr)
+    9 (let [et (u32) k (u64)] (if @keep-array? (vec (repeatedly k #(read-value et))) (do (dotimes [_ k] (read-value et)) nil))) 10 (u64) 11 (u64) 12 (do (swap! pos + 8) 0)))
 (swap! pos + 4) (u32) (def n-tensors (u64)) (def n-kv (u64))
-(def kv (into {} (for [_ (range n-kv)] (let [k (gstr) t (u32)] [k (read-value t)]))))
+(def kv (into {} (for [_ (range n-kv)] (let [k (gstr) t (u32) _ (reset! keep-array? (str/starts-with? k "prism.hadamard."))] [k (read-value t)]))))
 (def tensors (into {} (for [_ (range n-tensors)] (let [name (gstr) nd (u32) dims (vec (repeatedly nd u64)) typ (u32) off (u64)] [name {:dims dims :type typ :offset off}]))))
 (def alignment (get kv "general.alignment" 32))
 (def data-start (* (quot (+ @pos alignment -1) alignment) alignment))
 ;; --- architecture (iteration 59): every dimension from the GGUF's own metadata; "qwen35moe" is Nex (the hybrid this
 ;; generator grew on), "qwen2" / "llama" are dense decoders (one block kind: attention + SwiGLU FFN)
 (def arch (get kv "general.architecture"))
+(def bonsai? (= "qwen35" arch))
 (def dense? (contains? #{"qwen2" "llama"} arch))
 ;; tick 55 (B70, Qwen2.5-0.5B Q8_0, 24 L): a dense model's lm_head (151936 x 896 Q8_0 = 145 MB) dominates the batch step, so
 ;; on anv the int8 B-times lm_head read (B=4 6.56 ms/step) loses to reading it once through the positions kernel (4.06),
@@ -157,10 +160,11 @@
 ;; tick 58 (Xavier, same model): the h2 table (f16 activations, tuned on Nex's 2048-wide layers) is neither faster nor exact on a
 ;; dense 896-wide model -- s4 (exact f32) 14.8 / 19.2 / 29.6 ms/step at B=1/2/4 vs h2 15.7 / 19.2 / 29.8, KL(oracle||gpu) 9e-13 vs
 ;; 1e-7 nats -- so dense on nvgpu takes the exact table (with :lm-once). Nex keeps h2 (iteration 21: bandwidth-bound on its tensors).
-(def layouts (cond (and dense? (= backend "anv")) (assoc layouts* :lm-once true :batch-layout-upto 1)
+(def layouts (cond (and bonsai? (= backend "anv")) {:wide "kdot_f32_r1.spv" :narrow "kdot_f32_r1.spv" :lm "kdot_f32_r1.spv" :out "kdot_f32_r1.spv" :dense-dual "kdot_ptq1_dual_r1.spv"}
+                   (and dense? (= backend "anv")) (assoc layouts* :lm-once true :batch-layout-upto 1)
                    (and dense? (= backend "nvgpu")) (layout-table "nvgpu-exact")
                    :else layouts*))
-(when-not (contains? #{"qwen35moe" "qwen2" "llama"} arch) (println "REFUSE architecture" arch "-- known: qwen35moe qwen2 llama") (js/process.exit 2))
+(when-not (contains? #{"qwen35moe" "qwen35" "qwen2" "llama"} arch) (println "REFUSE architecture" arch "-- known: qwen35moe qwen35 qwen2 llama") (js/process.exit 2))
 (defn akv [k & [d]] (let [v (get kv (str arch "." k))] (if (some? v) v d)))
 (def eps (akv "attention.layer_norm_rms_epsilon"))
 (def NE (akv "embedding_length"))               ;; hidden size (Nex 2048, Qwen2.5-0.5B 896)
@@ -169,6 +173,13 @@
 (def HD (if dense? (quot NE NH) 256))           ;; head dim (Nex: 256 with a 2x gated q; dense: NE / NH)
 (def NFF (akv "feed_forward_length" 0))         ;; dense FFN width (4864)
 (def KVROW (* NKV HD))                          ;; floats per cached position (Nex 512, Qwen2.5-0.5B 128)
+(def GDN-D (akv "ssm.state_size" 128))
+(def GDN-H (if bonsai? (quot (akv "ssm.inner_size") GDN-D) 32))
+(def GDN-KH (if bonsai? (akv "ssm.group_count") 16))
+(def GDN-QKV (+ (* 2 GDN-KH GDN-D) (* GDN-H GDN-D)))
+(def GDN-Z (* GDN-H GDN-D))
+(def ATTN-Q (* 2 NH HD))
+(def ATTN-O (* NH HD))
 (def NROT (akv "rope.dimension_count" HD))      ;; rotated dims (Nex key present; dense: the head dim)
 (def NV (nth (:dims (or (get tensors "output.weight") (get tensors "token_embd.weight"))) 1))   ;; vocab rows (output.weight, or the tied embedding)
 (def LMT (:type (or (get tensors "output.weight") (get tensors "token_embd.weight"))))   ;; lm_head tensor type (14 Q6_K on Nex, 8 Q8_0 on Qwen2.5)
@@ -194,9 +205,24 @@
 ;; the Nex runs read a local header dump `nex-iq4xs-head64m.bin` and the box holds `nex.gguf`, so they pass NEX_BOX_GGUF=nex.gguf)
 (def gguf-name (or (aget js/process.env "NEX_BOX_GGUF") (last (str/split gguf #"/"))))
 (def wpath (str box "/" gguf-name))
+(def sign-widths (when bonsai? (vec (get kv "prism.hadamard.sign_widths"))))
+(def sign-values (when bonsai? (vec (get kv "prism.hadamard.sign_values"))))
+(def signs-local (when bonsai? (str out ".signs.f32")))
+(def signs-remote (when bonsai? (str box "/" (last (str/split signs-local #"/")))))
+(when bonsai?
+  (when-not (and (= 1024 (get kv "prism.hadamard.block_size"))
+                 (= "normalized-sylvester-walsh-hadamard" (get kv "prism.hadamard.transform"))
+                 (= (reduce + sign-widths) (count sign-values)))
+    (println "REFUSE unsupported or incomplete prism.hadamard contract") (js/process.exit 2))
+  (let [b (js/Buffer.alloc (* 4 (count sign-values)))]
+    (doseq [[i v] (map-indexed vector sign-values)] (.writeFloatLE b v (* 4 i)))
+    (fs/writeFileSync signs-local b)))
 (defn T* [full] (or (get tensors full) (do (println "REFUSE no tensor" full) (js/process.exit 2))))
-(def interval (get kv "qwen35moe.full_attention_interval" 4))
+(def interval (akv "full_attention_interval" 4))
 (def recurrent (vec (for [il (range 64)] (if (or dense? (zero? (mod (inc il) interval))) 0 1))))   ;; dense: every layer is attention  ;; llama.cpp: full attention every `interval`-th layer
+(when (and bonsai? (or PB BB prefill? stream?))
+  (println "REFUSE qwen35 Bonsai currently supports fn + runtime/resident/resident-replay decode; transformed prefill, batch, and stream are not yet measured")
+  (js/process.exit 2))
 (when prefill? (when (not= ntok 1) (println "REFUSE prefill: tokens must be 1 (the prompt is the batch)") (js/process.exit 2)))
 (def nrot NROT) (def rope-base (akv "rope.freq_base"))   ;; iteration 59: from the architecture's own keys (the Nex-only key read nil for Qwen -> NaN theta)
 ;; --- emission helpers ---
@@ -221,6 +247,8 @@
 (defn cat [& xs] (reduce (fn [a b] (str "(string-concat " a " " b ")")) xs))
 (defn map-tensor! [nm]
   (let [t (T* nm) h (alloc-slot!)] (step! (q (str "MAP " wpath " " (+ data-start (:offset t)) " " (tensor-bytes t)))) (str h)))
+(defn map-file! [path offset bytes]
+  (let [h (alloc-slot!)] (step! (q (str "MAP " path " " offset " " bytes))) (str h)))
 (defn alloc! [bytes] (let [h (alloc-slot!)] (step! (q (str "ALLOC " bytes))) (str h)))
 (defn zero! [h] (step! (q (str "ZERO " h))))
 (defn write! [h hex] (step! (q (str "WRITE " h " 0 " hex))))
@@ -246,16 +274,27 @@
 ;; p1 = 1: the kernel takes the position from the pos buffer (binding 6) -- nex_ops.comp dyn_pos
 (defn ops-meta-dyn! [n rows aux aux2 eps scale] (let [m (alloc! 32)] (write! m (str (le32 n) (le32 rows) (le32 aux) (le32 aux2) (lef32 eps) (lef32 scale) (lef32 0) (lef32 1))) m))
 (defn kdot-meta! [rows cols type positions input-per-expert & [pad0 pad1]] (let [m (alloc! 32)] (write! m (str (le32 rows) (le32 cols) (le32 type) (le32 positions) (le32 input-per-expert) (le32 (or pad0 0)) (le32 (or pad1 0)) (le32 0))) m))
+(defn hadamard-meta! [width rows hd nk rep sign-after]
+  (let [m (alloc! 32)]
+    (write! m (str (le32 width) (le32 rows) (le32 1024) (le32 hd) (le32 nk) (le32 rep) (le32 sign-after) (le32 0))) m))
 (def counter (atom 0))
 (defn fresh [prefix] (swap! counter inc) (str prefix @counter))
 ;; --- the plan ---
 (def zeros16 (alloc! 16))
 (def ops (into {} (for [op ["rmsnorm" "l2norm" "gated_rmsnorm" "silu_mul" "conv1d_step" "softmax_topk" "gate_decay2" "weighted_sum" "add" "f32_matvec" "add_rmsnorm" "rope_neox" "attn_decode" "argmax_partial" "argmax_final" "copy_at" "pos_incr" "pos_incr2" "sample_part" "sample_probs" "sample_bisect_part" "sample_bisect_step" "sample_final" "ctl" "pos_add" "pos_seed" "params" "add_bias"]] [op (pipeline! (str "nex_" op ".spv") 7)])))
+(def hadamard (when bonsai? (pipeline! "hadamard_signed.spv" 4)))
+(def sign-handles
+  (when bonsai?
+    (loop [ws sign-widths off 0 acc {}]
+      (if-let [width (first ws)]
+        (recur (next ws) (+ off (* 4 width)) (assoc acc width (map-file! signs-remote off (* 4 width))))
+        acc))))
 (def kdot-wide (pipeline! (:wide layouts) 5))
 (def kdot-narrow (pipeline! (:narrow layouts) 5))
 (def kdot-lm (pipeline! (:lm layouts) 5))
 (def kdot-expert (if (:expert layouts) (pipeline! (:expert layouts) 5) kdot-narrow))   ;; the three 8-position expert kdots (iteration 27)
 (def kdot-expert-dual (when (:expert-dual layouts) (pipeline! (:expert-dual layouts) 6)))   ;; gate + up + silu in one dispatch (iteration 28)
+(def kdot-dense-dual (when (:dense-dual layouts) (pipeline! (:dense-dual layouts) 6)))
 ;; :out = the 2048-row x 4096-col output projections (ssm_out, attn_output): on r8 they get only 256 workgroups (iteration 28)
 (def kdot-out (if (:out layouts) (pipeline! (:out layouts) 5) kdot-wide))
 ;; int8 activations (iteration 34): rows :wide-i8 / :lm-i8 / :expert-i8 name kdot_i8_* kernels (six bindings); the
@@ -306,24 +345,33 @@
 (def embed-bp (when bprefill? (pipeline! (str embed-spv "_bp.spv") 5)))
 (def w-embd (map-tensor! "token_embd.weight"))
 (def prompt-ids (alloc! (max 16 (* 4 (count prompt)))))
-(def x (alloc! (* PMAX 8192)))
-(def h (alloc! (* PMAX 8192))) (def qkv (alloc! (* PMAX 32768))) (def z (alloc! (* PMAX 16384))) (def alpha (alloc! (* PMAX 128))) (def betaL (alloc! (* PMAX 128))) (def gb (alloc! 256)) (def beta-only (alloc! 256))
-(def conv (alloc! 32768)) (def qn (alloc! 8192)) (def kn (alloc! 8192)) (def dn (alloc! 16384)) (def gnorm (alloc! (* PMAX 16384))) (def attn-out (alloc! (* PMAX 8192)))
-(def qfull (alloc! (* PMAX 32768))) (def kproj (alloc! (* PMAX 2048))) (def vproj (alloc! (* PMAX 2048))) (def qnorm (alloc! (* PMAX 16384))) (def knorm (alloc! (* PMAX 2048))) (def qrope (alloc! (* PMAX 16384))) (def krope (alloc! (* PMAX 2048))) (def attno (alloc! (* PMAX 16384)))
-(def resid (alloc! (* PMAX 8192))) (def h2 (alloc! (* PMAX 8192))) (def router (alloc! (* PMAX 1024))) (def ids (alloc! (* PMAX 64))) (def topw (alloc! (* PMAX 64)))
+(def x (alloc! (* PMAX 4 NE)))
+(def h (alloc! (* PMAX 4 NE))) (def qkv (alloc! (* PMAX 4 GDN-QKV))) (def z (alloc! (* PMAX 4 GDN-Z))) (def alpha (alloc! (* PMAX 4 GDN-H))) (def betaL (alloc! (* PMAX 4 GDN-H))) (def gb (alloc! (* 8 GDN-H))) (def beta-only (alloc! (* 8 GDN-H)))
+(def conv (alloc! (* 4 GDN-QKV))) (def qn (alloc! (* 4 GDN-KH GDN-D))) (def kn (alloc! (* 4 GDN-KH GDN-D))) (def dn (alloc! (* 4 GDN-Z))) (def gnorm (alloc! (* PMAX 4 GDN-Z))) (def attn-out (alloc! (* PMAX 4 NE)))
+(def qfull (alloc! (* PMAX 4 ATTN-Q))) (def kproj (alloc! (* PMAX 4 KVROW))) (def vproj (alloc! (* PMAX 4 KVROW))) (def qnorm (alloc! (* PMAX 4 ATTN-O))) (def knorm (alloc! (* PMAX 4 KVROW))) (def qrope (alloc! (* PMAX 4 ATTN-O))) (def krope (alloc! (* PMAX 4 KVROW))) (def attno (alloc! (* PMAX 4 ATTN-O)))
+(def resid (alloc! (* PMAX 4 NE))) (def h2 (alloc! (* PMAX 4 NE))) (def router (alloc! (* PMAX 1024))) (def ids (alloc! (* PMAX 64))) (def topw (alloc! (* PMAX 64)))
 (def gateE (alloc! (* PMAX 16384))) (def upE (alloc! (* PMAX 16384))) (def actE (alloc! (* PMAX 16384))) (def downE (alloc! (* PMAX 65536)))
-(def sg (alloc! (* PMAX 2048))) (def su (alloc! (* PMAX 2048))) (def sact (alloc! (* PMAX 2048))) (def shdown (alloc! (* PMAX 8192))) (def shlogit (alloc! (max 16 (* PMAX 4)))) (def ffn (alloc! (* PMAX 8192)))   ;; shlogit: the shared-expert gate logit per row (the P=8 bug of iteration 49: 16 bytes for 8 rows)
-(def xa (alloc! (* PMAX 8192))) (def xb (alloc! (* PMAX 8192)))
+(def sg (alloc! (* PMAX 2048))) (def su (alloc! (* PMAX 2048))) (def sact (alloc! (* PMAX 2048))) (def shdown (alloc! (* PMAX 4 NE))) (def shlogit (alloc! (max 16 (* PMAX 4)))) (def ffn (alloc! (* PMAX 4 NE)))   ;; shlogit: the shared-expert gate logit per row (the P=8 bug of iteration 49: 16 bytes for 8 rows)
+(def xa (alloc! (* PMAX 4 NE))) (def xb (alloc! (* PMAX 4 NE)))
+(def embed-raw (when bonsai? (alloc! (* PMAX 4 NE))))
+(def hrot (when bonsai? (alloc! (* PMAX 4 (apply max sign-widths)))))
+(def m-h-ne-fwd (when bonsai? (hadamard-meta! NE 1 NE 1 1 0)))
+(def m-h-ne-inv (when bonsai? (hadamard-meta! NE 1 NE 1 1 1)))
+(def m-h-gdn (when bonsai? (hadamard-meta! GDN-Z 1 GDN-D GDN-KH (quot GDN-H GDN-KH) 0)))
+(def m-h-attn (when bonsai? (hadamard-meta! ATTN-O 1 ATTN-O 1 1 0)))
+(def m-h-ffn (when bonsai? (hadamard-meta! NFF 1 NFF 1 1 0)))
+(defn hdispatch! [meta width input output]
+  (dispatch! hadamard (quot width 1024) PF 1 meta input (sign-handles width) output))
 ;; dense decoders (iteration 59): the block's activations (Nex keeps its own above; x / xa / xb / hN are reused and hold NE <= 2048)
 (when (and dense? (> NE 2048)) (println "REFUSE embedding_length" NE "> 2048: the shared activation buffers are sized for Nex") (js/process.exit 2))
 (def dq (when dense? (alloc! (* PMAX 4 NH HD)))) (def dk (when dense? (alloc! (* PMAX 4 KVROW)))) (def dv (when dense? (alloc! (* PMAX 4 KVROW))))
 (def dqr (when dense? (alloc! (* PMAX 4 NH HD)))) (def dkr (when dense? (alloc! (* PMAX 4 KVROW)))) (def dattn (when dense? (alloc! (* PMAX 4 NH HD))))
-(def dg (when dense? (alloc! (* PMAX 4 NFF)))) (def du (when dense? (alloc! (* PMAX 4 NFF)))) (def dact (when dense? (alloc! (* PMAX 4 NFF))))
+(def dg (when (or dense? bonsai?) (alloc! (* PMAX 4 NFF)))) (def du (when (or dense? bonsai?) (alloc! (* PMAX 4 NFF)))) (def dact (when (or dense? bonsai?) (alloc! (* PMAX 4 NFF))))
 (def zerosP (let [b (alloc! (max 16 (* 4 PMAX)))] (zero! b) b))   ;; expert_ids of zeros for the P-position non-MoE kdots
 (zero! zeros16)
 (write! prompt-ids (apply str (map le32 prompt)))
-(def rings (vec (for [il (range layers) :when (= 1 (recurrent il))] (let [r (alloc! (* NSEQ (if fused? 196608 98304)))] (zero! r) r))))   ;; fused: 2 slots x 3 x 8192 (double-buffered by pos parity)
-(def states (vec (for [il (range layers) :when (= 1 (recurrent il))] (let [s (alloc! (* NSEQ 2097152))] (zero! s) s))))
+(def rings (vec (for [il (range layers) :when (= 1 (recurrent il))] (let [r (alloc! (* NSEQ (if fused? (* 24 GDN-QKV) (* 12 GDN-QKV))))] (zero! r) r))))   ;; fused: 2 slots x 3 x qkv channels, f32
+(def states (vec (for [il (range layers) :when (= 1 (recurrent il))] (let [s (alloc! (* NSEQ 4 GDN-H GDN-D GDN-D))] (zero! s) s))))
 (def kcaches (vec (for [il (range layers) :when (= 0 (recurrent il))] (let [b (alloc! (* NSEQ (if runtime? 4096 (max ntok PMAX)) 4 KVROW))] (zero! b) b))))   ;; runtime: 4096-token context
 (def vcaches (vec (for [il (range layers) :when (= 0 (recurrent il))] (let [b (alloc! (* NSEQ (if runtime? 4096 (max ntok PMAX)) 4 KVROW))] (zero! b) b))))   ;; runtime: 4096-token context
 ;; the metas that depend on the batch (PF) or on the prefill form are made per PHASE: decode (pf 1) and, with
@@ -347,13 +395,20 @@
 (defn phase-metas [pf pre? & [batch-phase?]]
   (let [ipe (if pre? 1 0)]
     {:pf pf :pre? pre? :batch? (boolean batch-phase?) :shape-idx (shape-idx-of pf ipe)
-     :m-norm (ops-meta! 2048 pf 0 0 eps 0) :m-qkv (kdot-meta! 8192 2048 13 pf ipe) :m-gate (kdot-meta! 4096 2048 23 pf ipe)
-     :m-ab (kdot-meta! 32 2048 23 pf ipe) :m-out (kdot-meta! 2048 4096 23 pf ipe)
-     :m-q (kdot-meta! 8192 2048 23 pf ipe) :m-k (kdot-meta! 512 2048 23 pf ipe) :m-v (kdot-meta! 512 2048 13 pf ipe)
-     :m-attn-o (kdot-meta! 2048 4096 23 pf ipe)
+     :m-norm (ops-meta! NE pf 0 0 eps 0)
+     :m-qkv (kdot-meta! GDN-QKV NE (if dense? 13 (:type (T* "blk.0.attn_qkv.weight"))) pf ipe)
+     :m-gate (kdot-meta! GDN-Z NE (if dense? 23 (:type (T* "blk.0.attn_gate.weight"))) pf ipe)
+     :m-ab (kdot-meta! GDN-H NE (if dense? 23 (:type (T* "blk.0.ssm_alpha.weight"))) pf ipe)
+     :m-out (kdot-meta! NE GDN-Z (if dense? 23 (:type (T* "blk.0.ssm_out.weight"))) pf ipe)
+     :m-q (kdot-meta! ATTN-Q NE (if dense? 23 (:type (T* (str "blk." (dec interval) ".attn_q.weight")))) pf ipe)
+     :m-k (kdot-meta! KVROW NE (if dense? 23 (:type (T* (str "blk." (dec interval) ".attn_k.weight")))) pf ipe)
+     :m-v (kdot-meta! KVROW NE (if dense? 13 (:type (T* (str "blk." (dec interval) ".attn_v.weight")))) pf ipe)
+     :m-attn-o (kdot-meta! NE ATTN-O (if dense? 23 (:type (T* (str "blk." (dec interval) ".attn_output.weight")))) pf ipe)
      :m-gate-exps (kdot-meta! 512 2048 23 (* 8 pf) ipe (if pre? 8 0)) :m-down-exps (kdot-meta! 2048 512 23 (* 8 pf) 1)
      :m-silu8 (ops-meta! (* pf 4096) 1 0 0 0 0) :m-gate-sh (kdot-meta! 512 2048 23 pf ipe) :m-down-sh (kdot-meta! 2048 512 23 pf ipe)
-     :m-silu-sh (ops-meta! (* pf 512) 1 0 0 0 0) :m-add (ops-meta! (* pf 2048) 1 0 0 0 0)
+     :m-silu-sh (ops-meta! (* pf 512) 1 0 0 0 0) :m-add (ops-meta! (* pf NE) 1 0 0 0 0)
+     :m-bdual (when bonsai? (kdot-meta! NFF NE 143 pf 0))
+     :m-bdown (when bonsai? (kdot-meta! NE NFF 143 pf 0))
      :m-lm (if batch-phase? (kdot-meta! NV NE LMT pf 1 0 0) (kdot-meta! NV NE LMT 1 0 0 (dec pf)))   ;; prefill: the lm_head reads the last batch row (pad1); batch: every row
      :m-copy-dyn (ops-meta-dyn! (* KVROW pf) 1 0 KVROW 0 0)   ;; prefill: P consecutive rows in one copy
      ;; dense decoder (iteration 59): the block's kdots and elementwise ops, types from the tensors
@@ -377,10 +432,12 @@
 (def ^:dynamic shape-idx (:shape-idx phase-decode))   ;; which per-layer kdot-meta set the emission reads (tick 57)
 (def ^:dynamic m-dbq (:m-dbq phase-decode)) (def ^:dynamic m-dbk (:m-dbk phase-decode))
 (def ^:dynamic m-dsilu (:m-dsilu phase-decode)) (def ^:dynamic m-dadd (:m-dadd phase-decode))
+(def ^:dynamic m-bdual (:m-bdual phase-decode)) (def ^:dynamic m-bdown (:m-bdown phase-decode))
 (def phase-vars {#'m-norm :m-norm #'m-qkv :m-qkv #'m-gate :m-gate #'m-ab :m-ab #'m-out :m-out #'m-q :m-q #'m-k :m-k #'m-v :m-v #'m-attn-o :m-attn-o
                  #'m-gate-exps :m-gate-exps #'m-down-exps :m-down-exps #'m-silu8 :m-silu8 #'m-gate-sh :m-gate-sh #'m-down-sh :m-down-sh
                  #'m-silu-sh :m-silu-sh #'m-add :m-add #'m-lm :m-lm #'m-copy-dyn :m-copy-dyn #'m-padd :m-padd #'kdot-p :kdot-p
-                 #'shape-idx :shape-idx #'m-dbq :m-dbq #'m-dbk :m-dbk #'m-dsilu :m-dsilu #'m-dadd :m-dadd})
+                 #'shape-idx :shape-idx #'m-dbq :m-dbq #'m-dbk :m-dbk #'m-dsilu :m-dsilu #'m-dadd :m-dadd
+                 #'m-bdual :m-bdual #'m-bdown :m-bdown})
 (defn hexpr [e] (str "$(string-from-i64 " e ")"))
 (defn dense-meta
   "The kdot meta handle for `role` in the current phase: literal when the layer is literal (w carries :types) or the role's type is
@@ -401,14 +458,14 @@
                          #'i8-lm (when (or (not (:pre? ph)) (and (:batch? ph) (<= (:pf ph) batch-layout-upto))) i8-lm*)
                          #'i8-expert (when (or (not (:pre? ph)) (and (:batch? ph) (<= (:pf ph) batch-layout-upto))) i8-expert*)
                          #'kdot-expert-dual (when (or (not (:pre? ph)) (and (:batch? ph) (<= (:pf ph) batch-layout-upto))) kdot-expert-dual*)})
-    (f))) (def m-gd (ops-meta! 32 32 32 0 0 0)) (def m-gd0 (ops-meta! 32 32 0 0 0 0)) (def m-conv (ops-meta! 8192 1 0 0 0 0))
-(def m-l2q (ops-meta! 128 16 0 0 eps (/ 1.0 (js/Math.sqrt 128)))) (def m-l2k (ops-meta! 128 16 0 2048 eps 0))
-(def m-dn (let [m (alloc! 32)] (write! m (str (le32 32) (le32 128) (le32 128) (le32 16) (le32 4096) (le32 0) (le32 0) (le32 0))) m))
-(def m-fused (when fused? (let [m (alloc! 32)] (write! m (str (le32 32) (le32 128) (le32 128) (le32 16) (le32 4096) (le32 8192) (lef32 eps) (lef32 (/ 1.0 (js/Math.sqrt 128))))) m)))
+    (f))) (def m-gd (ops-meta! GDN-H GDN-H GDN-H 0 0 0)) (def m-gd0 (ops-meta! GDN-H GDN-H 0 0 0 0)) (def m-conv (ops-meta! GDN-QKV 1 0 0 0 0))
+(def m-l2q (ops-meta! GDN-D GDN-KH 0 0 eps (/ 1.0 (js/Math.sqrt GDN-D)))) (def m-l2k (ops-meta! GDN-D GDN-KH 0 (* GDN-KH GDN-D) eps 0))
+(def m-dn (let [m (alloc! 32)] (write! m (str (le32 GDN-H) (le32 GDN-D) (le32 GDN-D) (le32 GDN-KH) (le32 (* 2 GDN-KH GDN-D)) (le32 0) (le32 0) (le32 0))) m))
+(def m-fused (when fused? (let [m (alloc! 32)] (write! m (str (le32 GDN-H) (le32 GDN-D) (le32 GDN-D) (le32 GDN-KH) (le32 (* 2 GDN-KH GDN-D)) (le32 GDN-QKV) (lef32 eps) (lef32 (/ 1.0 (js/Math.sqrt GDN-D))))) m)))
 (def stepbufs (when (or prefill? PB) (vec (for [il (range layers) :when (= 1 (recurrent il))] (let [b (alloc! 16)] (zero! b) b)))))   ;; [abs pos, row] per layer, advanced by pos_incr2
-(def m-gn (ops-meta! 128 32 0 0 eps 0))
-(def m-qnorm (ops-meta! 256 16 512 0 eps 0)) (def m-knorm (ops-meta! 256 2 0 0 eps 0))
-(def m-addn (ops-meta! 2048 1 0 0 eps 0)) (def m-router (ops-meta! 2048 256 0 0 0 0)) (def m-topk (ops-meta! 256 1 8 0 0 1.0))
+(def m-gn (ops-meta! GDN-D GDN-H 0 0 eps 0))
+(def m-qnorm (ops-meta! HD NH (* 2 HD) 0 eps 0)) (def m-knorm (ops-meta! HD NKV 0 0 eps 0))
+(def m-addn (ops-meta! NE 1 0 0 eps 0)) (def m-router (ops-meta! NE 256 0 0 0 0)) (def m-topk (ops-meta! 256 1 8 0 0 1.0))
 (def m-shlogit (ops-meta! 2048 1 0 0 0 0)) (def m-wsum (ops-meta! 2048 1 8 0 0 0))
 (def w-out-norm (map-tensor! "output_norm.weight"))
 (def w-lm (if (get tensors "output.weight") (map-tensor! "output.weight") w-embd))   ;; tied lm_head (Llama-3.2): the embedding rows are the logits' weights (iteration 59)
@@ -421,16 +478,16 @@
 ;; emit the quant dispatch for activation x (n values) into its pair; returns the pair
 (defn quant! [x n pair] (dispatch! quant (quot (+ (quot n 32) 255) 256) 1 1 (q-metas n) x zeros16 zeros16 (second pair) zeros16 (first pair)) pair)
 ;; per-token metas: rope position, attention T, cache row, embedding source slot
-(def m-embedP (vec (for [p (range (count prompt))] (let [m (alloc! 16)] (write! m (str (le32 2048) (le32 p) (le32 0) (le32 0))) m))))   ;; slot p of prompt-ids (forced token)
+(def m-embedP (vec (for [p (range (count prompt))] (let [m (alloc! 16)] (write! m (str (le32 NE) (le32 p) (le32 0) (le32 0))) m))))   ;; slot p of prompt-ids (forced token)
 (def m-embed1 (let [m (alloc! 16)] (write! m (str (le32 NE) (le32 NPARTS) (le32 0) (le32 0))) m))    ;; slot 61 of amax-ids = the argmax
-(def m-ropeq (vec (for [pos (range ntok)] (ops-meta! 256 16 nrot pos 0 rope-base))))
-(def m-ropek (vec (for [pos (range ntok)] (ops-meta! 256 2 nrot pos 0 rope-base))))
-(def m-attn (vec (for [pos (range ntok)] (ops-meta! 256 16 (inc pos) 2 -1.0 (/ 1.0 16.0)))))
-(def m-copy (vec (for [pos (range ntok)] (ops-meta! (* 512 PF) 1 0 (* pos 512) 0 0))))   ;; prefill: P consecutive rows, one contiguous copy
+(def m-ropeq (vec (for [pos (range ntok)] (ops-meta! HD NH nrot pos 0 rope-base))))
+(def m-ropek (vec (for [pos (range ntok)] (ops-meta! HD NKV nrot pos 0 rope-base))))
+(def m-attn (vec (for [pos (range ntok)] (ops-meta! HD NH (inc pos) NKV -1.0 (/ 1.0 (js/Math.sqrt HD))))))
+(def m-copy (vec (for [pos (range ntok)] (ops-meta! (* KVROW PF) 1 0 (* pos KVROW) 0 0))))   ;; prefill: P consecutive rows, one contiguous copy
 ;; stream mode: one meta per kind, position read from posbuf on the device
 (def posbuf (alloc! 16))
-(def m-ropeq-dyn (ops-meta-dyn! 256 16 nrot 0 0 rope-base)) (def m-ropek-dyn (ops-meta-dyn! 256 2 nrot 0 0 rope-base))
-(def m-attn-dyn (ops-meta-dyn! 256 16 0 2 -1.0 (/ 1.0 16.0)))
+(def m-ropeq-dyn (ops-meta-dyn! HD NH nrot 0 0 rope-base)) (def m-ropek-dyn (ops-meta-dyn! HD NKV nrot 0 0 rope-base))
+(def m-attn-dyn (ops-meta-dyn! HD NH 0 NKV -1.0 (/ 1.0 (js/Math.sqrt HD))))
 (defn ops-meta8! [n rows aux aux2 eps scale p0 p1] (let [m (alloc! 32)] (write! m (str (le32 n) (le32 rows) (le32 aux) (le32 aux2) (lef32 eps) (lef32 scale) (lef32 p0) (lef32 p1))) m))
 ;; dense decoder metas: rope over HD with NH / NKV rows per token, attention without the output gate (p0 = 1), norms over NE
 (def m-dnorm (when dense? (ops-meta! NE 1 0 0 eps 0)))   ;; rows = PF is folded into the dispatch (rmsnorm is one workgroup per row)
@@ -472,16 +529,21 @@
 ;; resident sampling: the sampler meta whose eps / scale / p0 (T, top_p, seed) the params op rewrites from each message
 (def m-sample-dyn (when replay? (let [m (alloc! 32)] (write! m (str (le32 NV) (le32 1) (le32 NPARTS) (le32 4096) (lef32 1.0) (lef32 1.0) (le32 0) (lef32 1))) m)))
 (def m-params (when replay? (ops-meta! 3 1 0 0 0 0)))
-(def rec-keys [:norm :post :router :shgate-inp :gate-exps :up-exps :down-exps :gate-sh :up-sh :down-sh :qkv :gate :alpha :beta :dt :a :conv :ssm-norm :out])
-(def att-keys [:norm :post :router :shgate-inp :gate-exps :up-exps :down-exps :gate-sh :up-sh :down-sh :q :k :v :qn :kn :o])
+(def rec-keys (if bonsai?
+                [:norm :post :qkv :gate :alpha :beta :dt :a :conv :ssm-norm :out :fgate :fup :fdown]
+                [:norm :post :router :shgate-inp :gate-exps :up-exps :down-exps :gate-sh :up-sh :down-sh :qkv :gate :alpha :beta :dt :a :conv :ssm-norm :out]))
+(def att-keys (if bonsai?
+                [:norm :post :q :k :v :qn :kn :o :fgate :fup :fdown]
+                [:norm :post :router :shgate-inp :gate-exps :up-exps :down-exps :gate-sh :up-sh :down-sh :q :k :v :qn :kn :o]))
 (def dense-keys [:norm :q :qb :k :kb :v :vb :o :fnorm :gate :up :down])   ;; 12 handles per dense layer (qwen2: biases present; llama: none -> zeros16 stands in)
 (def dense-name {:norm "attn_norm.weight" :q "attn_q.weight" :qb "attn_q.bias" :k "attn_k.weight" :kb "attn_k.bias" :v "attn_v.weight" :vb "attn_v.bias"
                  :o "attn_output.weight" :fnorm "ffn_norm.weight" :gate "ffn_gate.weight" :up "ffn_up.weight" :down "ffn_down.weight"})
-(def WSTRIDE (if dense? 12 19))
+(def WSTRIDE (cond dense? 12 bonsai? 14 :else 19))
 (def tensor-name {:norm "attn_norm.weight" :post "post_attention_norm.weight" :router "ffn_gate_inp.weight" :shgate-inp "ffn_gate_inp_shexp.weight"
                   :gate-exps "ffn_gate_exps.weight" :up-exps "ffn_up_exps.weight" :down-exps "ffn_down_exps.weight" :gate-sh "ffn_gate_shexp.weight" :up-sh "ffn_up_shexp.weight" :down-sh "ffn_down_shexp.weight"
                   :qkv "attn_qkv.weight" :gate "attn_gate.weight" :alpha "ssm_alpha.weight" :beta "ssm_beta.weight" :dt "ssm_dt.bias" :a "ssm_a" :conv "ssm_conv1d.weight" :ssm-norm "ssm_norm.weight" :out "ssm_out.weight"
-                  :q "attn_q.weight" :k "attn_k.weight" :v "attn_v.weight" :qn "attn_q_norm.weight" :kn "attn_k_norm.weight" :o "attn_output.weight"})
+                  :q "attn_q.weight" :k "attn_k.weight" :v "attn_v.weight" :qn "attn_q_norm.weight" :kn "attn_k_norm.weight" :o "attn_output.weight"
+                  :fgate "ffn_gate.weight" :fup "ffn_up.weight" :fdown "ffn_down.weight"})
 (defn layer-weights! [il]
   ;; MAP in rec-keys / att-keys order -- a map LITERAL with more than 8 entries is
   ;; evaluated in hash order under nbb (the MAP lines came out scrambled, iteration
@@ -493,7 +555,7 @@
              :types (dense-layer-types il)))   ;; literal layers pick their kdot metas by their own types (tick 57)
     (let [p (str "blk." il ".") rec? (= 1 (recurrent il)) keys (if rec? rec-keys att-keys)
           w (into {} (mapv (fn [k] [k (map-tensor! (str p (tensor-name k)))]) keys))]
-      (when (and fn-mode? (not rec?)) (dotimes [_ 3] (alloc! 16)))   ;; pad to 19 handles per layer
+      (when (and fn-mode? (not rec?)) (dotimes [_ 3] (alloc! 16)))   ;; attention has three fewer handles than recurrent
       w)))
 (def layer-w (if stream? nil (vec (for [il (range layers)] (layer-weights! il)))))
 ;; --- T tokens, one command buffer each; the answer is per-token "ns|x hex|argmax hex" joined by "#" ---
@@ -533,6 +595,7 @@
     (do
         (when (and prefill? sb fn-mode? (not batch?)) (dispatch! (op* "pos_seed") 1 1 1 m-incr pb zeros16 zeros16 zeros16 zeros16 sb))   ;; stepbuf = [base position, row 0(, seq)]
         (dispatch! (ops "rmsnorm") PF 1 1 m-norm xin (:norm w) zeros16 h zeros16 zeros16)
+        (when bonsai? (hdispatch! m-h-ne-fwd NE h hrot))
         (if (= 1 (recurrent il))
           (do
             (if i8-wide
@@ -540,10 +603,10 @@
                 (dispatch! i8-wide (wg-of (:wide-i8 layouts) 8192) PF 1 m-qkv (:qkv w) xq qkv zerosP xs)
                 (dispatchc! i8-wide (wg-of (:wide-i8 layouts) 4096) PF 1 m-gate (:gate w) xq z zerosP xs))
               (do
-                (pkdot! kdot-wide (:wide layouts) 8192 m-qkv (:qkv w) h qkv zerosP)
-                (pkdotc! kdot-wide (:wide layouts) 4096 m-gate (:gate w) h z zerosP)))
-            (pkdotc! kdot-narrow (:narrow layouts) 32 m-ab (:alpha w) h alpha zerosP)
-            (pkdotc! kdot-narrow (:narrow layouts) 32 m-ab (:beta w) h betaL zerosP)
+                (pkdot! kdot-wide (:wide layouts) GDN-QKV m-qkv (:qkv w) (if bonsai? hrot h) qkv zerosP)
+                (pkdotc! kdot-wide (:wide layouts) GDN-Z m-gate (:gate w) (if bonsai? hrot h) z zerosP)))
+            (pkdotc! kdot-narrow (:narrow layouts) GDN-H m-ab (:alpha w) h alpha zerosP)
+            (pkdotc! kdot-narrow (:narrow layouts) GDN-H m-ab (:beta w) h betaL zerosP)
             (if fused?
               (cond
                 batch? (dispatch! deltanet-fused-b 32 PF 1 m-fused qkv (:conv w) ring alpha betaL (:dt w) (:a w) S (:ssm-norm w) z gnorm pb)   ;; C-4: one dispatch, row = sequence, pb = rowpos
@@ -552,7 +615,7 @@
                   (dotimes [_ PF]
                     (dispatch! (if bp? deltanet-fused-bp deltanet-fused) 32 1 1 m-fused qkv (:conv w) ring alpha betaL (:dt w) (:a w) S (:ssm-norm w) z gnorm sb)
                     (dispatch! (ops "pos_incr2") 1 1 1 m-incr zeros16 zeros16 zeros16 zeros16 zeros16 sb)))
-                :else (dispatch! deltanet-fused 32 1 1 m-fused qkv (:conv w) ring alpha betaL (:dt w) (:a w) S (:ssm-norm w) z gnorm pb))
+                :else (dispatch! deltanet-fused GDN-H 1 1 m-fused qkv (:conv w) ring alpha betaL (:dt w) (:a w) S (:ssm-norm w) z gnorm pb))
               (do
                 (dispatch! (ops "gate_decay2") 1 1 1 m-gd alpha (:dt w) (:a w) gb betaL zeros16)
                 (dispatchc! (ops "gate_decay2") 1 1 1 m-gd0 alpha (:dt w) (:a w) beta-only betaL zeros16)
@@ -561,25 +624,35 @@
                 (dispatchc! (ops "l2norm") 16 1 1 m-l2k conv zeros16 zeros16 kn zeros16 zeros16)
                 (dispatch! deltanet 32 1 1 m-dn qn kn conv gb beta-only S dn)
                 (dispatch! (ops "gated_rmsnorm") 32 1 1 m-gn dn (:ssm-norm w) z gnorm zeros16 zeros16)))
-            (pkdot! kdot-out out-spv 2048 m-out (:out w) gnorm attn-out zerosP))
+            (when bonsai? (hdispatch! m-h-gdn GDN-Z gnorm hrot))
+            (pkdot! kdot-out out-spv NE m-out (:out w) (if bonsai? hrot gnorm) attn-out zerosP))
           (do
             (if i8-wide
               (let [[xq xs] (quant! h (* PF 2048) h-i8)] (dispatch! i8-wide (wg-of (:wide-i8 layouts) 8192) PF 1 m-q (:q w) xq qfull zerosP xs))
-              (pkdot! kdot-wide (:wide layouts) 8192 m-q (:q w) h qfull zerosP))
-            (pkdotc! kdot-narrow (:narrow layouts) 512 m-k (:k w) h kproj zerosP)
-            (pkdotc! kdot-narrow (:narrow layouts) 512 m-v (:v w) h vproj zerosP)
-            (dispatch! (ops "rmsnorm") (* 16 PF) 1 1 m-qnorm qfull (:qn w) zeros16 qnorm zeros16 zeros16)
-            (dispatchc! (ops "rmsnorm") (* 2 PF) 1 1 m-knorm kproj (:kn w) zeros16 knorm zeros16 zeros16)
-            (dispatch! (op* "rope_neox") (* 16 PF) 1 1 mrq qnorm zeros16 zeros16 qrope zeros16 pb)
-            (dispatchc! (op* "rope_neox") (* 2 PF) 1 1 mrk knorm zeros16 zeros16 krope zeros16 pb)
+              (pkdot! kdot-wide (:wide layouts) ATTN-Q m-q (:q w) (if bonsai? hrot h) qfull zerosP))
+            (pkdotc! kdot-narrow (:narrow layouts) KVROW m-k (:k w) (if bonsai? hrot h) kproj zerosP)
+            (pkdotc! kdot-narrow (:narrow layouts) KVROW m-v (:v w) (if bonsai? hrot h) vproj zerosP)
+            (dispatch! (ops "rmsnorm") (* NH PF) 1 1 m-qnorm qfull (:qn w) zeros16 qnorm zeros16 zeros16)
+            (dispatchc! (ops "rmsnorm") (* NKV PF) 1 1 m-knorm kproj (:kn w) zeros16 knorm zeros16 zeros16)
+            (dispatch! (op* "rope_neox") (* NH PF) 1 1 mrq qnorm zeros16 zeros16 qrope zeros16 pb)
+            (dispatchc! (op* "rope_neox") (* NKV PF) 1 1 mrk knorm zeros16 zeros16 krope zeros16 pb)
             (if batch?
-              (do (dispatchc! (op* "copy_at") 2 PF 1 mcopy vproj zeros16 zeros16 vc zeros16 pb)   ;; C-4: (2, B): row's 512 into its cache slice at its position
-                  (dispatch! (op* "copy_at") 2 PF 1 mcopy krope zeros16 zeros16 kc zeros16 pb))
-              (do (dispatchc! (op* "copy_at") (* 2 PF) 1 1 mcopy vproj zeros16 zeros16 vc zeros16 pb)
-                  (dispatch! (op* "copy_at") (* 2 PF) 1 1 mcopy krope zeros16 zeros16 kc zeros16 pb)))
-            (dispatch! (op* "attn_decode") 16 PF 1 mattn qrope kc vc attno qfull pb)
-            (pkdot! kdot-out out-spv 2048 m-attn-o (:o w) attno attn-out zerosP)))
+              (do (dispatchc! (op* "copy_at") (quot (+ KVROW 255) 256) PF 1 mcopy vproj zeros16 zeros16 vc zeros16 pb)
+                  (dispatch! (op* "copy_at") (quot (+ KVROW 255) 256) PF 1 mcopy krope zeros16 zeros16 kc zeros16 pb))
+              (do (dispatchc! (op* "copy_at") (* (quot (+ KVROW 255) 256) PF) 1 1 mcopy vproj zeros16 zeros16 vc zeros16 pb)
+                  (dispatch! (op* "copy_at") (* (quot (+ KVROW 255) 256) PF) 1 1 mcopy krope zeros16 zeros16 kc zeros16 pb)))
+            (dispatch! (op* "attn_decode") NH PF 1 mattn qrope kc vc attno qfull pb)
+            (when bonsai? (hdispatch! m-h-attn ATTN-O attno hrot))
+            (pkdot! kdot-out out-spv NE m-attn-o (:o w) (if bonsai? hrot attno) attn-out zerosP)))
         (dispatch! (ops "add_rmsnorm") PF 1 1 m-addn xin attn-out (:post w) resid h2 zeros16)
+        (if bonsai?
+          (do
+            (hdispatch! m-h-ne-fwd NE h2 hrot)
+            (dispatch! kdot-dense-dual NFF PF 1 m-bdual (:fgate w) (:fup w) hrot dact zerosP)
+            (hdispatch! m-h-ffn NFF dact hrot)
+            (pkdot! kdot-out out-spv NE m-bdown (:fdown w) hrot ffn zerosP)
+            (dispatch! (ops "add") (quot (+ (* PF NE) 255) 256) 1 1 m-add resid ffn zeros16 xout zeros16 zeros16))
+          (do
         ;; barrier groups (DISPATCHC = independent of everything since the last DISPATCH)
         (dispatch! (ops "f32_matvec") 256 PF 1 m-router (:router w) h2 zeros16 router zeros16 zeros16)
         (pkdotc! kdot-narrow (:narrow layouts) 512 m-gate-sh (:gate-sh w) h2 sg zerosP)
@@ -604,27 +677,29 @@
           (let [[xq xs] (quant! actE (* PF 4096) actE-i8)] (dispatch! i8-expert (wg-of (:expert-i8 layouts) 2048) (* 8 PF) 1 m-down-exps (:down-exps w) xq downE ids xs))
           (dispatch! kdot-expert (wg-of expert-spv 2048) (* 8 PF) 1 m-down-exps (:down-exps w) actE downE ids))
         (dispatch! (ops "weighted_sum") 8 PF 1 m-wsum downE topw shdown ffn shlogit zeros16)
-        (dispatch! (ops "add") (* 8 PF) 1 1 m-add resid ffn zeros16 xout zeros16 zeros16))))
+        (dispatch! (ops "add") (* 8 PF) 1 1 m-add resid ffn zeros16 xout zeros16 zeros16))))))
 
 ;; the token's tail: final norm, lm_head, argmax, SUBMIT (bound) and the read-backs
 (defn emit-lm-head! [pos]
   (let [x-final (if (odd? (dec layers)) xb xa)]
     (dispatch! (ops "rmsnorm") PF 1 1 (if dense? m-dnorm m-norm) x-final w-out-norm zeros16 hN zeros16 zeros16)   ;; dense: rows of NE (iteration 59: with n = 2048 the norm of a 896-wide row diluted the rms by sqrt(2048/896) -- argmax-invariant, distribution-wrong, and rows >= 1 read the wrong offset)
+    (when bonsai? (hdispatch! m-h-ne-fwd NE hN hrot))
     (if i8-lm
       (let [[xq xs] (quant! hN (* PF 2048) hN-i8)] (dispatch! i8-lm (wg-of (:lm-i8 layouts) NV) 1 1 m-lm w-lm xq logits zeros16 xs))
-      (dispatch! kdot-lm (wg-of (:lm layouts) NV) 1 1 m-lm w-lm hN logits zeros16))
+      (dispatch! kdot-lm (wg-of (:lm layouts) NV) 1 1 m-lm w-lm (if bonsai? hrot hN) logits zeros16))
     (dispatch! (ops "argmax_partial") NPARTS 1 1 m-am1 logits zeros16 zeros16 zeros16 amax-s amax-ids)
     (dispatch! (ops "argmax_final") 1 1 1 m-am2 amax-s zeros16 zeros16 amax-s amax-s amax-ids)
     ;; SUBMIT and the read-backs are bound so their answers survive to the end
     (let [ns (fresh "ns") xr (fresh "xr") idr (fresh "idr") lg (fresh "lg") last? (= pos (dec ntok))]
-      (swap! ans-binds conj (cond-> [[ns (q "SUBMIT")] [xr (q (str "READ " x-final " 0 " (* PF 8192)))] [idr (q (str "READ " amax-ids " " PICK-OFF " 4"))]]
+      (swap! ans-binds conj (cond-> [[ns (q "SUBMIT")] [xr (q (str "READ " x-final " 0 " (* PF 4 NE)))] [idr (q (str "READ " amax-ids " " PICK-OFF " 4"))]]
                               (and stream? last?) (conj [lg (q (str "READ " logits " 0 " (* NV 4)))])))
       (swap! token-answers conj (if (and stream? last?) (cat ns (q "|") xr (q "|") idr (q "|") lg) (cat ns (q "|") xr (q "|") idr))))))
 (when flat?
   (doseq [pos (range ntok)]
     (write! posbuf (le32 pos))   ;; the fused delta-net step reads the position's parity for its conv ring slot
     (step! (q "BEGIN"))
-    (dispatch! embed 1 PF 1 (if (< pos (count prompt)) (m-embedP pos) m-embed1) w-embd (if (< pos (count prompt)) prompt-ids amax-ids) x zeros16)
+    (dispatch! embed 1 PF 1 (if (< pos (count prompt)) (m-embedP pos) m-embed1) w-embd (if (< pos (count prompt)) prompt-ids amax-ids) (if bonsai? embed-raw x) zeros16)
+    (when bonsai? (hdispatch! m-h-ne-inv NE embed-raw x))
     (let [rec-index (atom 0) att-index (atom 0)]
       (doseq [il (range layers)]
         (let [w (layer-w il) xin (if (zero? il) x (if (odd? il) xa xb)) xout (if (odd? il) xb xa)
@@ -673,7 +748,8 @@
   (doseq [pos (range ntok)]
     (write! posbuf (le32 pos))
     (step! (q "BEGIN"))
-    (dispatch! embed 1 1 1 (if (< pos (count prompt)) (m-embedP pos) m-embed1) w-embd (if (< pos (count prompt)) prompt-ids amax-ids) x zeros16)
+    (dispatch! embed 1 1 1 (if (< pos (count prompt)) (m-embedP pos) m-embed1) w-embd (if (< pos (count prompt)) prompt-ids amax-ids) (if bonsai? embed-raw x) zeros16)
+    (when bonsai? (hdispatch! m-h-ne-inv NE embed-raw x))
     (step! (q "SUBMIT"))
     (doseq [il (range layers)] (step! (str "(layer-" il " \"MAP " wpath "\")")))
     (step! (q "BEGIN"))
@@ -705,8 +781,8 @@
     (str "(defn layers" sfx " [il :i64 n :i64] :i64\n"
          "  (if (< il n)\n"
          "    (do (if (= 3 (bit-and il 3))\n"
-         "          (attention-layer" sfx " (+ " W0 " (* il 19)) (xin-of il) (xout-of il) (+ " K0 " (quot il 4)) (+ " V0 " (quot il 4)))\n"
-         "          (recurrent-layer" sfx " (+ " W0 " (* il 19)) (xin-of il) (xout-of il) (+ " R0 " (- il (quot il 4))) (+ " S0 " (- il (quot il 4)))))\n"
+         "          (attention-layer" sfx " (+ " W0 " (* il " WSTRIDE ")) (xin-of il) (xout-of il) (+ " K0 " (quot il 4)) (+ " V0 " (quot il 4)))\n"
+         "          (recurrent-layer" sfx " (+ " W0 " (* il " WSTRIDE ")) (xin-of il) (xout-of il) (+ " R0 " (- il (quot il 4))) (+ " S0 " (- il (quot il 4)))))\n"
          "        (layers" sfx " (+ il 1) n))\n"
          "    il))\n")))
 (def xinout-src (when fn-mode? (str
@@ -735,9 +811,11 @@
     (cond
       batch? (dispatch! embed-b 1 PF 1 m-embed-b w-embd tokbuf x rowpos)
       bp? (dispatch! embed-bp 1 PF 1 m-embed-b w-embd tokbuf x rowsel)
-      :else (dispatch! embed 1 PF 1 m-embed-dyn w-embd tokbuf x posbuf))
+      :else (dispatch! embed 1 PF 1 m-embed-dyn w-embd tokbuf (if bonsai? embed-raw x) posbuf))
+    (when bonsai? (hdispatch! m-h-ne-inv NE embed-raw x))
     (step! (str "(" layers-name " 0 " layers ")"))
     (dispatch! (ops "rmsnorm") PF 1 1 (if dense? m-dnorm m-norm) x-final w-out-norm zeros16 hN zeros16 zeros16)   ;; dense: rows of NE (iteration 59: with n = 2048 the norm of a 896-wide row diluted the rms by sqrt(2048/896) -- argmax-invariant, distribution-wrong, and rows >= 1 read the wrong offset)
+    (when bonsai? (hdispatch! m-h-ne-fwd NE hN hrot))
     (if (and i8-lm (not (and batch? (:lm-once layouts))))   ;; :lm-once wins over int8 in the batch step (tick 55)
       (let [[xq xs] (quant! hN (* PF 2048) hN-i8)] (dispatch! i8-lm (wg-of (:lm-i8 layouts) NV) (if batch? PF 1) 1 m-lm w-lm xq logits zerosP xs))   ;; batch: B rows of int8 logits
       (cond
@@ -745,7 +823,7 @@
         ;; nvgpu: bandwidth / issue bound on it); anv's x8r4 with the positions dispatch beats the f32 kernel even read B times
         (and batch? (:lm-once layouts)) (dispatch! kdot-p (pwg NV) 1 1 m-lm w-lm hN logits zerosP)
         batch? (dispatch! kdot-lm (wg-of (:lm layouts) NV) PF 1 m-lm w-lm hN logits zerosP)
-        :else (dispatch! kdot-lm (wg-of (:lm layouts) NV) 1 1 m-lm w-lm hN logits zeros16)))
+        :else (dispatch! kdot-lm (wg-of (:lm layouts) NV) 1 1 m-lm w-lm (if bonsai? hrot hN) logits zeros16)))
     (if (or sampling sampled?)
       ;; multi-workgroup sampler (iteration 19): 61-workgroup passes, 30 bisection rounds on tau, one final pass
       (let [h [(if sampled? m-sample-dyn m-sample) logits tokbuf posbuf sample-o sample-s amax-ids]]
@@ -791,7 +869,8 @@
 (def debug-bufs (when-let [e (aget js/process.env "NEX_DEBUG_BUFS")]
                   (let [table {"h" [h (* 4 NE)] "dq" [dq (* 4 NH HD)] "dk" [dk (* 4 KVROW)] "dv" [dv (* 4 KVROW)] "dqr" [dqr (* 4 NH HD)] "dkr" [dkr (* 4 KVROW)]
                                "dattn" [dattn (* 4 NH HD)] "attn-out" [attn-out (* 4 NE)] "resid" [resid (* 4 NE)] "h2" [h2 (* 4 NE)] "dg" [dg (* 4 NFF)] "du" [du (* 4 NFF)]
-                               "dact" [dact (* 4 NFF)] "ffn" [ffn (* 4 NE)] "hN" [hN (* 4 NE)] "logits" [logits (* 4 NV)] "x" [x (* 4 NE)]}]
+                               "dact" [dact (* 4 NFF)] "ffn" [ffn (* 4 NE)] "hN" [hN (* 4 NE)] "logits" [logits (* 4 NV)] "x" [x (* 4 NE)]
+                               "embed-raw" [embed-raw (* 4 NE)]}]
                     (vec (for [nm (str/split e #",") :let [[hnd bytes] (table nm)] :when hnd] [nm hnd bytes])))))
 (def fn-token-src (when fn-mode?
   (step-lines! m-incr "layers")
@@ -800,7 +879,7 @@
          "(defn token-step [pos :i64 n :i64 acc :string] :string\n"
          "  (if (< pos n)\n    (do\n"
          (str/join "\n" (map #(if (str/starts-with? % "(layers") (str "      " %) (str "      (gpu " % ")")) @lines)) "\n"
-         "      (let [ns (gpu \"SUBMIT\")\n            xr (gpu \"READ " x-final " 0 " (* PF 8192) "\")\n            idr (gpu \"READ " amax-ids " " PICK-OFF " 4\")"
+         "      (let [ns (gpu \"SUBMIT\")\n            xr (gpu \"READ " x-final " 0 " (* PF 4 NE) "\")\n            idr (gpu \"READ " amax-ids " " PICK-OFF " 4\")"
          ;; NEX_DEBUG_BUFS=h,dq,... (iteration 59): extra READs of named dense buffers appended as |name=hex to each token's answer
          (apply str (for [[nm hnd bytes] debug-bufs] (str "\n            " nm " (gpu \"READ " hnd " 0 " bytes "\")")))
          "]\n"

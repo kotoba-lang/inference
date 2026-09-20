@@ -1939,3 +1939,35 @@ byte-identical and the dense nvgpu guest is byte-identical to the `nvgpu-exact` 
 Qwen B=1, all oracle-exact in distribution too: B70 4.28 / K16 16.0 / Xavier 14.8 ms/token. Not done: the same distribution
 check for the anv int8 path on B70 (its lm_head is f32 x8r4 for dense, so the logits are exact by construction — the
 activation quantisation sits in Nex's `:wide-i8` class, unused by the dense recipe), SentencePiece, gemma / mistral.
+
+## Iteration 66 (2026-09-20): Ternary Bonsai 2 27B PTQ1_0 native E2E on B70
+
+The 64-layer `qwen35` path now reads the hybrid dimensions and Prism Hadamard contract from GGUF, maps PTQ1_0 folded
+weights directly, applies signed normalized 1024-wide transforms around embeddings and every folded projection, runs the
+48 recurrent plus 16 full-attention blocks, and serves the resident-replay guest through the OpenAI-compatible HTTP shell.
+The correctness defect found by the first full run was in the GGUF reader: `prism.hadamard.sign_values` is an `INT32`
+array, but type 5 was read as unsigned, turning −1 into 4294967296. Fixing signed metadata restored finite activations.
+
+Reference = Prism llama.cpp `prism-b10709-9a9394a`; model =
+`Ternary-Bonsai-2-27B-PTQ1_0.gguf` sha256 `53107f53…`; target = B70 / Intel BMG G31, Mesa 25.2.8 Vulkan ANV. Raw greedy
+`Hello` produces **8/8 identical** token ids `11, 353, 2688, 264, 5286, 303, 279, 3694`
+(`", I'm a student in the University"`) in both engines. The tokenizer is **18/18** corpus lines equal to
+llama-server `/tokenize`; Qwen3.5's template (including its default xhigh system instruction) is **3/3** message shapes
+byte-equal to `/apply-template`. A warm chat E2E, “What is the capital of France? Answer in one word.”, runs 64 prompt +
+36 completion tokens in **12.609 s**, answers **Paris**, and stops at the EOG token; GPU time is **125.223 ms/step**.
+
+HTTP concurrency used identical `Hello`, 8-token greedy requests after warmup:
+
+| concurrent requests | total completion tokens | wall s | aggregate completion tok/s | p50 / max latency s |
+|---:|---:|---:|---:|---:|
+| 1 | 8 | 1.0623 | 7.5308 | 1.0614 / 1.0614 |
+| 2 | 16 | 2.0098 | 7.9610 | 1.5073 / 2.0092 |
+| 4 | 32 | 4.0195 | 7.9612 | 2.5124 / 4.0186 |
+| 8 | 64 | 8.0362 | **7.9639** | 4.5209 / 8.0347 |
+
+The HTTP surface accepts concurrency, but this Bonsai guest has `batch-rows = 0`: requests queue behind one sequence and
+one token is aggregated per replay. Throughput therefore saturates near 8 tok/s and tail latency grows linearly. The next
+throughput lever is qwen35 batched decode and transformed prefill; neither is claimed here. The deployed local surface is
+`murakumo-b70-bonsai-native.service` on `127.0.0.1:8092`, model id
+`prism-ml/Ternary-Bonsai-2-27B-PTQ1_0`. Full machine-readable evidence and the unmeasured boundaries are in
+`verify/evidence/ternary-bonsai-ptq1-native-e2e-20260920.json`.
