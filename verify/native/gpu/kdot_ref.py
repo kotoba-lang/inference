@@ -1,7 +1,7 @@
 # CPU dequant oracle for the :gpu/compute K-quant dot guests (verify/native/gpu). Python because it is a
 # TEST ORACLE beside numpy, not operations tooling (CLAUDE.md kbb-first is for tooling); a .cljk twin is debt.
 # GGUF tensor directory + CPU dequant reference for the native kdot types,
-# including Prism PQ2_0/PTQ1_0 and Qwen3.5 BF16 projections.
+# including Prism PQ2_0/PTQ1_0 and Qwen3.8 BF16 projections.
 # Prints "name type offset(bytes, absolute in file) dims" and writes a reference dot.
 import struct, sys, numpy as np, json
 def read_gguf_dir(path):
