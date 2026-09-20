@@ -289,7 +289,7 @@
 (def deltanet (pipeline! "deltanet_step.spv" 8))
 (def deltanet-fused (when fused? (pipeline! "deltanet_fused.spv" 13)))
 (def EMB (:type (get tensors "token_embd.weight")))   ;; 23 IQ4_XS (Nex), 8 Q8_0 (Qwen2.5), or 143 PTQ1_0 (Prism Bonsai)
-(def embed-spv (case EMB 23 "embed_iq4xs" 8 "embed_q8" 143 "embed_ptq1" (do (println "REFUSE token_embd.weight type" EMB "-- embed kernels: 23 IQ4_XS, 8 Q8_0, 143 PTQ1_0") (js/process.exit 2))))
+(def embed-spv (case EMB 23 "embed_iq4xs" 8 "embed_q8" 2 "embed_q40" 3 "embed_q41" 6 "embed_q50" 7 "embed_q51" 143 "embed_ptq1" (do (println "REFUSE token_embd.weight type" EMB "-- embed kernels: 23 IQ4_XS, 8 Q8_0, 2/3/6/7 Q4_0/Q4_1/Q5_0/Q5_1 (embed_iq4xs.comp -DB32=<type>, tick 57), 143 PTQ1_0") (js/process.exit 2))))
 (def embed (pipeline! (str embed-spv ".spv") 5))
 (def deltanet-fused-b (when BB (pipeline! "deltanet_fused_b.spv" 13)))
 (def embed-b (when BB (pipeline! (str embed-spv "_b.spv") 5)))
@@ -324,9 +324,24 @@
 ;; the metas that depend on the batch (PF) or on the prefill form are made per PHASE: decode (pf 1) and, with
 ;; prefill:<P>, prefill (pf P). `with-phase` rebinds PF / prefill? / the metas / kdot-p around an emission.
 (def ^:dynamic prefill? prefill?)
+;; tick 57: a dense layer's kdot metas carry the TENSOR TYPE, and a Q4_K_M file mixes types per layer (Qwen2.5-0.5B: attn_v Q8_0 in
+;; layers 0-1 and Q5_0 after, ffn_down Q6_K / Q4_K) -- reading layer 0's types for every layer produced NaN from layer 2 on.
+;; One meta buffer per [phase shape [pf ipe], role, distinct type]; a layer's type signature (index into dense-sigs) is passed to the
+;; shared layer function as `sig`, and a role whose type varies picks its meta with an (if (= sig k) ...) chain. Per-layer meta
+;; buffers would have cost 720 WRITE lines on a 24-layer adaptive guest (150 KB source, over the literal budget).
+(def phase-shapes (vec (distinct (concat [[PF-static (if prefill? 1 0)]] (when PB [[PB 1]]) (for [b (or BBs [])] [b 1])))))
+(defn shape-idx-of [pf ipe] (.indexOf phase-shapes [pf ipe]))
+(def dense-roles [[:q (* NH HD) NE "attn_q.weight"] [:k KVROW NE "attn_k.weight"] [:v KVROW NE "attn_v.weight"] [:o NE (* NH HD) "attn_output.weight"]
+                  [:gate NFF NE "ffn_gate.weight"] [:down NE NFF "ffn_down.weight"]])
+(defn dense-layer-types [il] (vec (for [[_ _ _ nm] dense-roles] (:type (T* (str "blk." il "." nm))))))
+(def dense-sigs (when dense? (vec (distinct (map dense-layer-types (range layers))))))   ;; distinct type signatures over the layers
+(def layer-sig (when dense? (vec (for [il (range layers)] (.indexOf dense-sigs (dense-layer-types il))))))
+(def dense-metas (when dense? (into {} (for [[si [pf ipe]] (map-indexed vector phase-shapes) [ri [role rows cols _]] (map-indexed vector dense-roles)
+                                            t (distinct (map #(nth % ri) dense-sigs))]
+                                        [[si role t] (kdot-meta! rows cols t pf ipe)]))))
 (defn phase-metas [pf pre? & [batch-phase?]]
   (let [ipe (if pre? 1 0)]
-    {:pf pf :pre? pre? :batch? (boolean batch-phase?)
+    {:pf pf :pre? pre? :batch? (boolean batch-phase?) :shape-idx (shape-idx-of pf ipe)
      :m-norm (ops-meta! 2048 pf 0 0 eps 0) :m-qkv (kdot-meta! 8192 2048 13 pf ipe) :m-gate (kdot-meta! 4096 2048 23 pf ipe)
      :m-ab (kdot-meta! 32 2048 23 pf ipe) :m-out (kdot-meta! 2048 4096 23 pf ipe)
      :m-q (kdot-meta! 8192 2048 23 pf ipe) :m-k (kdot-meta! 512 2048 23 pf ipe) :m-v (kdot-meta! 512 2048 13 pf ipe)
@@ -337,9 +352,6 @@
      :m-lm (if batch-phase? (kdot-meta! NV NE LMT pf 1 0 0) (kdot-meta! NV NE LMT 1 0 0 (dec pf)))   ;; prefill: the lm_head reads the last batch row (pad1); batch: every row
      :m-copy-dyn (ops-meta-dyn! (* KVROW pf) 1 0 KVROW 0 0)   ;; prefill: P consecutive rows in one copy
      ;; dense decoder (iteration 59): the block's kdots and elementwise ops, types from the tensors
-     :m-dq (when dense? (kdot-meta! (* NH HD) NE (:type (T* "blk.0.attn_q.weight")) pf ipe)) :m-dk (when dense? (kdot-meta! KVROW NE (:type (T* "blk.0.attn_k.weight")) pf ipe))
-     :m-dv (when dense? (kdot-meta! KVROW NE (:type (T* "blk.0.attn_v.weight")) pf ipe)) :m-do (when dense? (kdot-meta! NE (* NH HD) (:type (T* "blk.0.attn_output.weight")) pf ipe))
-     :m-dgate (when dense? (kdot-meta! NFF NE (:type (T* "blk.0.ffn_gate.weight")) pf ipe)) :m-ddown (when dense? (kdot-meta! NE NFF (:type (T* "blk.0.ffn_down.weight")) pf ipe))
      :m-dbq (when dense? (ops-meta! (* pf NH HD) 1 (* NH HD) 0 0 0)) :m-dbk (when dense? (ops-meta! (* pf KVROW) 1 KVROW 0 0 0))   ;; add_bias: n total, aux stride
      :m-dsilu (when dense? (ops-meta! (* pf NFF) 1 0 0 0 0)) :m-dadd (when dense? (ops-meta! (* pf NE) 1 0 0 0 0))
      :m-padd (when pre? (ops-meta! pf 1 0 0 0 0))   ;; pos_add: n = the batch
@@ -357,13 +369,24 @@
 (def ^:dynamic m-silu8 (:m-silu8 phase-decode)) (def ^:dynamic m-gate-sh (:m-gate-sh phase-decode)) (def ^:dynamic m-down-sh (:m-down-sh phase-decode))
 (def ^:dynamic m-silu-sh (:m-silu-sh phase-decode)) (def ^:dynamic m-add (:m-add phase-decode)) (def ^:dynamic m-lm (:m-lm phase-decode))
 (def ^:dynamic m-copy-dyn (:m-copy-dyn phase-decode)) (def ^:dynamic m-padd (:m-padd phase-decode)) (def ^:dynamic kdot-p (:kdot-p phase-decode))
-(def ^:dynamic m-dq (:m-dq phase-decode)) (def ^:dynamic m-dk (:m-dk phase-decode)) (def ^:dynamic m-dv (:m-dv phase-decode)) (def ^:dynamic m-do (:m-do phase-decode))
-(def ^:dynamic m-dgate (:m-dgate phase-decode)) (def ^:dynamic m-ddown (:m-ddown phase-decode)) (def ^:dynamic m-dbq (:m-dbq phase-decode)) (def ^:dynamic m-dbk (:m-dbk phase-decode))
+(def ^:dynamic shape-idx (:shape-idx phase-decode))   ;; which per-layer kdot-meta set the emission reads (tick 57)
+(def ^:dynamic m-dbq (:m-dbq phase-decode)) (def ^:dynamic m-dbk (:m-dbk phase-decode))
 (def ^:dynamic m-dsilu (:m-dsilu phase-decode)) (def ^:dynamic m-dadd (:m-dadd phase-decode))
 (def phase-vars {#'m-norm :m-norm #'m-qkv :m-qkv #'m-gate :m-gate #'m-ab :m-ab #'m-out :m-out #'m-q :m-q #'m-k :m-k #'m-v :m-v #'m-attn-o :m-attn-o
                  #'m-gate-exps :m-gate-exps #'m-down-exps :m-down-exps #'m-silu8 :m-silu8 #'m-gate-sh :m-gate-sh #'m-down-sh :m-down-sh
                  #'m-silu-sh :m-silu-sh #'m-add :m-add #'m-lm :m-lm #'m-copy-dyn :m-copy-dyn #'m-padd :m-padd #'kdot-p :kdot-p
-                 #'m-dq :m-dq #'m-dk :m-dk #'m-dv :m-dv #'m-do :m-do #'m-dgate :m-dgate #'m-ddown :m-ddown #'m-dbq :m-dbq #'m-dbk :m-dbk #'m-dsilu :m-dsilu #'m-dadd :m-dadd})
+                 #'shape-idx :shape-idx #'m-dbq :m-dbq #'m-dbk :m-dbk #'m-dsilu :m-dsilu #'m-dadd :m-dadd})
+(defn hexpr [e] (str "$(string-from-i64 " e ")"))
+(defn dense-meta
+  "The kdot meta handle for `role` in the current phase: literal when the layer is literal (w carries :types) or the role's type is
+   uniform across layers; otherwise an if-chain over the layer signature `sig` (fn mode)."
+  [w role]
+  (let [ri (.indexOf (mapv first dense-roles) role) types (distinct (map #(nth % ri) dense-sigs))]
+    (cond (:types w) (dense-metas [shape-idx role (nth (:types w) ri)])
+          (= 1 (count types)) (dense-metas [shape-idx role (first types)])
+          :else (hexpr (reduce (fn [acc k] (str "(if (= sig " k ") " (dense-metas [shape-idx role (nth (nth dense-sigs k) ri)]) " " acc ")"))
+                               (str (dense-metas [shape-idx role (nth (last dense-sigs) ri)]))
+                               (reverse (range (dec (count dense-sigs)))))))))
 (defn with-phase [ph f]
   (with-bindings (merge (into {} (map (fn [[v k]] [v (get ph k)]) phase-vars))
                         {#'PF (:pf ph) #'prefill? (:pre? ph) #'batch? (:batch? ph) #'bp? (boolean (:bp? ph))
@@ -461,7 +484,8 @@
   (if dense?
     (let [p (str "blk." il ".")]
       ;; a bias the model lacks (llama) is a 16-byte zero buffer so the handle arithmetic stays one stride
-      (into {} (mapv (fn [k] [k (if (and (contains? #{:qb :kb :vb} k) (not (get tensors (str p (dense-name k))))) (let [b (alloc! 16)] (zero! b) b) (map-tensor! (str p (dense-name k))))]) dense-keys)))
+      (assoc (into {} (mapv (fn [k] [k (if (and (contains? #{:qb :kb :vb} k) (not (get tensors (str p (dense-name k))))) (let [b (alloc! 16)] (zero! b) b) (map-tensor! (str p (dense-name k))))]) dense-keys))
+             :types (dense-layer-types il)))   ;; literal layers pick their kdot metas by their own types (tick 57)
     (let [p (str "blk." il ".") rec? (= 1 (recurrent il)) keys (if rec? rec-keys att-keys)
           w (into {} (mapv (fn [k] [k (map-tensor! (str p (tensor-name k)))]) keys))]
       (when (and fn-mode? (not rec?)) (dotimes [_ 3] (alloc! 16)))   ;; pad to 19 handles per layer
@@ -477,9 +501,9 @@
    -> o kdot -> residual + rmsnorm -> SwiGLU FFN -> residual. PF rows; the batch / prefill twins come through op* and the metas."
   [w xin xout kc vc pb]
   (dispatch! (ops "rmsnorm") PF 1 1 m-dnorm xin (:norm w) zeros16 h zeros16 zeros16)
-  (pkdot! kdot-wide (:wide layouts) (* NH HD) m-dq (:q w) h dq zerosP)
-  (pkdotc! kdot-narrow (:narrow layouts) KVROW m-dk (:k w) h dk zerosP)
-  (pkdotc! kdot-narrow (:narrow layouts) KVROW m-dv (:v w) h dv zerosP)
+  (pkdot! kdot-wide (:wide layouts) (* NH HD) (dense-meta w :q) (:q w) h dq zerosP)
+  (pkdotc! kdot-narrow (:narrow layouts) KVROW (dense-meta w :k) (:k w) h dk zerosP)
+  (pkdotc! kdot-narrow (:narrow layouts) KVROW (dense-meta w :v) (:v w) h dv zerosP)
   (dispatch! (ops "add_bias") (quot (+ (* PF NH HD) 255) 256) 1 1 m-dbq dq (:qb w) zeros16 dq zeros16 zeros16)
   (dispatchc! (ops "add_bias") (quot (+ (* PF KVROW) 255) 256) 1 1 m-dbk dk (:kb w) zeros16 dk zeros16 zeros16)
   (dispatchc! (ops "add_bias") (quot (+ (* PF KVROW) 255) 256) 1 1 m-dbk dv (:vb w) zeros16 dv zeros16 zeros16)
@@ -491,12 +515,12 @@
     (do (dispatchc! (op* "copy_at") (quot (+ (* KVROW PF) 255) 256) 1 1 m-copy-dyn dv zeros16 zeros16 vc zeros16 pb)
         (dispatch! (op* "copy_at") (quot (+ (* KVROW PF) 255) 256) 1 1 m-copy-dyn dkr zeros16 zeros16 kc zeros16 pb)))
   (dispatch! (op* "attn_decode") NH PF 1 m-dattn dqr kc vc dattn zeros16 pb)
-  (pkdot! kdot-out out-spv NE m-do (:o w) dattn attn-out zerosP)
+  (pkdot! kdot-out out-spv NE (dense-meta w :o) (:o w) dattn attn-out zerosP)
   (dispatch! (ops "add_rmsnorm") PF 1 1 m-daddn xin attn-out (:fnorm w) resid h2 zeros16)
-  (pkdot! kdot-wide (:wide layouts) NFF m-dgate (:gate w) h2 dg zerosP)
-  (pkdotc! kdot-wide (:wide layouts) NFF m-dgate (:up w) h2 du zerosP)
+  (pkdot! kdot-wide (:wide layouts) NFF (dense-meta w :gate) (:gate w) h2 dg zerosP)
+  (pkdotc! kdot-wide (:wide layouts) NFF (dense-meta w :gate) (:up w) h2 du zerosP)
   (dispatch! (ops "silu_mul") (quot (+ (* PF NFF) 255) 256) 1 1 m-dsilu dg du zeros16 dact zeros16 zeros16)
-  (pkdot! kdot-out out-spv NE m-ddown (:down w) dact ffn zerosP)
+  (pkdot! kdot-out out-spv NE (dense-meta w :down) (:down w) dact ffn zerosP)
   (dispatch! (ops "add") (quot (+ (* PF NE) 255) 256) 1 1 m-dadd resid ffn zeros16 xout zeros16 zeros16))
 (defn emit-layer! [il w xin xout ring S kc vc mrq mrk mattn mcopy pb & [sb]]
   (if dense?
@@ -654,15 +678,16 @@
 (def W0 (when fn-mode? (js/parseInt (:norm (layer-w 0)))))
 (def R0 (when fn-mode? (if (seq rings) (js/parseInt (first rings)) 0))) (def S0 (when fn-mode? (if (seq states) (js/parseInt (first states)) 0)))
 (def K0 (when fn-mode? (if (seq kcaches) (js/parseInt (first kcaches)) 0))) (def V0 (when fn-mode? (if (seq vcaches) (js/parseInt (first vcaches)) 0)))
-(defn hexpr [e] (str "$(string-from-i64 " e ")"))
 (defn fn-body-src [fname keys rec?]
   (reset! lines [])
   (let [w (into {} (map-indexed (fn [i k] [k (hexpr (str "(+ w0 " i ")"))]) keys))]
     (emit-layer! (if rec? 0 3) w (hexpr "xin") (hexpr "xout") (when rec? (hexpr "ring")) (when rec? (hexpr "S")) (when-not rec? (hexpr "kc")) (when-not rec? (hexpr "vc")) m-ropeq-dyn m-ropek-dyn m-attn-dyn (if batch? m-copy-b m-copy-dyn) (cond batch? rowpos bp? rowsel :else posbuf)
                  (when (and rec? prefill?) (hexpr (str "(+ S " (- (js/parseInt (first stepbufs)) (js/parseInt (first states))) ")")))))   ;; stepbuf handle = S + (SB0 - S0): both run one per recurrent layer
   (let [params (concat ["w0" "xin" "xout"] (if rec? ["ring" "S"] ["kc" "vc"])) body @lines]
+    ;; dense: the layer's type signature comes from its weight base (a 6th parameter exceeds the native ABI arity, tick 57)
     (str "(defn " fname " [" (str/join " " (map #(str % " :i64") params)) "] :string\n"
-         "  (do\n" (str/join "\n" (map #(str "    (gpu " % ")") body)) "))\n")))
+         (when dense? (str "  (let [sig (sig-of (quot (- w0 " W0 ") " WSTRIDE "))]\n"))
+         "  (do\n" (str/join "\n" (map #(str "    (gpu " % ")") body)) ")" (when dense? ")") ")\n")))
 (def fn-rec-src (when (and fn-mode? (not dense?)) (fn-body-src "recurrent-layer" rec-keys true)))
 (def fn-att-src (when fn-mode? (fn-body-src "attention-layer" (if dense? dense-keys att-keys) false)))
 (defn layers-src [sfx]
@@ -682,7 +707,9 @@
 (def xinout-src (when fn-mode? (str
   ";; layer il: attention when (il + 1) mod 4 = 0; xin/xout alternate x, xa, xb; state index = il - il/4 (recurrent) or il/4 (attention)\n"
   "(defn xin-of [il :i64] :i64 (if (= il 0) " x " (if (= 1 (bit-and il 1)) " xa " " xb ")))\n"
-  "(defn xout-of [il :i64] :i64 (if (= 1 (bit-and il 1)) " xb " " xa "))\n")))
+  "(defn xout-of [il :i64] :i64 (if (= 1 (bit-and il 1)) " xb " " xa "))\n"
+  (when dense?   ;; layer -> kdot type signature index (tick 57); a uniform file has one signature and the chain collapses to 0
+    (str "(defn sig-of [il :i64] :i64 " (reduce (fn [acc il] (str "(if (= il " il ") " (layer-sig il) " " acc ")")) "0" (reverse (range 1 layers))) ")\n")))))
 (def fn-layers-src (when fn-mode? (str xinout-src (layers-src ""))))
 ;; the prefill PHASE (prefill:<P>): the same two layer bodies emitted with PF = P, plus their recursion
 (def fn-rec-p-src (when (and PB (not dense?)) (with-phase phase-prefill #(fn-body-src "recurrent-layer-p" rec-keys true))))

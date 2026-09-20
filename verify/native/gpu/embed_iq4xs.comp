@@ -20,7 +20,7 @@ int kvalue(uint i) {
 void main() {
   uint t = gl_LocalInvocationID.x;
   uint blocks = P.cols / 256u;
-#if !defined(Q8) && !defined(PTQ1)
+#if !defined(Q8) && !defined(PTQ1) && !defined(B32)
   if (t >= blocks * 8u) return;
 #endif
   uint row = gl_WorkGroupID.y;   // prefill: token row of the batch (decode dispatches y = 1)
@@ -37,6 +37,30 @@ void main() {
   uint b8 = tok * nb + t; uint bbase = b8 * 34u;
   float d8 = weight_half(bbase);
   for (uint j = 0u; j < 32u; j++) { int q = int(weight_byte(bbase + 2u + j)); if (q >= 128) q -= 256; o[row * P.cols + t * 32u + j] = d8 * float(q); }
+  return;
+#elif defined(B32)
+  // -DB32=<ggml type> (tick 57, Q4_K_M mixes): the four legacy 32-value block types, dequantised as ggml-quants.c does.
+  //   2 Q4_0 18 B: f16 d, 16 B nibbles (lo nibble = value j, hi = value j+16), value - 8
+  //   3 Q4_1 20 B: f16 d, f16 m, nibbles; value * d + m
+  //   6 Q5_0 22 B: f16 d, u32 qh (bit j -> 5th bit of value j), nibbles; (value | bit<<4) - 16
+  //   7 Q5_1 24 B: f16 d, f16 m, u32 qh, nibbles; (value | bit<<4) * d + m
+  // thread t = block t (P.cols / 32 blocks; 896 -> 28, tail-free because 896 = 28 * 32).
+  uint nb = P.cols / 32u; if (t >= nb) return;
+  uint bb = (B32 == 2) ? 18u : (B32 == 3) ? 20u : (B32 == 6) ? 22u : 24u;
+  uint bbase = (tok * nb + t) * bb;
+  float d = weight_half(bbase);
+  float m = (B32 == 3 || B32 == 7) ? weight_half(bbase + 2u) : 0.0;
+  uint qhoff = (B32 == 3 || B32 == 7) ? 4u : 2u;
+  uint qh = (B32 == 6 || B32 == 7) ? (weight_byte(bbase + qhoff) | (weight_byte(bbase + qhoff + 1u) << 8u) | (weight_byte(bbase + qhoff + 2u) << 16u) | (weight_byte(bbase + qhoff + 3u) << 24u)) : 0u;
+  uint qsoff = bb - 16u;
+  int off = (B32 == 2) ? 8 : (B32 == 6) ? 16 : 0;
+  for (uint j = 0u; j < 16u; j++) {
+    uint q = weight_byte(bbase + qsoff + j);
+    uint lo = q & 15u; uint hi = q >> 4u;
+    if (B32 == 6 || B32 == 7) { lo |= ((qh >> j) & 1u) << 4u; hi |= ((qh >> (j + 16u)) & 1u) << 4u; }
+    o[row * P.cols + t * 32u + j] = d * float(int(lo) - off) + m;
+    o[row * P.cols + t * 32u + 16u + j] = d * float(int(hi) - off) + m;
+  }
   return;
 #elif defined(PTQ1)
   // Prism PTQ1_0: qs[24], qh[2], fp16 scale; 128 values per block.
