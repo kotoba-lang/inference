@@ -100,6 +100,18 @@ the old shader on each backend. The three Vulkan measurements used the native
 gate because the native loader has no Metal arm. Full measurements and scope:
 `verify/evidence/ternary-bonsai-ptq1-radix-decode-20260920.json`.
 
+Co-scientist iteration 65 fused the two dense SwiGLU projections. The
+PTQ1-specific `kdot_ptq1_dual_r1.comp` reads the activation once, decodes gate
+and up weights in one workgroup, reduces both dots together, and writes
+`silu(gate) * up` directly. Against two iteration-64 single projections, the
+conservative speedup (before counting the removed standalone SiLU dispatch) is
+**1.71x B70, 1.21x K16, 1.54x Xavier, and 2.02x/2.18x M1 Max at B1/B8**.
+Native output agrees with the CPU oracle to at most `2.690e-6` relative; Metal
+agrees to `1.192e-7` absolute. The model-wide accumulated matmul upper bound
+moves from 1.004 to 1.207 aggregate seq-tok/s at B1 and from 1.943 to 2.625 at
+B8. This is still not a complete token recipe. Full evidence:
+`verify/evidence/ternary-bonsai-ptq1-dual-swiglu-20260920.json`.
+
 `kdot_f32_r8.comp` / `kdot_f32_r1.comp` are the GLSL twins of
 `shaders/ggml_kdot_f32_r8.wgsl` / `ggml_kdot_f32.wgsl` (Q4_K 12 / Q5_K 13 /
 Q6_K 14 / IQ4_XS 23, f32 activations, five storage bindings). `gen_kdot_guest.cljk`
