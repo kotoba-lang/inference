@@ -1526,3 +1526,32 @@ Answer in one word." → `"Paris"` (llama-server on the same GGUF: `"Paris"`), c
 Not done: B70 / Xavier runs of the dense guests (anv int8 / nvgpu h2 layouts have no Q8_0 arm yet — `kdot_i8_x8r4`,
 `kdot_h2_r1`; on those boxes a dense model would fall to the f32 kernels), Q4_K_M mixes with Q5_0 (type 6: kdot arm
 missing), SentencePiece models (refused by name), the Xavier head shell not yet updated to the new tokenizer core.
+
+## Tick 55 (2026-09-20, HF coverage 2): the dense guests on B70 and Xavier; the Xavier head on the new tokenizer core
+
+The f32 kdot layout (the RADV table: `kdot_f32_r8` / `_r1`, positions kernel `kdot_f32_p<P>`) is portable — the same
+generator arguments with `nvgpu`'s loader and `aarch64-linux` target run Qwen2.5-0.5B-Instruct Q8_0 on every box,
+because the Q8_0 arms landed in the f32 kernels (tick 53) and the dense recipe (tick 54) never touches the
+int8 / h2 tables when the layout says f32. Adaptive guests `prefill:8 batch:1,2,4`, `NEX_BOX_GGUF=models/…`, oracle
+= `dense_ref.py`, `batch_drive.py --parts 38`:
+
+| box | guest | rows | B=1 ms/step | B=4 ms/step |
+|---|---|---|---|---|
+| B70 (anv, x86_64) | `qw24-f32b70.bin` @27185 | 4/4 oracle-exact | 5.37 | 4.04 (per step of 4 rows) |
+| Xavier (nvgpu, aarch64) | `qw24-f32xv.bin` @29360 | 4/4 oracle-exact | 18.0 | 30.4 |
+| K16 (radv, tick 54) | `qw24.bin` | 4/4 | 16.0 | 17.8 |
+
+B70's f32 path is already 3× K16 and 3.4× Xavier at B=1 — the tuned int8 / h2 layouts on these boxes need Q8_0 arms in
+`kdot_i8_x8r4` / `kdot_x8r8` (anv) and `kdot_h2_r1` / `kdot_s4_r1` (nvgpu) before a dense model gets their speed; those
+arms are the three subagent sections that follow (anv, nvgpu, and Q4_1 / Q5_0 / Q5_1 in the f32 kernels for Q4_K_M mixes).
+
+**Xavier head on the new shell** (`serve_http.cljk` + `tokenizer_core.cljk` + `chat_templates.cljk` + `gguf_tokenizer.cljk`,
+old files kept in `/root/kgpu/shell.pre55/`): `systemctl restart murakumo-xavier-nex-native` → active; log
+`TEMPLATE chatml-think pre qwen35 add_bos false eog [248044 248046]`; chat "What is the capital of France? Answer in one
+word." → `"Paris"`, prompt_tokens 21, 1957 ms wall (1.70 s before — the tokenizer core now walks the pre-tokenizer
+regex per family, the difference is the 40-layer prefill of 21 vs 12 tokens, not the shell); seeded haiku (T 0.7 / top_p
+0.9 / seed 7) → `"Autumn rain falls softly / Leaves drift down in crimson rivers / Earth breathes before sleep"`, 22
+tokens — the same text the serial and the adaptive shells produced in ticks 50–52, so the token ids the new core feeds the
+guest are the ids the old core fed it for this prompt. K16 :8099 (the 12-layer Nex prefix guest, same new core): greedy
+and seeded completions oracle-exact (`128186,116769,…` / `80072,…`), chat text meaningless as it was under the old core
+in tick 37 — a 12-layer prefix of a 40-layer model is not the model; the shell is judged on the ids.
