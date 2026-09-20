@@ -125,7 +125,7 @@
    ;; 12L x 3T 48.5 -> 39.3 ms/token. "nvgpu-exact" keeps the f32 path (s4).
    "nvgpu"       {:wide "kdot_h2_r1.spv" :narrow "kdot_h2_r1.spv" :lm "kdot_h2q6_r1.spv" :lm-once true}   ;; lm_head on the Q6_K half path (separate binary) since iteration 21; batch: read once (iteration 52: B=2 77.4 -> 60.8 ms)
    "nvgpu-exact" {:wide "kdot_s4_r1.spv" :narrow "kdot_s4_r1.spv" :lm "kdot_s4_r1.spv"}})
-(def layouts (or (layout-table backend) (do (println "REFUSE unknown backend" backend) (js/process.exit 2))))
+(def layouts* (or (layout-table backend) (do (println "REFUSE unknown backend" backend) (js/process.exit 2))))
 ;; --- GGUF directory (header only) ---
 (def fd (fs/openSync gguf "r"))
 (def head (js/Buffer.alloc (* 64 1024 1024)))
@@ -150,6 +150,11 @@
 ;; generator grew on), "qwen2" / "llama" are dense decoders (one block kind: attention + SwiGLU FFN)
 (def arch (get kv "general.architecture"))
 (def dense? (contains? #{"qwen2" "llama"} arch))
+;; tick 55 (B70, Qwen2.5-0.5B Q8_0, 24 L): a dense model's lm_head (151936 x 896 Q8_0 = 145 MB) dominates the batch step, so
+;; on anv the int8 B-times lm_head read (B=4 6.56 ms/step) loses to reading it once through the positions kernel (4.06),
+;; and the int8 decode form at B=2 (6.18) loses to the positions form (4.64). Nex keeps the anv table as measured in
+;; iteration 58 (its lm_head is the same size but its layers are 4x wider). Layer kdots stay x8r4 (B=1 4.28 vs f32 5.37).
+(def layouts (if (and dense? (= backend "anv")) (assoc layouts* :lm-once true :batch-layout-upto 1) layouts*))
 (when-not (contains? #{"qwen35moe" "qwen2" "llama"} arch) (println "REFUSE architecture" arch "-- known: qwen35moe qwen2 llama") (js/process.exit 2))
 (defn akv [k & [d]] (let [v (get kv (str arch "." k))] (if (some? v) v d)))
 (def eps (akv "attention.layer_norm_rms_epsilon"))
@@ -700,7 +705,7 @@
       :else (dispatch! embed 1 PF 1 m-embed-dyn w-embd tokbuf x posbuf))
     (step! (str "(" layers-name " 0 " layers ")"))
     (dispatch! (ops "rmsnorm") PF 1 1 (if dense? m-dnorm m-norm) x-final w-out-norm zeros16 hN zeros16 zeros16)   ;; dense: rows of NE (iteration 59: with n = 2048 the norm of a 896-wide row diluted the rms by sqrt(2048/896) -- argmax-invariant, distribution-wrong, and rows >= 1 read the wrong offset)
-    (if i8-lm
+    (if (and i8-lm (not (and batch? (:lm-once layouts))))   ;; :lm-once wins over int8 in the batch step (tick 55)
       (let [[xq xs] (quant! hN (* PF 2048) hN-i8)] (dispatch! i8-lm (wg-of (:lm-i8 layouts) NV) (if batch? PF 1) 1 m-lm w-lm xq logits zerosP xs))   ;; batch: B rows of int8 logits
       (cond
         ;; batch: every row's logits. :lm-once backends read the 425 MB lm_head ONCE through the positions kernel (radv,
