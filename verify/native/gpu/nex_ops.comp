@@ -150,15 +150,19 @@ void op_rope_neox() {   // workgroup x = head row over all batch rows; P.rows = 
   uint tokrow = (P.rows > 0u) ? h / P.rows : 0u;
   for (uint i = t; i < n; i += 256u) {
     if (i >= nrot) { o[base + i] = a[base + i]; continue; }
-    uint pair = (i >= hlf) ? i - hlf : i;
+    // p0 != 0 (iteration 59, llama): the NORMAL rope pairs adjacent dims (2p, 2p+1) instead of (p, p + nrot/2)
+    bool norm_ = P.p0 != 0.0;
+    uint pair = norm_ ? (i >> 1u) : ((i >= hlf) ? i - hlf : i);
 #ifdef BATCH
     float theta = float(ids[tokrow]) * pow(P.scale, -2.0 * float(pair) / float(nrot));   // C-4: the row's own position
 #else
     float theta = float(((P.p1 != 0.0) ? dyn_pos() : P.aux2) + tokrow) * pow(P.scale, -2.0 * float(pair) / float(nrot));
 #endif
+    if (P.eps != 0.0) theta /= b[pair];   // iteration 59, llama3 rope scaling: b = rope_freqs.weight, one divisor per frequency (eps != 0 says it is bound)
     float cs = cos(theta), sn = sin(theta);
-    float x0 = a[base + pair], x1 = a[base + pair + hlf];
-    o[base + i] = (i >= hlf) ? (x0 * sn + x1 * cs) : (x0 * cs - x1 * sn);
+    float x0 = norm_ ? a[base + 2u * pair] : a[base + pair], x1 = norm_ ? a[base + 2u * pair + 1u] : a[base + pair + hlf];
+    bool second = norm_ ? ((i & 1u) == 1u) : (i >= hlf);
+    o[base + i] = second ? (x0 * sn + x1 * cs) : (x0 * cs - x1 * sn);
   }
 }
 void op_attn_decode() {   // workgroup y = query row of the batch (prefill): causal T = base + 1 + row, q / out / gate offset by the row (iteration 38)
@@ -190,7 +194,7 @@ void op_attn_decode() {   // workgroup y = query row of the batch (prefill): cau
     float acc = 0.0;
     for (uint tt = 0u; tt < T; tt++) acc += red[tt] * c[cbase + (tt * P.aux2 + hkv) * d + i];
     uint gi = (P.eps < 0.0) ? (row * P.rows * 2u * d + (h * 2u + 1u) * d + i) : (qoff + h * d + i);
-    o[qoff + h * d + i] = acc * sigmoid(s[gi]);
+    o[qoff + h * d + i] = (P.p0 != 0.0) ? acc : acc * sigmoid(s[gi]);   // p0 != 0: no output gate (dense decoders, iteration 59)
   }
 }
 void op_argmax_partial() {
@@ -448,6 +452,11 @@ void op_add() {
   uint i = gl_GlobalInvocationID.x; if (i >= P.n) return;
   o[i] = a[i] + b[i];
 }
+// dense decoders (iteration 59): o[i] = a[i] + bias[i mod rows-stride]: n = total elements (rows x stride), aux = stride
+void op_add_bias() {
+  uint i = gl_GlobalInvocationID.x; if (i >= P.n) return;
+  o[i] = a[i] + b[i - (i / P.aux) * P.aux];
+}
 void op_f32_matvec() {   // workgroup y = input row (prefill), x = output row
   uint r = gl_WorkGroupID.x, y = gl_WorkGroupID.y, t = gl_LocalInvocationID.x, n = P.n, base = r * n;
   float acc = 0.0;
@@ -465,7 +474,7 @@ void op_add_rmsnorm() {   // workgroup x = row (prefill batches P rows; decode d
 }
 
 #ifndef OP
-#error "compile with -DOP=<rmsnorm|l2norm|gated_rmsnorm|silu_mul|conv1d_step|softmax_topk|gate_decay|gate_decay2|copy_at|weighted_sum|rope_neox|attn_decode|argmax_partial|argmax_final|add|f32_matvec|add_rmsnorm|pos_incr|sample_topp|sample_part|sample_probs|sample_bisect_part|sample_bisect_step|sample_final|quant_q8|pos_incr2|ctl|pos_add|pos_seed|params>"
+#error "compile with -DOP=<rmsnorm|l2norm|gated_rmsnorm|silu_mul|conv1d_step|softmax_topk|gate_decay|gate_decay2|copy_at|weighted_sum|rope_neox|attn_decode|argmax_partial|argmax_final|add|f32_matvec|add_rmsnorm|pos_incr|sample_topp|sample_part|sample_probs|sample_bisect_part|sample_bisect_step|sample_final|quant_q8|pos_incr2|ctl|pos_add|pos_seed|params|add_bias>"
 #endif
 #define CAT2(a, b) a##b
 #define CAT(a, b) CAT2(a, b)

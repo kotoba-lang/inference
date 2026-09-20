@@ -20,7 +20,9 @@ int kvalue(uint i) {
 void main() {
   uint t = gl_LocalInvocationID.x;
   uint blocks = P.cols / 256u;
+#ifndef Q8
   if (t >= blocks * 8u) return;
+#endif
   uint row = gl_WorkGroupID.y;   // prefill: token row of the batch (decode dispatches y = 1)
 #ifdef BATCH
   uint tok = ids[row * P.pad1 + pos[row]];   // C-4 (iteration 51): rows are sequences; pad1 = token-buffer stride per row
@@ -28,6 +30,14 @@ void main() {
   uint tok = ids[pos[1] * P.pad1 + pos[0] + row];   // iteration 57: P positions of sequence pos[1] from its base pos[0]
 #else
   uint tok = ids[((P.dyn != 0u) ? pos[0] : P.slot) + row];
+#endif
+#ifdef Q8
+  // -DQ8 (dense decoders, iteration 59): token_embd.weight in Q8_0 -- 32 values per block, f16 d + 32 int8 (34 B); thread t = block t
+  uint nb = P.cols / 32u; if (t >= nb) return;
+  uint b8 = tok * nb + t; uint bbase = b8 * 34u;
+  float d8 = weight_half(bbase);
+  for (uint j = 0u; j < 32u; j++) { int q = int(weight_byte(bbase + 2u + j)); if (q >= 128) q -= 256; o[row * P.cols + t * 32u + j] = d8 * float(q); }
+  return;
 #endif
   uint blk = t / 8u, ib = t & 7u;
   uint base = (tok * blocks + blk) * 136u;

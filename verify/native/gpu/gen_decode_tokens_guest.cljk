@@ -146,14 +146,42 @@
 (def tensors (into {} (for [_ (range n-tensors)] (let [name (gstr) nd (u32) dims (vec (repeatedly nd u64)) typ (u32) off (u64)] [name {:dims dims :type typ :offset off}]))))
 (def alignment (get kv "general.alignment" 32))
 (def data-start (* (quot (+ @pos alignment -1) alignment) alignment))
-(def eps (get kv "qwen35moe.attention.layer_norm_rms_epsilon"))
+;; --- architecture (iteration 59): every dimension from the GGUF's own metadata; "qwen35moe" is Nex (the hybrid this
+;; generator grew on), "qwen2" / "llama" are dense decoders (one block kind: attention + SwiGLU FFN)
+(def arch (get kv "general.architecture"))
+(def dense? (contains? #{"qwen2" "llama"} arch))
+(when-not (contains? #{"qwen35moe" "qwen2" "llama"} arch) (println "REFUSE architecture" arch "-- known: qwen35moe qwen2 llama") (js/process.exit 2))
+(defn akv [k & [d]] (let [v (get kv (str arch "." k))] (if (some? v) v d)))
+(def eps (akv "attention.layer_norm_rms_epsilon"))
+(def NE (akv "embedding_length"))               ;; hidden size (Nex 2048, Qwen2.5-0.5B 896)
+(def NH (akv "attention.head_count"))           ;; query heads (16 / 14)
+(def NKV (akv "attention.head_count_kv"))       ;; kv heads (2 / 2)
+(def HD (if dense? (quot NE NH) 256))           ;; head dim (Nex: 256 with a 2x gated q; dense: NE / NH)
+(def NFF (akv "feed_forward_length" 0))         ;; dense FFN width (4864)
+(def KVROW (* NKV HD))                          ;; floats per cached position (Nex 512, Qwen2.5-0.5B 128)
+(def NROT (akv "rope.dimension_count" HD))      ;; rotated dims (Nex key present; dense: the head dim)
+(def NV (nth (:dims (or (get tensors "output.weight") (get tensors "token_embd.weight"))) 1))   ;; vocab rows (output.weight, or the tied embedding)
+(def LMT (:type (or (get tensors "output.weight") (get tensors "token_embd.weight"))))   ;; lm_head tensor type (14 Q6_K on Nex, 8 Q8_0 on Qwen2.5)
+(def NPARTS (quot (+ NV 4095) 4096))            ;; argmax partials (61 for 248320, 38 for 151936); the pick lands at slot NPARTS
+(def PICK-OFF (* 4 NPARTS))                     ;; byte offset of the pick in a row of the ids buffer
+(when (> NPARTS 63) (println "REFUSE vocab" NV "-- more than 63 argmax partials, the row stride is 64 slots") (js/process.exit 2))
 (def block-bytes {12 144 13 176 14 210 23 136 0 nil})
 (defn tensor-bytes [{:keys [dims type]}]
+  ;; iteration 59: F32 (0) / F16 (1) per value; Q8_0 (8) 34 B and Q4_0 (2) 18 B per 32 values; K-quants per 256
   (let [cols (first dims) rows (reduce * 1 (rest dims))]
-    (if (= 0 type) (* rows cols 4) (* rows (quot cols 256) (block-bytes type)))))
+    (case type
+      0 (* rows cols 4)
+      1 (* rows cols 2)
+      8 (* rows (quot (+ cols 31) 32) 34)
+      2 (* rows (quot (+ cols 31) 32) 18)
+      (* rows (quot cols 256) (block-bytes type)))))
+;; the weight file on the box: <dir-on-box>/<basename of the GGUF given>, or NEX_BOX_GGUF (iteration 59; it was nex.gguf --
+;; the Nex runs read a local header dump `nex-iq4xs-head64m.bin` and the box holds `nex.gguf`, so they pass NEX_BOX_GGUF=nex.gguf)
+(def gguf-name (or (aget js/process.env "NEX_BOX_GGUF") (last (str/split gguf #"/"))))
+(def wpath (str box "/" gguf-name))
 (defn T* [full] (or (get tensors full) (do (println "REFUSE no tensor" full) (js/process.exit 2))))
 (def interval (get kv "qwen35moe.full_attention_interval" 4))
-(def recurrent (vec (for [il (range 64)] (if (zero? (mod (inc il) interval)) 0 1))))  ;; llama.cpp: full attention every `interval`-th layer
+(def recurrent (vec (for [il (range 64)] (if (or dense? (zero? (mod (inc il) interval))) 0 1))))   ;; dense: every layer is attention  ;; llama.cpp: full attention every `interval`-th layer
 (when prefill? (when (not= ntok 1) (println "REFUSE prefill: tokens must be 1 (the prompt is the batch)") (js/process.exit 2)))
 (def nrot (get kv "qwen35moe.rope.dimension_count")) (def rope-base (get kv "qwen35moe.rope.freq_base"))
 ;; --- emission helpers ---
@@ -177,7 +205,7 @@
 (defn free! [h] (step! (q (str "FREE " h))) (swap! free-slots conj (js/parseInt h)))
 (defn cat [& xs] (reduce (fn [a b] (str "(string-concat " a " " b ")")) xs))
 (defn map-tensor! [nm]
-  (let [t (T* nm) h (alloc-slot!)] (step! (q (str "MAP " box "/nex.gguf " (+ data-start (:offset t)) " " (tensor-bytes t)))) (str h)))
+  (let [t (T* nm) h (alloc-slot!)] (step! (q (str "MAP " wpath " " (+ data-start (:offset t)) " " (tensor-bytes t)))) (str h)))
 (defn alloc! [bytes] (let [h (alloc-slot!)] (step! (q (str "ALLOC " bytes))) (str h)))
 (defn zero! [h] (step! (q (str "ZERO " h))))
 (defn write! [h hex] (step! (q (str "WRITE " h " 0 " hex))))
@@ -207,7 +235,7 @@
 (defn fresh [prefix] (swap! counter inc) (str prefix @counter))
 ;; --- the plan ---
 (def zeros16 (alloc! 16))
-(def ops (into {} (for [op ["rmsnorm" "l2norm" "gated_rmsnorm" "silu_mul" "conv1d_step" "softmax_topk" "gate_decay2" "weighted_sum" "add" "f32_matvec" "add_rmsnorm" "rope_neox" "attn_decode" "argmax_partial" "argmax_final" "copy_at" "pos_incr" "pos_incr2" "sample_part" "sample_probs" "sample_bisect_part" "sample_bisect_step" "sample_final" "ctl" "pos_add" "pos_seed" "params"]] [op (pipeline! (str "nex_" op ".spv") 7)])))
+(def ops (into {} (for [op ["rmsnorm" "l2norm" "gated_rmsnorm" "silu_mul" "conv1d_step" "softmax_topk" "gate_decay2" "weighted_sum" "add" "f32_matvec" "add_rmsnorm" "rope_neox" "attn_decode" "argmax_partial" "argmax_final" "copy_at" "pos_incr" "pos_incr2" "sample_part" "sample_probs" "sample_bisect_part" "sample_bisect_step" "sample_final" "ctl" "pos_add" "pos_seed" "params" "add_bias"]] [op (pipeline! (str "nex_" op ".spv") 7)])))
 (def kdot-wide (pipeline! (:wide layouts) 5))
 (def kdot-narrow (pipeline! (:narrow layouts) 5))
 (def kdot-lm (pipeline! (:lm layouts) 5))
@@ -250,15 +278,17 @@
 (def expert-spv (or (:expert layouts) (:narrow layouts)))
 (def deltanet (pipeline! "deltanet_step.spv" 8))
 (def deltanet-fused (when fused? (pipeline! "deltanet_fused.spv" 13)))
-(def embed (pipeline! "embed_iq4xs.spv" 5))
+(def EMB (:type (get tensors "token_embd.weight")))   ;; 23 IQ4_XS (Nex) or 8 Q8_0 (Qwen2.5 Q8_0)
+(def embed-spv (case EMB 23 "embed_iq4xs" 8 "embed_q8" (do (println "REFUSE token_embd.weight type" EMB "-- embed kernels: 23 IQ4_XS, 8 Q8_0") (js/process.exit 2))))
+(def embed (pipeline! (str embed-spv ".spv") 5))
 (def deltanet-fused-b (when BB (pipeline! "deltanet_fused_b.spv" 13)))
-(def embed-b (when BB (pipeline! "embed_iq4xs_b.spv" 5)))
+(def embed-b (when BB (pipeline! (str embed-spv "_b.spv") 5)))
 (def batch-op-names ["copy_at" "rope_neox" "attn_decode" "argmax_partial" "argmax_final" "pos_incr" "ctl"
                      "params" "sample_part" "sample_probs" "sample_bisect_part" "sample_bisect_step" "sample_final"])   ;; iteration 55: per-row sampling
 (def bprefill-op-names ["copy_at" "attn_decode" "pos_add" "pos_seed" "ctl"])   ;; iteration 57: the batch-prefill twins
 (def ^:dynamic bp? false)   ;; the batch-prefill phase is being emitted
 (def deltanet-fused-bp (when bprefill? (pipeline! "deltanet_fused_bp.spv" 13)))
-(def embed-bp (when bprefill? (pipeline! "embed_iq4xs_bp.spv" 5)))
+(def embed-bp (when bprefill? (pipeline! (str embed-spv "_bp.spv") 5)))
 (def w-embd (map-tensor! "token_embd.weight"))
 (def prompt-ids (alloc! (max 16 (* 4 (count prompt)))))
 (def x (alloc! (* PMAX 8192)))
@@ -269,13 +299,18 @@
 (def gateE (alloc! (* PMAX 16384))) (def upE (alloc! (* PMAX 16384))) (def actE (alloc! (* PMAX 16384))) (def downE (alloc! (* PMAX 65536)))
 (def sg (alloc! (* PMAX 2048))) (def su (alloc! (* PMAX 2048))) (def sact (alloc! (* PMAX 2048))) (def shdown (alloc! (* PMAX 8192))) (def shlogit (alloc! (max 16 (* PMAX 4)))) (def ffn (alloc! (* PMAX 8192)))   ;; shlogit: the shared-expert gate logit per row (the P=8 bug of iteration 49: 16 bytes for 8 rows)
 (def xa (alloc! (* PMAX 8192))) (def xb (alloc! (* PMAX 8192)))
+;; dense decoders (iteration 59): the block's activations (Nex keeps its own above; x / xa / xb / hN are reused and hold NE <= 2048)
+(when (and dense? (> NE 2048)) (println "REFUSE embedding_length" NE "> 2048: the shared activation buffers are sized for Nex") (js/process.exit 2))
+(def dq (when dense? (alloc! (* PMAX 4 NH HD)))) (def dk (when dense? (alloc! (* PMAX 4 KVROW)))) (def dv (when dense? (alloc! (* PMAX 4 KVROW))))
+(def dqr (when dense? (alloc! (* PMAX 4 NH HD)))) (def dkr (when dense? (alloc! (* PMAX 4 KVROW)))) (def dattn (when dense? (alloc! (* PMAX 4 NH HD))))
+(def dg (when dense? (alloc! (* PMAX 4 NFF)))) (def du (when dense? (alloc! (* PMAX 4 NFF)))) (def dact (when dense? (alloc! (* PMAX 4 NFF))))
 (def zerosP (let [b (alloc! (max 16 (* 4 PMAX)))] (zero! b) b))   ;; expert_ids of zeros for the P-position non-MoE kdots
 (zero! zeros16)
 (write! prompt-ids (apply str (map le32 prompt)))
 (def rings (vec (for [il (range layers) :when (= 1 (recurrent il))] (let [r (alloc! (* NSEQ (if fused? 196608 98304)))] (zero! r) r))))   ;; fused: 2 slots x 3 x 8192 (double-buffered by pos parity)
 (def states (vec (for [il (range layers) :when (= 1 (recurrent il))] (let [s (alloc! (* NSEQ 2097152))] (zero! s) s))))
-(def kcaches (vec (for [il (range layers) :when (= 0 (recurrent il))] (let [b (alloc! (* NSEQ (if runtime? 4096 (max ntok PMAX)) 2048))] (zero! b) b))))   ;; runtime: 4096-token context
-(def vcaches (vec (for [il (range layers) :when (= 0 (recurrent il))] (let [b (alloc! (* NSEQ (if runtime? 4096 (max ntok PMAX)) 2048))] (zero! b) b))))   ;; runtime: 4096-token context
+(def kcaches (vec (for [il (range layers) :when (= 0 (recurrent il))] (let [b (alloc! (* NSEQ (if runtime? 4096 (max ntok PMAX)) 4 KVROW))] (zero! b) b))))   ;; runtime: 4096-token context
+(def vcaches (vec (for [il (range layers) :when (= 0 (recurrent il))] (let [b (alloc! (* NSEQ (if runtime? 4096 (max ntok PMAX)) 4 KVROW))] (zero! b) b))))   ;; runtime: 4096-token context
 ;; the metas that depend on the batch (PF) or on the prefill form are made per PHASE: decode (pf 1) and, with
 ;; prefill:<P>, prefill (pf P). `with-phase` rebinds PF / prefill? / the metas / kdot-p around an emission.
 (def ^:dynamic prefill? prefill?)
@@ -289,8 +324,14 @@
      :m-gate-exps (kdot-meta! 512 2048 23 (* 8 pf) ipe (if pre? 8 0)) :m-down-exps (kdot-meta! 2048 512 23 (* 8 pf) 1)
      :m-silu8 (ops-meta! (* pf 4096) 1 0 0 0 0) :m-gate-sh (kdot-meta! 512 2048 23 pf ipe) :m-down-sh (kdot-meta! 2048 512 23 pf ipe)
      :m-silu-sh (ops-meta! (* pf 512) 1 0 0 0 0) :m-add (ops-meta! (* pf 2048) 1 0 0 0 0)
-     :m-lm (if batch-phase? (kdot-meta! 248320 2048 14 pf 1 0 0) (kdot-meta! 248320 2048 14 1 0 0 (dec pf)))   ;; prefill: the lm_head reads the last batch row (pad1); batch: every row
-     :m-copy-dyn (ops-meta-dyn! (* 512 pf) 1 0 512 0 0)   ;; prefill: P consecutive rows in one copy
+     :m-lm (if batch-phase? (kdot-meta! NV NE LMT pf 1 0 0) (kdot-meta! NV NE LMT 1 0 0 (dec pf)))   ;; prefill: the lm_head reads the last batch row (pad1); batch: every row
+     :m-copy-dyn (ops-meta-dyn! (* KVROW pf) 1 0 KVROW 0 0)   ;; prefill: P consecutive rows in one copy
+     ;; dense decoder (iteration 59): the block's kdots and elementwise ops, types from the tensors
+     :m-dq (when dense? (kdot-meta! (* NH HD) NE (:type (T* "blk.0.attn_q.weight")) pf ipe)) :m-dk (when dense? (kdot-meta! KVROW NE (:type (T* "blk.0.attn_k.weight")) pf ipe))
+     :m-dv (when dense? (kdot-meta! KVROW NE (:type (T* "blk.0.attn_v.weight")) pf ipe)) :m-do (when dense? (kdot-meta! NE (* NH HD) (:type (T* "blk.0.attn_output.weight")) pf ipe))
+     :m-dgate (when dense? (kdot-meta! NFF NE (:type (T* "blk.0.ffn_gate.weight")) pf ipe)) :m-ddown (when dense? (kdot-meta! NE NFF (:type (T* "blk.0.ffn_down.weight")) pf ipe))
+     :m-dbq (when dense? (ops-meta! (* pf NH HD) 1 (* NH HD) 0 0 0)) :m-dbk (when dense? (ops-meta! (* pf KVROW) 1 KVROW 0 0 0))   ;; add_bias: n total, aux stride
+     :m-dsilu (when dense? (ops-meta! (* pf NFF) 1 0 0 0 0)) :m-dadd (when dense? (ops-meta! (* pf NE) 1 0 0 0 0))
      :m-padd (when pre? (ops-meta! pf 1 0 0 0 0))   ;; pos_add: n = the batch
      :kdot-p (when pre? (pipeline! (str "kdot_f32_p" pf (when (> PROWS 1) (str "r" PROWS)) ".spv") 5))}))
 (def phase-decode (phase-metas PF-static prefill?))   ;; the legacy single phase (fn / prefill / stream / flat modes) and the resident decode step
@@ -306,9 +347,13 @@
 (def ^:dynamic m-silu8 (:m-silu8 phase-decode)) (def ^:dynamic m-gate-sh (:m-gate-sh phase-decode)) (def ^:dynamic m-down-sh (:m-down-sh phase-decode))
 (def ^:dynamic m-silu-sh (:m-silu-sh phase-decode)) (def ^:dynamic m-add (:m-add phase-decode)) (def ^:dynamic m-lm (:m-lm phase-decode))
 (def ^:dynamic m-copy-dyn (:m-copy-dyn phase-decode)) (def ^:dynamic m-padd (:m-padd phase-decode)) (def ^:dynamic kdot-p (:kdot-p phase-decode))
+(def ^:dynamic m-dq (:m-dq phase-decode)) (def ^:dynamic m-dk (:m-dk phase-decode)) (def ^:dynamic m-dv (:m-dv phase-decode)) (def ^:dynamic m-do (:m-do phase-decode))
+(def ^:dynamic m-dgate (:m-dgate phase-decode)) (def ^:dynamic m-ddown (:m-ddown phase-decode)) (def ^:dynamic m-dbq (:m-dbq phase-decode)) (def ^:dynamic m-dbk (:m-dbk phase-decode))
+(def ^:dynamic m-dsilu (:m-dsilu phase-decode)) (def ^:dynamic m-dadd (:m-dadd phase-decode))
 (def phase-vars {#'m-norm :m-norm #'m-qkv :m-qkv #'m-gate :m-gate #'m-ab :m-ab #'m-out :m-out #'m-q :m-q #'m-k :m-k #'m-v :m-v #'m-attn-o :m-attn-o
                  #'m-gate-exps :m-gate-exps #'m-down-exps :m-down-exps #'m-silu8 :m-silu8 #'m-gate-sh :m-gate-sh #'m-down-sh :m-down-sh
-                 #'m-silu-sh :m-silu-sh #'m-add :m-add #'m-lm :m-lm #'m-copy-dyn :m-copy-dyn #'m-padd :m-padd #'kdot-p :kdot-p})
+                 #'m-silu-sh :m-silu-sh #'m-add :m-add #'m-lm :m-lm #'m-copy-dyn :m-copy-dyn #'m-padd :m-padd #'kdot-p :kdot-p
+                 #'m-dq :m-dq #'m-dk :m-dk #'m-dv :m-dv #'m-do :m-do #'m-dgate :m-dgate #'m-ddown :m-ddown #'m-dbq :m-dbq #'m-dbk :m-dbk #'m-dsilu :m-dsilu #'m-dadd :m-dadd})
 (defn with-phase [ph f]
   (with-bindings (merge (into {} (map (fn [[v k]] [v (get ph k)]) phase-vars))
                         {#'PF (:pf ph) #'prefill? (:pre? ph) #'batch? (:batch? ph) #'bp? (boolean (:bp? ph))
@@ -327,9 +372,10 @@
 (def m-qnorm (ops-meta! 256 16 512 0 eps 0)) (def m-knorm (ops-meta! 256 2 0 0 eps 0))
 (def m-addn (ops-meta! 2048 1 0 0 eps 0)) (def m-router (ops-meta! 2048 256 0 0 0 0)) (def m-topk (ops-meta! 256 1 8 0 0 1.0))
 (def m-shlogit (ops-meta! 2048 1 0 0 0 0)) (def m-wsum (ops-meta! 2048 1 8 0 0 0))
-(def w-out-norm (map-tensor! "output_norm.weight")) (def w-lm (map-tensor! "output.weight"))
-(def hN (alloc! (* PMAX 8192))) (def logits (alloc! (* NSEQ 248320 4))) (def amax-s (alloc! (* NSEQ 256))) (def amax-ids (alloc! (* NSEQ 256)))   ;; batch: one row of 64 slots per sequence
-(def m-am1 (ops-meta! 248320 1 61 0 0 0)) (def m-am2 (ops-meta! 248320 1 61 0 0 0))
+(def w-out-norm (map-tensor! "output_norm.weight"))
+(def w-lm (if (get tensors "output.weight") (map-tensor! "output.weight") w-embd))   ;; tied lm_head (Llama-3.2): the embedding rows are the logits' weights (iteration 59)
+(def hN (alloc! (* PMAX 4 NE))) (def logits (alloc! (* NSEQ NV 4))) (def amax-s (alloc! (* NSEQ 256))) (def amax-ids (alloc! (* NSEQ 256)))   ;; batch: one row of 64 slots per sequence
+(def m-am1 (ops-meta! NV 1 NPARTS 0 0 0)) (def m-am2 (ops-meta! NV 1 NPARTS 0 0 0))
 ;; int8 twins of the activations the i8 kdots read: [xq xs] per buffer, and one quant meta per value count
 (def q-metas (when quant (into {} (for [n [2048 4096] b (range 1 (inc PMAX))] [(* n b) (ops-meta! (* n b) 1 0 0 0 0)]))))   ;; iteration 58: B rows quantized as one vector
 (defn i8-pair! [n] (when quant [(alloc! (* PMAX n)) (alloc! (* PMAX 4 (quot n 32)))]))   ;; PMAX rows (the scale index is element / 32, so rows quantize contiguously)
@@ -338,7 +384,7 @@
 (defn quant! [x n pair] (dispatch! quant (quot (+ (quot n 32) 255) 256) 1 1 (q-metas n) x zeros16 zeros16 (second pair) zeros16 (first pair)) pair)
 ;; per-token metas: rope position, attention T, cache row, embedding source slot
 (def m-embedP (vec (for [p (range (count prompt))] (let [m (alloc! 16)] (write! m (str (le32 2048) (le32 p) (le32 0) (le32 0))) m))))   ;; slot p of prompt-ids (forced token)
-(def m-embed1 (let [m (alloc! 16)] (write! m (str (le32 2048) (le32 61) (le32 0) (le32 0))) m))    ;; slot 61 of amax-ids = the argmax
+(def m-embed1 (let [m (alloc! 16)] (write! m (str (le32 NE) (le32 NPARTS) (le32 0) (le32 0))) m))    ;; slot 61 of amax-ids = the argmax
 (def m-ropeq (vec (for [pos (range ntok)] (ops-meta! 256 16 nrot pos 0 rope-base))))
 (def m-ropek (vec (for [pos (range ntok)] (ops-meta! 256 2 nrot pos 0 rope-base))))
 (def m-attn (vec (for [pos (range ntok)] (ops-meta! 256 16 (inc pos) 2 -1.0 (/ 1.0 16.0)))))
@@ -347,19 +393,28 @@
 (def posbuf (alloc! 16))
 (def m-ropeq-dyn (ops-meta-dyn! 256 16 nrot 0 0 rope-base)) (def m-ropek-dyn (ops-meta-dyn! 256 2 nrot 0 0 rope-base))
 (def m-attn-dyn (ops-meta-dyn! 256 16 0 2 -1.0 (/ 1.0 16.0)))
+(defn ops-meta8! [n rows aux aux2 eps scale p0 p1] (let [m (alloc! 32)] (write! m (str (le32 n) (le32 rows) (le32 aux) (le32 aux2) (lef32 eps) (lef32 scale) (lef32 p0) (lef32 p1))) m))
+;; dense decoder metas: rope over HD with NH / NKV rows per token, attention without the output gate (p0 = 1), norms over NE
+(def m-dnorm (when dense? (ops-meta! NE 1 0 0 eps 0)))   ;; rows = PF is folded into the dispatch (rmsnorm is one workgroup per row)
+(def ROPE-NORM (if (= arch "llama") 1 0))   ;; llama.cpp: LLAMA_ROPE_TYPE_NORM for llama (adjacent pairs), NEOX for qwen2 / Nex
+;; llama3 rope scaling: `rope_freqs.weight` (NROT/2 f32 divisors) when the GGUF carries it; bound as the rope's `b`, eps = 1 says so
+(def rope-freqs (when (and dense? (get tensors "rope_freqs.weight")) (map-tensor! "rope_freqs.weight")))
+(def m-dropeq (when dense? (ops-meta8! HD NH NROT 0 (if rope-freqs 1.0 0) rope-base ROPE-NORM 1))) (def m-dropek (when dense? (ops-meta8! HD NKV NROT 0 (if rope-freqs 1.0 0) rope-base ROPE-NORM 1)))
+(def m-dattn (when dense? (ops-meta8! HD NH 0 NKV 1.0 (/ 1.0 (js/Math.sqrt HD)) 1 1)))   ;; eps > 0: the (unused) gate index layout; p0 = 1: no gate
+(def m-daddn (when dense? (ops-meta! NE 1 0 0 eps 0)))
 ;; fn mode: the token buffer holds the prompt, then argmax_final appends each next token; embed reads slot pos
 (def tokbuf (let [b (alloc! (if runtime? (* NSEQ 4 4096) (max 16 (* 4 (+ ntok 1)) (* 4 (count prompt)))))] (when-not runtime? (write! b (apply str (map le32 prompt)))) b))   ;; holds the prompt and every decoded token (runtime: 4096 slots, filled by WRITEDEC)
-(def m-embed-dyn (let [m (alloc! 16)] (write! m (str (le32 2048) (le32 0) (le32 1) (le32 0))) m))
+(def m-embed-dyn (let [m (alloc! 16)] (write! m (str (le32 NE) (le32 0) (le32 1) (le32 0))) m))
 ;; batch: rowpos = one absolute position per sequence; the token buffer row stride is 4096 (embed pad1, ctl aux)
 (def rowpos (when BB (let [b (alloc! (max 16 (* 4 BB)))] (zero! b) b)))
 ;; batch sampling (iteration 55): per-row (T, top_p, seed, -) from the message; the sampler's scratch per row
 (def sparams (when BB (let [b (alloc! (* 16 BB))] (zero! b) b)))
 (def sample-o-b (when BB (alloc! (* 1024 BB))))
-(def sample-s-b (when BB (alloc! (* 248320 4 BB))))
-(def m-sample-b (when BB (let [m (alloc! 32)] (write! m (str (le32 248320) (le32 1) (le32 61) (le32 4096) (lef32 1.0) (lef32 1.0) (le32 0) (lef32 1))) m)))
-(def m-embed-b (when BB (let [m (alloc! 16)] (write! m (str (le32 2048) (le32 0) (le32 1) (le32 4096))) m)))
-(def m-copy-b (when BB (ops-meta! 512 1 (* 4096 512) 512 0 0)))   ;; n per row, aux = cache stride per sequence, aux2 = per position
-(def m-am2-dyn (let [m (alloc! 32)] (write! m (str (le32 248320) (le32 1) (le32 61) (le32 (if resident? 4096 (count prompt))) (lef32 0) (lef32 0) (lef32 0) (lef32 1))) m))   ;; resident: the shell is the only writer of the token buffer
+(def sample-s-b (when BB (alloc! (* NV 4 BB))))
+(def m-sample-b (when BB (let [m (alloc! 32)] (write! m (str (le32 NV) (le32 1) (le32 NPARTS) (le32 4096) (lef32 1.0) (lef32 1.0) (le32 0) (lef32 1))) m)))
+(def m-embed-b (when BB (let [m (alloc! 16)] (write! m (str (le32 NE) (le32 0) (le32 1) (le32 4096))) m)))
+(def m-copy-b (when BB (ops-meta! KVROW 1 (* 4096 KVROW) KVROW 0 0)))   ;; n per row, aux = cache stride per sequence, aux2 = per position
+(def m-am2-dyn (let [m (alloc! 32)] (write! m (str (le32 NV) (le32 1) (le32 NPARTS) (le32 (if resident? 4096 (count prompt))) (lef32 0) (lef32 0) (lef32 0) (lef32 1))) m))   ;; resident: the shell is the only writer of the token buffer
 (def ctrl (when resident? (alloc! (max 20 (* 4 (+ 3 (or PB 1))) (* 20 (or BB 1))))))   ;; batch: 5B words (tokens, flags, T/top_p/seed per row)   ;; >= 5 words: the sampled message   ;; resident: "<token id>,<reset flag>" (or P tokens + flag) lands here (WRITEDEC), read by ctl
 (def m-ctlP (when PB (ops-meta! PB 1 0 0 0 0)))   ;; ctl with n = P tokens
 (def m-ctlBs (when BBs (into {} (for [b BBs] [b (ops-meta! b 1 4096 0 0 0)]))))   ;; batch ctl per B: n = B rows, aux = token-buffer row stride
@@ -373,14 +428,18 @@
 (def m-ctlBP (when bprefill? (ops-meta! PB 1 4096 0 0 0)))   ;; batch-prefill ctl: n = P tokens, aux = token-buffer row stride
 (def m-incr (ops-meta! 1 1 0 0 0 0))
 ;; sampler meta: n rows aux(=ids slot 61) aux2(=prompt length) eps(=T) scale(=top_p) p0(=seed bits) p1(=1)
-(def m-sample (when sampling (let [m (alloc! 32)] (write! m (str (le32 248320) (le32 1) (le32 61) (le32 (count prompt)) (lef32 (:T sampling)) (lef32 (:top-p sampling)) (le32 (:seed sampling)) (lef32 1))) m)))
+(def m-sample (when sampling (let [m (alloc! 32)] (write! m (str (le32 NV) (le32 1) (le32 NPARTS) (le32 (count prompt)) (lef32 (:T sampling)) (lef32 (:top-p sampling)) (le32 (:seed sampling)) (lef32 1))) m)))
 (def sample-o (when (or sampling replay?) (alloc! 1024)))          ;; partial max / Z / mass, lo / hi
-(def sample-s (when (or sampling replay?) (alloc! (* 248320 4))))  ;; p_i
+(def sample-s (when (or sampling replay?) (alloc! (* NV 4))))  ;; p_i
 ;; resident sampling: the sampler meta whose eps / scale / p0 (T, top_p, seed) the params op rewrites from each message
-(def m-sample-dyn (when replay? (let [m (alloc! 32)] (write! m (str (le32 248320) (le32 1) (le32 61) (le32 4096) (lef32 1.0) (lef32 1.0) (le32 0) (lef32 1))) m)))
+(def m-sample-dyn (when replay? (let [m (alloc! 32)] (write! m (str (le32 NV) (le32 1) (le32 NPARTS) (le32 4096) (lef32 1.0) (lef32 1.0) (le32 0) (lef32 1))) m)))
 (def m-params (when replay? (ops-meta! 3 1 0 0 0 0)))
 (def rec-keys [:norm :post :router :shgate-inp :gate-exps :up-exps :down-exps :gate-sh :up-sh :down-sh :qkv :gate :alpha :beta :dt :a :conv :ssm-norm :out])
 (def att-keys [:norm :post :router :shgate-inp :gate-exps :up-exps :down-exps :gate-sh :up-sh :down-sh :q :k :v :qn :kn :o])
+(def dense-keys [:norm :q :qb :k :kb :v :vb :o :fnorm :gate :up :down])   ;; 12 handles per dense layer (qwen2: biases present; llama: none -> zeros16 stands in)
+(def dense-name {:norm "attn_norm.weight" :q "attn_q.weight" :qb "attn_q.bias" :k "attn_k.weight" :kb "attn_k.bias" :v "attn_v.weight" :vb "attn_v.bias"
+                 :o "attn_output.weight" :fnorm "ffn_norm.weight" :gate "ffn_gate.weight" :up "ffn_up.weight" :down "ffn_down.weight"})
+(def WSTRIDE (if dense? 12 19))
 (def tensor-name {:norm "attn_norm.weight" :post "post_attention_norm.weight" :router "ffn_gate_inp.weight" :shgate-inp "ffn_gate_inp_shexp.weight"
                   :gate-exps "ffn_gate_exps.weight" :up-exps "ffn_up_exps.weight" :down-exps "ffn_down_exps.weight" :gate-sh "ffn_gate_shexp.weight" :up-sh "ffn_up_shexp.weight" :down-sh "ffn_down_shexp.weight"
                   :qkv "attn_qkv.weight" :gate "attn_gate.weight" :alpha "ssm_alpha.weight" :beta "ssm_beta.weight" :dt "ssm_dt.bias" :a "ssm_a" :conv "ssm_conv1d.weight" :ssm-norm "ssm_norm.weight" :out "ssm_out.weight"
@@ -389,17 +448,50 @@
   ;; MAP in rec-keys / att-keys order -- a map LITERAL with more than 8 entries is
   ;; evaluated in hash order under nbb (the MAP lines came out scrambled, iteration
   ;; 16), and fn mode addresses handle(il, k) = W0 + 19 il + index(k).
-  (let [p (str "blk." il ".") rec? (= 1 (recurrent il)) keys (if rec? rec-keys att-keys)
-        w (into {} (mapv (fn [k] [k (map-tensor! (str p (tensor-name k)))]) keys))]
-    (when (and fn-mode? (not rec?)) (dotimes [_ 3] (alloc! 16)))   ;; pad to 19 handles per layer
-    w))
+  (if dense?
+    (let [p (str "blk." il ".")]
+      ;; a bias the model lacks (llama) is a 16-byte zero buffer so the handle arithmetic stays one stride
+      (into {} (mapv (fn [k] [k (if (and (contains? #{:qb :kb :vb} k) (not (get tensors (str p (dense-name k))))) (let [b (alloc! 16)] (zero! b) b) (map-tensor! (str p (dense-name k))))]) dense-keys)))
+    (let [p (str "blk." il ".") rec? (= 1 (recurrent il)) keys (if rec? rec-keys att-keys)
+          w (into {} (mapv (fn [k] [k (map-tensor! (str p (tensor-name k)))]) keys))]
+      (when (and fn-mode? (not rec?)) (dotimes [_ 3] (alloc! 16)))   ;; pad to 19 handles per layer
+      w)))
 (def layer-w (if stream? nil (vec (for [il (range layers)] (layer-weights! il)))))
 ;; --- T tokens, one command buffer each; the answer is per-token "ns|x hex|argmax hex" joined by "#" ---
 (def token-answers (atom []))
 (def ans-binds (atom []))
 
 ;; one layer's dispatches, for any handle representation (literal or "$symbol")
+(defn emit-dense-layer!
+  "One dense decoder block (qwen2 / llama, iteration 59): rmsnorm -> q/k/v kdots (+ bias) -> rope -> KV copy -> attention (no gate)
+   -> o kdot -> residual + rmsnorm -> SwiGLU FFN -> residual. PF rows; the batch / prefill twins come through op* and the metas."
+  [w xin xout kc vc pb]
+  (dispatch! (ops "rmsnorm") PF 1 1 m-dnorm xin (:norm w) zeros16 h zeros16 zeros16)
+  (pkdot! kdot-wide (:wide layouts) (* NH HD) m-dq (:q w) h dq zerosP)
+  (pkdotc! kdot-narrow (:narrow layouts) KVROW m-dk (:k w) h dk zerosP)
+  (pkdotc! kdot-narrow (:narrow layouts) KVROW m-dv (:v w) h dv zerosP)
+  (dispatch! (ops "add_bias") (quot (+ (* PF NH HD) 255) 256) 1 1 m-dbq dq (:qb w) zeros16 dq zeros16 zeros16)
+  (dispatchc! (ops "add_bias") (quot (+ (* PF KVROW) 255) 256) 1 1 m-dbk dk (:kb w) zeros16 dk zeros16 zeros16)
+  (dispatchc! (ops "add_bias") (quot (+ (* PF KVROW) 255) 256) 1 1 m-dbk dv (:vb w) zeros16 dv zeros16 zeros16)
+  (dispatch! (op* "rope_neox") (* NH PF) 1 1 m-dropeq dq (or rope-freqs zeros16) zeros16 dqr zeros16 pb)
+  (dispatchc! (op* "rope_neox") (* NKV PF) 1 1 m-dropek dk (or rope-freqs zeros16) zeros16 dkr zeros16 pb)
+  (if batch?
+    (do (dispatchc! (op* "copy_at") (quot (+ KVROW 255) 256) PF 1 (if batch? m-copy-b m-copy-dyn) dv zeros16 zeros16 vc zeros16 pb)
+        (dispatch! (op* "copy_at") (quot (+ KVROW 255) 256) PF 1 (if batch? m-copy-b m-copy-dyn) dkr zeros16 zeros16 kc zeros16 pb))
+    (do (dispatchc! (op* "copy_at") (quot (+ (* KVROW PF) 255) 256) 1 1 m-copy-dyn dv zeros16 zeros16 vc zeros16 pb)
+        (dispatch! (op* "copy_at") (quot (+ (* KVROW PF) 255) 256) 1 1 m-copy-dyn dkr zeros16 zeros16 kc zeros16 pb)))
+  (dispatch! (op* "attn_decode") NH PF 1 m-dattn dqr kc vc dattn zeros16 pb)
+  (pkdot! kdot-out out-spv NE m-do (:o w) dattn attn-out zerosP)
+  (dispatch! (ops "add_rmsnorm") PF 1 1 m-daddn xin attn-out (:fnorm w) resid h2 zeros16)
+  (pkdot! kdot-wide (:wide layouts) NFF m-dgate (:gate w) h2 dg zerosP)
+  (pkdotc! kdot-wide (:wide layouts) NFF m-dgate (:up w) h2 du zerosP)
+  (dispatch! (ops "silu_mul") (quot (+ (* PF NFF) 255) 256) 1 1 m-dsilu dg du zeros16 dact zeros16 zeros16)
+  (pkdot! kdot-out out-spv NE m-ddown (:down w) dact ffn zerosP)
+  (dispatch! (ops "add") (quot (+ (* PF NE) 255) 256) 1 1 m-dadd resid ffn zeros16 xout zeros16 zeros16))
 (defn emit-layer! [il w xin xout ring S kc vc mrq mrk mattn mcopy pb & [sb]]
+  (if dense?
+    (emit-dense-layer! w xin xout kc vc pb)
+    (do
         (when (and prefill? sb fn-mode? (not batch?)) (dispatch! (op* "pos_seed") 1 1 1 m-incr pb zeros16 zeros16 zeros16 zeros16 sb))   ;; stepbuf = [base position, row 0(, seq)]
         (dispatch! (ops "rmsnorm") PF 1 1 m-norm xin (:norm w) zeros16 h zeros16 zeros16)
         (if (= 1 (recurrent il))
@@ -473,21 +565,21 @@
           (let [[xq xs] (quant! actE (* PF 4096) actE-i8)] (dispatch! i8-expert (wg-of (:expert-i8 layouts) 2048) (* 8 PF) 1 m-down-exps (:down-exps w) xq downE ids xs))
           (dispatch! kdot-expert (wg-of expert-spv 2048) (* 8 PF) 1 m-down-exps (:down-exps w) actE downE ids))
         (dispatch! (ops "weighted_sum") 8 PF 1 m-wsum downE topw shdown ffn shlogit zeros16)
-        (dispatch! (ops "add") (* 8 PF) 1 1 m-add resid ffn zeros16 xout zeros16 zeros16))
+        (dispatch! (ops "add") (* 8 PF) 1 1 m-add resid ffn zeros16 xout zeros16 zeros16))))
 
 ;; the token's tail: final norm, lm_head, argmax, SUBMIT (bound) and the read-backs
 (defn emit-lm-head! [pos]
   (let [x-final (if (odd? (dec layers)) xb xa)]
     (dispatch! (ops "rmsnorm") PF 1 1 m-norm x-final w-out-norm zeros16 hN zeros16 zeros16)
     (if i8-lm
-      (let [[xq xs] (quant! hN (* PF 2048) hN-i8)] (dispatch! i8-lm (wg-of (:lm-i8 layouts) 248320) 1 1 m-lm w-lm xq logits zeros16 xs))
-      (dispatch! kdot-lm (wg-of (:lm layouts) 248320) 1 1 m-lm w-lm hN logits zeros16))
-    (dispatch! (ops "argmax_partial") 61 1 1 m-am1 logits zeros16 zeros16 zeros16 amax-s amax-ids)
+      (let [[xq xs] (quant! hN (* PF 2048) hN-i8)] (dispatch! i8-lm (wg-of (:lm-i8 layouts) NV) 1 1 m-lm w-lm xq logits zeros16 xs))
+      (dispatch! kdot-lm (wg-of (:lm layouts) NV) 1 1 m-lm w-lm hN logits zeros16))
+    (dispatch! (ops "argmax_partial") NPARTS 1 1 m-am1 logits zeros16 zeros16 zeros16 amax-s amax-ids)
     (dispatch! (ops "argmax_final") 1 1 1 m-am2 amax-s zeros16 zeros16 amax-s amax-s amax-ids)
     ;; SUBMIT and the read-backs are bound so their answers survive to the end
     (let [ns (fresh "ns") xr (fresh "xr") idr (fresh "idr") lg (fresh "lg") last? (= pos (dec ntok))]
-      (swap! ans-binds conj (cond-> [[ns (q "SUBMIT")] [xr (q (str "READ " x-final " 0 " (* PF 8192)))] [idr (q (str "READ " amax-ids " 244 4"))]]
-                              (and stream? last?) (conj [lg (q (str "READ " logits " 0 " (* 248320 4)))])))
+      (swap! ans-binds conj (cond-> [[ns (q "SUBMIT")] [xr (q (str "READ " x-final " 0 " (* PF 8192)))] [idr (q (str "READ " amax-ids " " PICK-OFF " 4"))]]
+                              (and stream? last?) (conj [lg (q (str "READ " logits " 0 " (* NV 4)))])))
       (swap! token-answers conj (if (and stream? last?) (cat ns (q "|") xr (q "|") idr (q "|") lg) (cat ns (q "|") xr (q "|") idr))))))
 (when flat?
   (doseq [pos (range ntok)]
@@ -544,7 +636,7 @@
     (step! (q "BEGIN"))
     (dispatch! embed 1 1 1 (if (< pos (count prompt)) (m-embedP pos) m-embed1) w-embd (if (< pos (count prompt)) prompt-ids amax-ids) x zeros16)
     (step! (q "SUBMIT"))
-    (doseq [il (range layers)] (step! (str "(layer-" il " \"MAP " box "/nex.gguf\")")))
+    (doseq [il (range layers)] (step! (str "(layer-" il " \"MAP " wpath "\")")))
     (step! (q "BEGIN"))
     (emit-lm-head! pos)))
 
@@ -561,24 +653,30 @@
   (let [params (concat ["w0" "xin" "xout"] (if rec? ["ring" "S"] ["kc" "vc"])) body @lines]
     (str "(defn " fname " [" (str/join " " (map #(str % " :i64") params)) "] :string\n"
          "  (do\n" (str/join "\n" (map #(str "    (gpu " % ")") body)) "))\n")))
-(def fn-rec-src (when fn-mode? (fn-body-src "recurrent-layer" rec-keys true)))
-(def fn-att-src (when fn-mode? (fn-body-src "attention-layer" att-keys false)))
+(def fn-rec-src (when (and fn-mode? (not dense?)) (fn-body-src "recurrent-layer" rec-keys true)))
+(def fn-att-src (when fn-mode? (fn-body-src "attention-layer" (if dense? dense-keys att-keys) false)))
 (defn layers-src [sfx]
-  (str "(defn layers" sfx " [il :i64 n :i64] :i64\n"
-       "  (if (< il n)\n"
-       "    (do (if (= 3 (bit-and il 3))\n"
-       "          (attention-layer" sfx " (+ " W0 " (* il 19)) (xin-of il) (xout-of il) (+ " K0 " (quot il 4)) (+ " V0 " (quot il 4)))\n"
-       "          (recurrent-layer" sfx " (+ " W0 " (* il 19)) (xin-of il) (xout-of il) (+ " R0 " (- il (quot il 4))) (+ " S0 " (- il (quot il 4)))))\n"
-       "        (layers" sfx " (+ il 1) n))\n"
-       "    il))\n"))
+  (if dense?
+    (str "(defn layers" sfx " [il :i64 n :i64] :i64\n"
+         "  (if (< il n)\n"
+         "    (do (attention-layer" sfx " (+ " W0 " (* il " WSTRIDE ")) (xin-of il) (xout-of il) (+ " K0 " il) (+ " V0 " il))\n"
+         "        (layers" sfx " (+ il 1) n))\n"
+         "    il))\n")
+    (str "(defn layers" sfx " [il :i64 n :i64] :i64\n"
+         "  (if (< il n)\n"
+         "    (do (if (= 3 (bit-and il 3))\n"
+         "          (attention-layer" sfx " (+ " W0 " (* il 19)) (xin-of il) (xout-of il) (+ " K0 " (quot il 4)) (+ " V0 " (quot il 4)))\n"
+         "          (recurrent-layer" sfx " (+ " W0 " (* il 19)) (xin-of il) (xout-of il) (+ " R0 " (- il (quot il 4))) (+ " S0 " (- il (quot il 4)))))\n"
+         "        (layers" sfx " (+ il 1) n))\n"
+         "    il))\n")))
 (def xinout-src (when fn-mode? (str
   ";; layer il: attention when (il + 1) mod 4 = 0; xin/xout alternate x, xa, xb; state index = il - il/4 (recurrent) or il/4 (attention)\n"
   "(defn xin-of [il :i64] :i64 (if (= il 0) " x " (if (= 1 (bit-and il 1)) " xa " " xb ")))\n"
   "(defn xout-of [il :i64] :i64 (if (= 1 (bit-and il 1)) " xb " " xa "))\n")))
 (def fn-layers-src (when fn-mode? (str xinout-src (layers-src ""))))
 ;; the prefill PHASE (prefill:<P>): the same two layer bodies emitted with PF = P, plus their recursion
-(def fn-rec-p-src (when PB (with-phase phase-prefill #(fn-body-src "recurrent-layer-p" rec-keys true))))
-(def fn-att-p-src (when PB (with-phase phase-prefill #(fn-body-src "attention-layer-p" att-keys false))))
+(def fn-rec-p-src (when (and PB (not dense?)) (with-phase phase-prefill #(fn-body-src "recurrent-layer-p" rec-keys true))))
+(def fn-att-p-src (when PB (with-phase phase-prefill #(fn-body-src "attention-layer-p" (if dense? dense-keys att-keys) false))))
 (def fn-layers-p-src (when PB (layers-src "-p")))
 (defn step-lines!
   "The token step's request lines for the CURRENT phase: BEGIN, ctl (resident), embed of PF rows, the layer recursion
@@ -599,28 +697,28 @@
     (step! (str "(" layers-name " 0 " layers ")"))
     (dispatch! (ops "rmsnorm") PF 1 1 m-norm x-final w-out-norm zeros16 hN zeros16 zeros16)
     (if i8-lm
-      (let [[xq xs] (quant! hN (* PF 2048) hN-i8)] (dispatch! i8-lm (wg-of (:lm-i8 layouts) 248320) (if batch? PF 1) 1 m-lm w-lm xq logits zerosP xs))   ;; batch: B rows of int8 logits
+      (let [[xq xs] (quant! hN (* PF 2048) hN-i8)] (dispatch! i8-lm (wg-of (:lm-i8 layouts) NV) (if batch? PF 1) 1 m-lm w-lm xq logits zerosP xs))   ;; batch: B rows of int8 logits
       (cond
         ;; batch: every row's logits. :lm-once backends read the 425 MB lm_head ONCE through the positions kernel (radv,
         ;; nvgpu: bandwidth / issue bound on it); anv's x8r4 with the positions dispatch beats the f32 kernel even read B times
-        (and batch? (:lm-once layouts)) (dispatch! kdot-p (pwg 248320) 1 1 m-lm w-lm hN logits zerosP)
-        batch? (dispatch! kdot-lm (wg-of (:lm layouts) 248320) PF 1 m-lm w-lm hN logits zerosP)
-        :else (dispatch! kdot-lm (wg-of (:lm layouts) 248320) 1 1 m-lm w-lm hN logits zeros16)))
+        (and batch? (:lm-once layouts)) (dispatch! kdot-p (pwg NV) 1 1 m-lm w-lm hN logits zerosP)
+        batch? (dispatch! kdot-lm (wg-of (:lm layouts) NV) PF 1 m-lm w-lm hN logits zerosP)
+        :else (dispatch! kdot-lm (wg-of (:lm layouts) NV) 1 1 m-lm w-lm hN logits zeros16)))
     (if (or sampling sampled?)
       ;; multi-workgroup sampler (iteration 19): 61-workgroup passes, 30 bisection rounds on tau, one final pass
       (let [h [(if sampled? m-sample-dyn m-sample) logits tokbuf posbuf sample-o sample-s amax-ids]]
-        (apply dispatch! (ops "sample_part") 61 1 1 h)
-        (apply dispatch! (ops "sample_probs") 61 1 1 h)
-        (dotimes [_ 30] (apply dispatch! (ops "sample_bisect_part") 61 1 1 h) (apply dispatch! (ops "sample_bisect_step") 1 1 1 h))
+        (apply dispatch! (ops "sample_part") NPARTS 1 1 h)
+        (apply dispatch! (ops "sample_probs") NPARTS 1 1 h)
+        (dotimes [_ 30] (apply dispatch! (ops "sample_bisect_part") NPARTS 1 1 h) (apply dispatch! (ops "sample_bisect_step") 1 1 1 h))
         (apply dispatch! (ops "sample_final") 1 1 1 h))
-      (do (dispatch! (op* "argmax_partial") 61 (if batch? PF 1) 1 m-am1 logits zeros16 zeros16 zeros16 amax-s amax-ids)
+      (do (dispatch! (op* "argmax_partial") NPARTS (if batch? PF 1) 1 m-am1 logits zeros16 zeros16 zeros16 amax-s amax-ids)
           (dispatch! (op* "argmax_final") 1 (if batch? PF 1) 1 m-am2-dyn amax-s tokbuf posbuf amax-s amax-s amax-ids)
           (when batch?
             ;; per-row sampling (iteration 55): the chain over B rows, T == 0 rows keep the argmax pick
             (let [h [m-sample-b logits sparams rowpos sample-o-b sample-s-b amax-ids]]
-              (apply dispatch! (op* "sample_part") 61 PF 1 h)
-              (apply dispatch! (op* "sample_probs") 61 PF 1 h)
-              (dotimes [_ 30] (apply dispatch! (op* "sample_bisect_part") 61 PF 1 h) (apply dispatch! (op* "sample_bisect_step") 1 PF 1 h))
+              (apply dispatch! (op* "sample_part") NPARTS PF 1 h)
+              (apply dispatch! (op* "sample_probs") NPARTS PF 1 h)
+              (dotimes [_ 30] (apply dispatch! (op* "sample_bisect_part") NPARTS PF 1 h) (apply dispatch! (op* "sample_bisect_step") 1 PF 1 h))
               (apply dispatch! (op* "sample_final") 1 PF 1 h)))))
     (cond
       batch? (dispatch! (op* "pos_incr") 1 1 1 m-incrB* zeros16 zeros16 zeros16 zeros16 zeros16 rowpos)
@@ -635,12 +733,12 @@
 (defn bsfx [b] (if (= b BB) "-b" (str "-b" b)))
 (def fn-batch-srcs (when BBs (into {} (for [b BBs] [b (with-phase (phase-batches b)
                                                        #(binding [m-incrB* (m-incrBs b)]
-                                                          (str (fn-body-src (str "recurrent-layer" (bsfx b)) rec-keys true)
-                                                               (fn-body-src (str "attention-layer" (bsfx b)) att-keys false)
+                                                          (str (when-not dense? (fn-body-src (str "recurrent-layer" (bsfx b)) rec-keys true))
+                                                               (fn-body-src (str "attention-layer" (bsfx b)) (if dense? dense-keys att-keys) false)
                                                                (layers-src (bsfx b)))))]))))
 (def batch-step-liness (when BBs (into {} (for [b BBs] [b (with-phase (phase-batches b) #(binding [m-incrB* (m-incrBs b)] (step-lines! (m-ctlBs b) (str "layers" (bsfx b)))))]))))
 (def batch-step-lines (when BB (batch-step-liness BB)))
-(def fn-bprefill-src (when bprefill? (with-phase phase-bprefill #(str (fn-body-src "recurrent-layer-bp" rec-keys true) (fn-body-src "attention-layer-bp" att-keys false) (layers-src "-bp")))))
+(def fn-bprefill-src (when bprefill? (with-phase phase-bprefill #(str (when-not dense? (fn-body-src "recurrent-layer-bp" rec-keys true)) (fn-body-src "attention-layer-bp" (if dense? dense-keys att-keys) false) (layers-src "-bp")))))
 (def bprefill-step-lines (when bprefill? (with-phase phase-bprefill #(step-lines! m-ctlBP "layers-bp"))))
 (def bprefill-slot (when bprefill? (count BBs)))
 ;; kept slot per B: adaptive guests use slots 0.. (no single-row steps), the single-B guest slot 3
@@ -655,7 +753,7 @@
          "(defn token-step [pos :i64 n :i64 acc :string] :string\n"
          "  (if (< pos n)\n    (do\n"
          (str/join "\n" (map #(if (str/starts-with? % "(layers") (str "      " %) (str "      (gpu " % ")")) @lines)) "\n"
-         "      (let [ns (gpu \"SUBMIT\")\n            xr (gpu \"READ " x-final " 0 " (* PF 8192) "\")\n            idr (gpu \"READ " amax-ids " 244 4\")]\n"
+         "      (let [ns (gpu \"SUBMIT\")\n            xr (gpu \"READ " x-final " 0 " (* PF 8192) "\")\n            idr (gpu \"READ " amax-ids " " PICK-OFF " 4\")]\n"
          "        (token-step (+ pos 1) n (string-concat acc (string-concat (if (= pos 0) \"\" \"#\") (string-concat ns (string-concat \"|\" (string-concat xr (string-concat \"|\" idr)))))))))\n"
          "    acc))\n"
          (when resident?
@@ -711,13 +809,13 @@
                          (str "      (let [ns (if (string=? nw \"2\") (gpu \"REPLAY 0\") (if (string=? nw \"5\") (gpu \"REPLAY 2\") "
                               (if BB (str "(if (string=? nw \"" (* 2 BB) "\") (gpu \"REPLAY 3\") (gpu \"REPLAY 1\"))") "(gpu \"REPLAY 1\")") "))\n"))
                        ;; batch: the reply carries every row's 64 slots (slot 61 = the pick); single steps write row 0
-                       "            idr (gpu \"READ " amax-ids " " (if BB (str "0 " (* 256 BB)) "244 4") "\")]\n"
+                       "            idr (gpu \"READ " amax-ids " " (if BB (str "0 " (* 256 BB)) (str PICK-OFF " 4")) "\")]\n"
                        (when (aget js/process.env "NEX_DEBUG_TOKBUF") (str "      (typed-cap-call :io/write-error :string :string (string-concat \"TOKBUF \" (string-concat (gpu \"READ " tokbuf " 0 64\") (string-concat \" POS \" (string-concat (gpu \"READ " posbuf " 0 4\") \"\\n\")))))\n")))
                   (str "      (gpu (string-concat \"WRITEDEC " ctrl " 0 \" line))\n"
                        (if replay?
                          ""   ;; the step is one REPLAY below
                          (str/join "\n" (map #(if (str/starts-with? % "(layers") (str "      " %) (str "      (gpu " % ")")) @lines))) "\n"
-                       "      (let [ns (gpu \"" (if replay? "REPLAY 0" "SUBMIT") "\")\n            idr (gpu \"READ " amax-ids " 244 4\")]\n"))
+                       "      (let [ns (gpu \"" (if replay? "REPLAY 0" "SUBMIT") "\")\n            idr (gpu \"READ " amax-ids " " PICK-OFF " 4\")]\n"))
                 "        (do (typed-cap-call :io/write :string :string (string-concat ns (string-concat \"|\" (string-concat idr \"\\n\"))))\n"
                 "            (typed-cap-call :io/write-error :string :string \"\")\n"   ;; the loader buffers standard output (64 KiB) and flushes it before any diagnostic write: an empty one is the flush
                 "            (serve-loop (+ n 1))))" (when replay? ")") "))))\n"))))))
@@ -743,7 +841,7 @@
               (if (and runtime? (not resident?)) "(ns gpu.decode-tokens (:export [main serve]))\n" "(ns gpu.decode-tokens (:export [main]))\n")
               "(defn gpu [r :string] :string\n  (typed-cap-call :gpu/compute :string :string r))\n"
               ;; the weight file's path once (iteration 57): 733 MAP literals carried it, ~15 KiB of the 64 KiB string budget
-              (when fn-mode? (str "(defn M [tail :string] :string (gpu (string-concat \"MAP " box "/nex.gguf \" tail)))\n"))
+              (when fn-mode? (str "(defn M [tail :string] :string (gpu (string-concat \"MAP " wpath " \" tail)))\n"))
               (when stream? (str rec-body-src att-body-src layer-fns-src))
               ;; adaptive guests carry only the batch (+ batch-prefill) functions: the single-row bodies would push a 40-layer program past the
 ;; 64 KiB string-literal limit (iteration 57) and are never called there
@@ -756,8 +854,8 @@
               (cond resident? "(defn main [] :string\n"
                     runtime? (str "(defn main [] :string (serve " (count prompt) " " ntok "))\n(defn serve [plen :i64 ntok :i64] :string\n")
                     :else "(defn main [] :string\n")
-              "    (do\n" (str/join "\n" (map #(if (and fn-mode? (str/starts-with? % (str "\"MAP " box "/nex.gguf ")))
-                                                  (str "      (M \"" (subs % (count (str "\"MAP " box "/nex.gguf "))) ")")
+              "    (do\n" (str/join "\n" (map #(if (and fn-mode? (str/starts-with? % (str "\"MAP " wpath " ")))
+                                                  (str "      (M \"" (subs % (count (str "\"MAP " wpath " "))) ")")
                                                   (str "      (gpu " % ")")) const-steps)) "\n"
               (if fn-mode?
                 (cond
@@ -767,9 +865,9 @@
                   runtime?
                   (str "      (let [prompt (typed-cap-call :env/read :string :string \"NEX_PROMPT\")]\n"
                        "        (do (gpu (string-concat \"WRITEDEC " tokbuf " 0 \" prompt))\n"
-                       "            (gpu (string-concat \"WRITEDEC " m-am2-dyn " 0 248320,1,61,\" (string-concat (string-from-i64 plen) \",0,0,0,1065353216\")))\n"
-                       "            (string-concat (token-step 0 (+ plen ntok) \"\") (string-concat \"|\" (gpu \"READ " logits " 0 " (* 248320 4) "\")))))")
-                  :else (str "      (string-concat (token-step 0 " ntok " \"\") (string-concat \"|\" (gpu \"READ " logits " 0 " (* 248320 4) "\")))"))
+                       "            (gpu (string-concat \"WRITEDEC " m-am2-dyn " 0 " NV ",1," NPARTS ",\" (string-concat (string-from-i64 plen) \",0,0,0,1065353216\")))\n"
+                       "            (string-concat (token-step 0 (+ plen ntok) \"\") (string-concat \"|\" (gpu \"READ " logits " 0 " (* NV 4) "\")))))")
+                  :else (str "      (string-concat (token-step 0 " ntok " \"\") (string-concat \"|\" (gpu \"READ " logits " 0 " (* NV 4) "\")))"))
                 (emit-tokens token-steps @ans-binds @token-answers)) "))\n"))
 (fs/writeFileSync out src)
 (println (str "wrote " out ": " (if fn-mode? (str (count const-steps) " constant requests + a token-step function") (str (count @lines) " requests")) ", layers " layers " tokens " ntok " buffers " (dec @next-buffer) " pipelines " (dec @next-pipeline) " backend " backend " layouts " (pr-str layouts) (when stream? " STREAM (per-layer MAP/FREE; last token answers its full logits)")))
