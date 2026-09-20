@@ -71,6 +71,14 @@ kbb -M:verify-gguf
 KOTODAMA_VERIFY_FULL_MLP=1 KOTODAMA_VERIFY_FULL_LAYERS=2 KOTODAMA_VERIFY_FULL_VOCAB=1 kbb -M:verify-gemma-num
 ```
 
+Hosted Ternary Bonsai 2 27B measurements are recorded separately from the
+native runtime evidence in
+`verify/evidence/ternary-bonsai-hosted-turbo4-20260920.json`. The record covers
+Hugging Face L4/T4 endpoints using real TurboQuant `turbo4` K/V, an RTX PRO
+6000 Q4_0-KV operational reference, 32K through 256K cold-prefill outcomes,
+failure boundaries, cost per million prompt tokens, and an explicitly
+unmeasured analytical prefix-reuse ceiling.
+
 `gemma4-e4b-num-smoke` proves 2 composed transformer blocks against golden
 logits; it does not tokenize, sample, or run the full model. End-to-end
 single-request text generation (real tokenizer, every real transformer block,
