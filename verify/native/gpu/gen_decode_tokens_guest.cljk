@@ -124,7 +124,7 @@
    ;; as the exact kernel's 0.0167 -- llama.cpp itself is ~0.015 from the f64 oracle.
    ;; 12L x 3T 48.5 -> 39.3 ms/token. "nvgpu-exact" keeps the f32 path (s4).
    "nvgpu"       {:wide "kdot_h2_r1.spv" :narrow "kdot_h2_r1.spv" :lm "kdot_h2q6_r1.spv" :lm-once true}   ;; lm_head on the Q6_K half path (separate binary) since iteration 21; batch: read once (iteration 52: B=2 77.4 -> 60.8 ms)
-   "nvgpu-exact" {:wide "kdot_s4_r1.spv" :narrow "kdot_s4_r1.spv" :lm "kdot_s4_r1.spv"}})
+   "nvgpu-exact" {:wide "kdot_s4_r1.spv" :narrow "kdot_s4_r1.spv" :lm "kdot_s4_r1.spv" :lm-once true}})   ;; :lm-once (tick 58): batch reads the lm_head once, as the h2 table does
 (def layouts* (or (layout-table backend) (do (println "REFUSE unknown backend" backend) (js/process.exit 2))))
 ;; --- GGUF directory (header only) ---
 (def fd (fs/openSync gguf "r"))
@@ -154,7 +154,12 @@
 ;; on anv the int8 B-times lm_head read (B=4 6.56 ms/step) loses to reading it once through the positions kernel (4.06),
 ;; and the int8 decode form at B=2 (6.18) loses to the positions form (4.64). Nex keeps the anv table as measured in
 ;; iteration 58 (its lm_head is the same size but its layers are 4x wider). Layer kdots stay x8r4 (B=1 4.28 vs f32 5.37).
-(def layouts (if (and dense? (= backend "anv")) (assoc layouts* :lm-once true :batch-layout-upto 1) layouts*))
+;; tick 58 (Xavier, same model): the h2 table (f16 activations, tuned on Nex's 2048-wide layers) is neither faster nor exact on a
+;; dense 896-wide model -- s4 (exact f32) 14.8 / 19.2 / 29.6 ms/step at B=1/2/4 vs h2 15.7 / 19.2 / 29.8, KL(oracle||gpu) 9e-13 vs
+;; 1e-7 nats -- so dense on nvgpu takes the exact table (with :lm-once). Nex keeps h2 (iteration 21: bandwidth-bound on its tensors).
+(def layouts (cond (and dense? (= backend "anv")) (assoc layouts* :lm-once true :batch-layout-upto 1)
+                   (and dense? (= backend "nvgpu")) (layout-table "nvgpu-exact")
+                   :else layouts*))
 (when-not (contains? #{"qwen35moe" "qwen2" "llama"} arch) (println "REFUSE architecture" arch "-- known: qwen35moe qwen2 llama") (js/process.exit 2))
 (defn akv [k & [d]] (let [v (get kv (str arch "." k))] (if (some? v) v d)))
 (def eps (akv "attention.layer_norm_rms_epsilon"))
