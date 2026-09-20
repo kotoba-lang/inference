@@ -183,7 +183,7 @@
 (def interval (get kv "qwen35moe.full_attention_interval" 4))
 (def recurrent (vec (for [il (range 64)] (if (or dense? (zero? (mod (inc il) interval))) 0 1))))   ;; dense: every layer is attention  ;; llama.cpp: full attention every `interval`-th layer
 (when prefill? (when (not= ntok 1) (println "REFUSE prefill: tokens must be 1 (the prompt is the batch)") (js/process.exit 2)))
-(def nrot (get kv "qwen35moe.rope.dimension_count")) (def rope-base (get kv "qwen35moe.rope.freq_base"))
+(def nrot NROT) (def rope-base (akv "rope.freq_base"))   ;; iteration 59: from the architecture's own keys (the Nex-only key read nil for Qwen -> NaN theta)
 ;; --- emission helpers ---
 ;; The loader assigns buffer handles 1, 2, 3 ... in ALLOC/MAP order and pipeline
 ;; handles 1, 2, 3 ... in PIPELINE order (kexe_gpu_vulkan.c: "first free slot",
@@ -570,7 +570,7 @@
 ;; the token's tail: final norm, lm_head, argmax, SUBMIT (bound) and the read-backs
 (defn emit-lm-head! [pos]
   (let [x-final (if (odd? (dec layers)) xb xa)]
-    (dispatch! (ops "rmsnorm") PF 1 1 m-norm x-final w-out-norm zeros16 hN zeros16 zeros16)
+    (dispatch! (ops "rmsnorm") PF 1 1 (if dense? m-dnorm m-norm) x-final w-out-norm zeros16 hN zeros16 zeros16)   ;; dense: rows of NE (iteration 59: with n = 2048 the norm of a 896-wide row diluted the rms by sqrt(2048/896) -- argmax-invariant, distribution-wrong, and rows >= 1 read the wrong offset)
     (if i8-lm
       (let [[xq xs] (quant! hN (* PF 2048) hN-i8)] (dispatch! i8-lm (wg-of (:lm-i8 layouts) NV) 1 1 m-lm w-lm xq logits zeros16 xs))
       (dispatch! kdot-lm (wg-of (:lm layouts) NV) 1 1 m-lm w-lm hN logits zeros16))
@@ -695,7 +695,7 @@
       bp? (dispatch! embed-bp 1 PF 1 m-embed-b w-embd tokbuf x rowsel)
       :else (dispatch! embed 1 PF 1 m-embed-dyn w-embd tokbuf x posbuf))
     (step! (str "(" layers-name " 0 " layers ")"))
-    (dispatch! (ops "rmsnorm") PF 1 1 m-norm x-final w-out-norm zeros16 hN zeros16 zeros16)
+    (dispatch! (ops "rmsnorm") PF 1 1 (if dense? m-dnorm m-norm) x-final w-out-norm zeros16 hN zeros16 zeros16)   ;; dense: rows of NE (iteration 59: with n = 2048 the norm of a 896-wide row diluted the rms by sqrt(2048/896) -- argmax-invariant, distribution-wrong, and rows >= 1 read the wrong offset)
     (if i8-lm
       (let [[xq xs] (quant! hN (* PF 2048) hN-i8)] (dispatch! i8-lm (wg-of (:lm-i8 layouts) NV) (if batch? PF 1) 1 m-lm w-lm xq logits zerosP xs))   ;; batch: B rows of int8 logits
       (cond
@@ -746,6 +746,11 @@
 (declare fn-token-src)
 (defn cut-defn [src name] (let [i (.indexOf src (str "(defn " name " "))] (if (neg? i) src (let [j (.indexOf src "\n(defn " (inc i)) j2 (.indexOf src "\n;; " (inc i)) k (min (if (neg? j) (count src) j) (if (neg? j2) (count src) j2))] (str (subs src 0 i) (subs src k))))))
 (def adaptive-token-src (delay (reduce cut-defn fn-token-src ["token-step" "record-step" "record-sampled"])))
+(def debug-bufs (when-let [e (aget js/process.env "NEX_DEBUG_BUFS")]
+                  (let [table {"h" [h (* 4 NE)] "dq" [dq (* 4 NH HD)] "dk" [dk (* 4 KVROW)] "dv" [dv (* 4 KVROW)] "dqr" [dqr (* 4 NH HD)] "dkr" [dkr (* 4 KVROW)]
+                               "dattn" [dattn (* 4 NH HD)] "attn-out" [attn-out (* 4 NE)] "resid" [resid (* 4 NE)] "h2" [h2 (* 4 NE)] "dg" [dg (* 4 NFF)] "du" [du (* 4 NFF)]
+                               "dact" [dact (* 4 NFF)] "ffn" [ffn (* 4 NE)] "hN" [hN (* 4 NE)] "logits" [logits (* 4 NV)] "x" [x (* 4 NE)]}]
+                    (vec (for [nm (str/split e #",") :let [[hnd bytes] (table nm)] :when hnd] [nm hnd bytes])))))
 (def fn-token-src (when fn-mode?
   (step-lines! m-incr "layers")
   (let [x-final (if (odd? (dec layers)) xb xa)]
@@ -753,8 +758,13 @@
          "(defn token-step [pos :i64 n :i64 acc :string] :string\n"
          "  (if (< pos n)\n    (do\n"
          (str/join "\n" (map #(if (str/starts-with? % "(layers") (str "      " %) (str "      (gpu " % ")")) @lines)) "\n"
-         "      (let [ns (gpu \"SUBMIT\")\n            xr (gpu \"READ " x-final " 0 " (* PF 8192) "\")\n            idr (gpu \"READ " amax-ids " " PICK-OFF " 4\")]\n"
-         "        (token-step (+ pos 1) n (string-concat acc (string-concat (if (= pos 0) \"\" \"#\") (string-concat ns (string-concat \"|\" (string-concat xr (string-concat \"|\" idr)))))))))\n"
+         "      (let [ns (gpu \"SUBMIT\")\n            xr (gpu \"READ " x-final " 0 " (* PF 8192) "\")\n            idr (gpu \"READ " amax-ids " " PICK-OFF " 4\")"
+         ;; NEX_DEBUG_BUFS=h,dq,... (iteration 59): extra READs of named dense buffers appended as |name=hex to each token's answer
+         (apply str (for [[nm hnd bytes] debug-bufs] (str "\n            " nm " (gpu \"READ " hnd " 0 " bytes "\")")))
+         "]\n"
+         "        (token-step (+ pos 1) n (string-concat acc (string-concat (if (= pos 0) \"\" \"#\") (string-concat ns (string-concat \"|\" (string-concat xr (string-concat \"|\" "
+         (reduce (fn [acc [nm _ _]] (str "(string-concat " acc " (string-concat \"|" nm "=\" " nm "))")) "idr" debug-bufs)
+         ")))))))))\n"
          "    acc))\n"
          (when resident?
            (str ";; resident (iteration 43): one message per step from standard input until EOF; the argmax id answers on standard output\n"
