@@ -145,18 +145,32 @@ ivec4 pq2_0_word_values(uint base, uint index) {
                int((w >> (s + 4u)) & 3u) - 1,
                int((w >> (s + 6u)) & 3u) - 1);
 }
-int ptq1_0_trit(uint base, uint e) {
-  uint b; uint n;
-  if (e < 80u) { b = weight_byte(base + (e & 15u)); n = e >> 4u; }
-  else if (e < 120u) { uint q = e - 80u; b = weight_byte(base + 16u + (q & 7u)); n = q >> 3u; }
-  else { uint q = e - 120u; b = weight_byte(base + 24u + (q & 1u)); n = q >> 1u; }
-  for (uint i = 0u; i < n; i++) b = (b * 3u) & 255u;
-  return int((b * 3u) >> 8u) - 1;
+uint ptq1_pow3(uint n) {
+  // Co-scientist iteration 63: the PTQ byte holds five radix-3 digits.
+  // A fixed factor replaces the old variable-trip multiply loop.
+  return n == 0u ? 1u : n == 1u ? 3u : n == 2u ? 9u : n == 3u ? 27u : 81u;
 }
+int ptq1_decode_byte(uint b, uint pow3) { return int(((((b * pow3) & 255u) * 3u) >> 8u)) - 1; }
 ivec4 ptq1_0_word_values(uint base, uint index) {
   uint e = index & 127u;
-  return ivec4(ptq1_0_trit(base, e), ptq1_0_trit(base, e + 1u),
-               ptq1_0_trit(base, e + 2u), ptq1_0_trit(base, e + 3u));
+  // index is a multiple of four. The first 120 trits therefore come from four
+  // adjacent radix bytes at one shared digit depth. Decode the packed word as
+  // a vector instead of running four variable-trip multiply loops.
+  if (e < 120u) {
+    uint q = e < 80u ? e : e - 80u;
+    uint offset = e < 80u ? base + (e & 15u) : base + 16u + (q & 7u);
+    uint n = e < 80u ? e >> 4u : q >> 3u;
+    uint w = weights[offset >> 2u];
+    uvec4 b = uvec4(w & 255u, (w >> 8u) & 255u, (w >> 16u) & 255u, w >> 24u);
+    b = (b * ptq1_pow3(n)) & uvec4(255u);
+    return ivec4((b * 3u) >> 8u) - ivec4(1);
+  }
+  // Two tail bytes hold four digits each. e is 120 or 124 here.
+  uint w = weights[(base + 24u) >> 2u], n = (e - 120u) >> 1u;
+  uint b0 = w & 255u, b1 = (w >> 8u) & 255u;
+  uint p0 = ptq1_pow3(n), p1 = ptq1_pow3(n + 1u);
+  return ivec4(ptq1_decode_byte(b0, p0), ptq1_decode_byte(b1, p0),
+               ptq1_decode_byte(b0, p1), ptq1_decode_byte(b1, p1));
 }
 vec4 bf16_values(uint base, uint index) {
   uint w = (base + index * 2u) >> 2u;
