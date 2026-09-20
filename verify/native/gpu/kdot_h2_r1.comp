@@ -29,7 +29,7 @@
 // :gpu/compute path (root ADR-2609182400 C). Same bindings, same Meta, same
 // dequant helpers; every buffer is std430 storage so the .kotoba guest's
 // PIPELINE declares five storage bindings and nothing else.
-//   tensor_type: 12 Q4_K (144 B/256) | 13 Q5_K (176) | 14 Q6_K (210) | 23 IQ4_XS (136)
+//   tensor_type: 12 Q4_K (144 B/256) | 13 Q5_K (176) | 14 Q6_K (210) | 23 IQ4_XS (136) | 8 Q8_0 (272, tick 55) | 2 Q4_0 (144) | 1 F16 (512)
 // Dispatch: (ceil(rows / 8), positions, 1).
 layout(local_size_x = 64) in;
 layout(std430, binding = 0) readonly buffer Meta {
@@ -120,11 +120,65 @@ int iq4xs_scale(uint base, uint ib) {
   return int(((scales_l >> (4u * (ib & 1u))) & 15u) | (((scales_h >> (2u * ib)) & 3u) << 4u));
 }
 uint block_bytes_of(uint t) {
-  if (t == 12u) return 144u; if (t == 13u) return 176u; if (t == 14u) return 210u; if (t == 23u) return 136u; return 0u;
+  if (t == 12u) return 144u; if (t == 13u) return 176u; if (t == 14u) return 210u; if (t == 23u) return 136u;
+  if (t == 8u) return 272u; if (t == 2u) return 144u; if (t == 1u) return 512u; return 0u;
 }
 
-
-
+// Q8_0 (8) / Q4_0 (2) / F16 (1) on the half path (tick 55, the nvgpu twin of kdot_f32_r1's iteration-53 arms):
+// 32-value blocks (34 B = f16 d + 32 int8 | 18 B = f16 d + 16 nibble bytes, code - 8) or none (F16). Rows are
+// ceil(cols / 32) blocks, cols need not be a 256-multiple (Qwen2.5-0.5B: 896 = 28 blocks, ffn_down 4864 = 152 =
+// 19 groups): the group count is ceil(cols / 256), row_bytes = ceil(cols / 32) * 34 (18 / 64), the tail group is
+// masked in main. NOTHING IS STAGED for these types (hwords = 0): the per-32 d sits inside the block and is read
+// through weight_half, so hdr[16][5] keeps its 16-block capacity (Nex rows <= 4096) and a 19-group row never
+// touches it. Codes -> halves by the exponent trick: Q8_0 bytes are signed, so the sign bit is flipped first
+// (s ^ 0x80 = s + 128 as a byte, 0..255), 0x6400 | (s + 128) is the half 1024 + s + 128, and the packed
+// subtract of 1152 gives s exactly (every step is an integer below 2048, exact in f16). That form is kept behind
+// -DQ8_TRICK for A/B only: the shipped form is float16_t(int8) conversion (I2F), bit-identical and measured
+// faster for the whole binary (see term32). Q4_0 folds the -8 into the bias
+// (1032). F16 halves are loaded as f16vec2 directly, no conversion. Products as in term(): two packed multiplies,
+// the four products summed in f32, d applied in f32.
+void codes8_to_halfs(uint codes, out f16vec2 lo, out f16vec2 hi) {   // codes: four bytes = int8 + 128
+  uint w0 = 0x64006400u | (codes & 0xFFu) | ((codes << 8u) & 0x00FF0000u);
+  uint w1 = 0x64006400u | ((codes >> 16u) & 0xFFu) | ((codes >> 8u) & 0x00FF0000u);
+  lo = unpackFloat2x16(w0) - f16vec2(1152.0hf);
+  hi = unpackFloat2x16(w1) - f16vec2(1152.0hf);
+}
+void codes4_0_to_halfs(uint codes, out f16vec2 lo, out f16vec2 hi) {   // codes: four nibbles as bytes -> q - 8
+  uint w0 = 0x64006400u | (codes & 0x0Fu) | ((codes << 8u) & 0x000F0000u);
+  uint w1 = 0x64006400u | ((codes >> 16u) & 0x0Fu) | ((codes >> 8u) & 0x000F0000u);
+  lo = unpackFloat2x16(w0) - f16vec2(1032.0hf);
+  hi = unpackFloat2x16(w1) - f16vec2(1032.0hf);
+}
+// this thread's four values of 256-group `wb` for the non-K-quant types (no hdr entry)
+float term32(uint wb, uint tt, uint index, f16vec2 ylo, f16vec2 yhi) {
+  f16vec2 qlo, qhi; float d;
+  if (tt == 8u) {
+    uint bo = wb + (index / 32u) * 34u;
+    uint codes = weight_u32_at(bo + 2u + (index & 31u));
+#ifdef Q8_TRICK
+    codes8_to_halfs(codes ^ 0x80808080u, qlo, qhi);   // -DQ8_TRICK: the exponent trick, kept for A/B
+#else
+    // int8 -> half by conversion (I2F). Bit-identical to the exponent trick below, and the binary that carries
+    // this form runs EVERY arm faster on nvgpu (fp16 ffn_down 76 vs 41-44 GB/s, Q8_0 attn_q 20.5 vs 6-8, Q5_K
+    // control 21.5 vs 17-21; the trick binary is also erratic run to run) -- the same whole-binary effect as
+    // iteration 21's Q6 arm. Measured 2026-09-20 on the Xavier, README tick 55.
+    qlo = f16vec2(float16_t(bitfieldExtract(int(codes), 0, 8)), float16_t(bitfieldExtract(int(codes), 8, 8)));
+    qhi = f16vec2(float16_t(bitfieldExtract(int(codes), 16, 8)), float16_t(bitfieldExtract(int(codes), 24, 8)));
+#endif
+    d = weight_half(bo);
+  } else if (tt == 2u) {
+    uint within = index & 31u; uint bo = wb + (index / 32u) * 18u;
+    uint w = weight_u32_at(bo + 2u + (within & 15u));   // value j < 16: low nibble of byte j; j >= 16: high nibble of byte j - 16
+    codes4_0_to_halfs(((within >= 16u) ? (w >> 4u) : w) & 0x0F0F0F0Fu, qlo, qhi);
+    d = weight_half(bo);
+  } else {
+    uint w = (wb + index * 2u) >> 2u;   // four halves = two aligned words (cols even -> row_bytes a 4-multiple)
+    qlo = unpackFloat2x16(weights[w]); qhi = unpackFloat2x16(weights[w + 1u]);
+    d = 1.0;
+  }
+  f16vec2 p0 = qlo * ylo, p1 = qhi * yhi;
+  return d * (float(p0.x) + float(p0.y) + float(p1.x) + float(p1.y));
+}
 
 // two f16vec2 holding the four codes q0..q3 (each < 32) of `codes`, whose byte k is q_k
 void codes_to_halfs(uint codes, out f16vec2 lo, out f16vec2 hi) {
@@ -210,14 +264,15 @@ void main() {
   uint t = gl_LocalInvocationID.x;
   uint expert = expert_ids[position];
   uint in_row = ((params.input_per_expert == 1u) ? ((params.pad0 > 1u) ? position / params.pad0 : position) : 0u) + params.pad1;   // pad0 > 1: positions per input row (prefill MoE); pad1: input row offset (the lm_head on a prefill's last row) -- iterations 36-37
-  uint blocks = params.cols / 256u;
   uint tt = params.tensor_type;
+  bool b32 = (tt == 8u || tt == 2u || tt == 1u);   // 32-value blocks / no blocks: rows need not be 256-multiples, nothing staged
+  uint blocks = b32 ? (params.cols + 255u) / 256u : params.cols / 256u;
   uint block_bytes = block_bytes_of(tt);
-  uint row_bytes = blocks * block_bytes;
+  uint row_bytes = b32 ? ((params.cols + 31u) / 32u) * (block_bytes / 8u) : blocks * block_bytes;
   uint index = t * 4u;
   bool live = row < params.rows && position < params.positions;
   uint rowbase = (expert * params.rows + row) * row_bytes;
-  uint hwords = (tt == 14u) ? 5u : (tt == 23u) ? 2u : 4u;
+  uint hwords = b32 ? 0u : (tt == 14u) ? 5u : (tt == 23u) ? 2u : 4u;
   if (t < 16u) cb[t] = float16_t(kvalue(t));
   if (live) {
     for (uint w = t; w < blocks * hwords; w += 64u) {
@@ -230,11 +285,30 @@ void main() {
   float acc0 = 0.0, acc1 = 0.0;
   if (live) {
     uint xrow = in_row * params.cols + index;
-    for (uint b = 0u; b < blocks; b += 2u) {
-      vec4 y0 = x4[(xrow + b * 256u) >> 2u];
-      vec4 y1 = x4[(xrow + (b + 1u) * 256u) >> 2u];
-      acc0 += term(b, rowbase + b * block_bytes, tt, index, y0, y0.x + y0.y + y0.z + y0.w, f16vec2(y0.xy), f16vec2(y0.zw));
-      acc1 += term(b + 1u, rowbase + (b + 1u) * block_bytes, tt, index, y1, y1.x + y1.y + y1.z + y1.w, f16vec2(y1.xy), f16vec2(y1.zw));
+    if (b32) {
+      // two groups per iteration as below, with the odd 19th group (ffn_down 4864) as a trailing single and the
+      // tail group masked per thread (index past cols; only the last group can be one, so the break is safe)
+      uint b = 0u;
+      for (; b + 1u < blocks; b += 2u) {
+        if (b * 256u + index >= params.cols) break;
+        vec4 y0 = x4[(xrow + b * 256u) >> 2u];
+        acc0 += term32(rowbase + b * block_bytes, tt, index, f16vec2(y0.xy), f16vec2(y0.zw));
+        if ((b + 1u) * 256u + index < params.cols) {
+          vec4 y1 = x4[(xrow + (b + 1u) * 256u) >> 2u];
+          acc1 += term32(rowbase + (b + 1u) * block_bytes, tt, index, f16vec2(y1.xy), f16vec2(y1.zw));
+        }
+      }
+      if (b < blocks && b * 256u + index < params.cols) {
+        vec4 y0 = x4[(xrow + b * 256u) >> 2u];
+        acc0 += term32(rowbase + b * block_bytes, tt, index, f16vec2(y0.xy), f16vec2(y0.zw));
+      }
+    } else {
+      for (uint b = 0u; b < blocks; b += 2u) {
+        vec4 y0 = x4[(xrow + b * 256u) >> 2u];
+        vec4 y1 = x4[(xrow + (b + 1u) * 256u) >> 2u];
+        acc0 += term(b, rowbase + b * block_bytes, tt, index, y0, y0.x + y0.y + y0.z + y0.w, f16vec2(y0.xy), f16vec2(y0.zw));
+        acc1 += term(b + 1u, rowbase + (b + 1u) * block_bytes, tt, index, y1, y1.x + y1.y + y1.z + y1.w, f16vec2(y1.xy), f16vec2(y1.zw));
+      }
     }
   }
   float sg = subgroupAdd(acc0 + acc1);

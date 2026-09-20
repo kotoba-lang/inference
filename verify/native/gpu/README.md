@@ -1526,3 +1526,65 @@ Answer in one word." → `"Paris"` (llama-server on the same GGUF: `"Paris"`), c
 Not done: B70 / Xavier runs of the dense guests (anv int8 / nvgpu h2 layouts have no Q8_0 arm yet — `kdot_i8_x8r4`,
 `kdot_h2_r1`; on those boxes a dense model would fall to the f32 kernels), Q4_K_M mixes with Q5_0 (type 6: kdot arm
 missing), SentencePiece models (refused by name), the Xavier head shell not yet updated to the new tokenizer core.
+
+## Tick 55 (2026-09-20): Q8_0 / Q4_0 / F16 in the nvgpu kernels (`kdot_h2_r1` / `kdot_s4_r1`) — measured on the Xavier
+
+The three iteration-53 arms (Q8_0 type 8, Q4_0 type 2, F16 type 1; 32-value blocks of 34 / 18 B or none, rows
+`ceil(cols / 32)` blocks, group count `ceil(cols / 256)`, tail group masked) are now in the two nvgpu one-row
+kernels: `kdot_s4_r1.comp` (the exact f32 row, `nvgpu-exact`) and `kdot_h2_r1.comp` (the packed-half row; both
+`kdot_h2_r1.spv` and `-DQ6_HALF` → `kdot_h2q6_r1.spv` build and carry the arms). **Staging**: these types stage
+nothing (`hwords = 0`) — the per-32 `d` sits inside the block and is read through `weight_half` — so
+`hdr[16][5]` keeps its 16-block capacity and Qwen's ffn_down (cols 4864 = 19 groups) never touches it; the
+two-groups-per-iteration loop gets a trailing single for the odd 19th group and a per-thread tail mask. The
+K-quant loop is untouched. h2 dequant: Q4_0 by the exponent trick with the −8 folded into the bias (1032); F16
+loaded as `f16vec2` directly; **Q8_0 by `float16_t(int8)` conversion (I2F)** — the exponent trick for signed bytes
+(`s ^ 0x80` then `0x6400 |`, minus 1152) is kept behind `-DQ8_TRICK` and produces bit-identical outputs, but the
+binary that carries it runs *every* arm slower and erratically on nvgpu (below), the same whole-binary effect as
+iteration 21's Q6 arm. `gen_kdot_guest.cljk` gains the layouts `s4r1` / `h2r1` / `h2q6r1` and `KDOT_SPV_DIR`
+(measure a rebuilt kernel from a side directory before it replaces the installed one). Xavier holds
+`kdot_{h2,h2q6,s4}_r1.spv.pre-q80`; the Qwen GGUFs are in `/root/kgpu/models/` (sha256 = the HF etags
+`ca59ca7f…` / `7671c0c3…` / `8e0ae260…`; root fs 4.5 → 3.2 GB free).
+
+Xavier, nvgpu, GPU at 1377 MHz, first 64 rows, `max |gpu − f64| / max(|f64|, 1e-2)` against `kdot_ref.py`, GB/s
+from 10 dispatches in one buffer. **The production resident head (`rap40-nv.bin`, :8090) was on the GPU during
+every number here**; attn_k is launch-bound and its GB/s is not listed.
+
+| type | tensor (rows × cols) | s4r1 exact | s4 GB/s | h2r1 | h2 GB/s |
+|---|---|---|---|---|---|
+| Q8_0 | `blk.0.attn_q` (896 × 896) | **6.42e-6** | 22.3 | 3.70e-2 | 20.6 |
+| Q8_0 | `blk.0.attn_k` (128 × 896) | 4.73e-6 | — | 3.93e-3 | — |
+| Q8_0 | `blk.0.ffn_down` (896 × 4864, 19 groups) | 2.19e-6 | 44–47 | 1.28e-2 | 42–43 |
+| Q4_0 | `blk.0.attn_q` | 7.75e-6 | 11.7 | 1.80e-2 | 11.2 |
+| Q4_0 | `blk.0.ffn_down` | 3.88e-6 | 20.2 | 7.71e-3 | 20.8 |
+| F16 | `blk.0.attn_q` | 2.83e-6 | 26.2 | 3.22e-2 | 38.6 |
+| F16 | `blk.0.ffn_down` | 3.64e-6 | 63.3 | 4.04e-3 | **74.6** |
+
+s4 is exact to the f32-accumulation floor (≤ 7.75e-6, K16's f32 kernels gave ≤ 1.01e-5 on the same tensors). The
+h2 column is the half format's budget, in the band of the existing arms (Q5_K attn_qkv on the same box and metric:
+3.97e-2): rel-RMS against the f64 dot is 1.8e-4 – 2.2e-4 for all six h2 cells, of which rounding `x` to f16
+alone is 1.4e-4 – 2.1e-4; max |Δ| 1.3e-3 on attn_q (|dot| ≤ 5.8). An emulation of the kernel's arithmetic
+(x → f16 RN or RTZ, products in f16 or f32, f32 sums) did **not** reproduce the GPU bit-for-bit (1e-2-level
+differences either way, each as far from f64 as the GPU is) — the driver's f32 → f16 conversion / product
+rounding could not be pinned; the addressing is verified by the exact kernel, which shares it.
+
+**Unchanged-numerics control** (same guests, installed pre-q80 spv vs the rebuilt spv, outputs compared as hex):
+Q5_K `blk.0.attn_qkv` h2r1 **bit-identical** (3.97e-2; 20.9 → 21.5 GB/s), s4r1 bit-identical (6.64e-6; 18.6 → 19.2),
+Q6_K `output` h2q6r1 bit-identical (3.37e-3; 26.3 / 25.0 / 24.8 pre vs 25.6 / 24.5 / 24.9 new — noise). The
+40-layer × 6-token `fn` guest (prompt 9707,198,220): hidden states and final logits **bit-identical** across all
+eight runs (argmax 198, 410, 471, 220, 16, 15).
+
+**Q8_0 I2F vs exponent trick, whole-binary effect** (same source otherwise; spv files swapped under each other's
+path to separate kernel content from the guest): the trick binary — fp16 ffn_down 40.8 / 44.3 GB/s (77.3 once),
+Q4_0 ffn_down 11.6 – 25.2, Q8_0 ffn_down 19.6 – 29.4 (41.3 once), Q8_0 attn_q 5.7 – 8.3 (19.0 once), Q5_K control
+17.1 / 20.9; the I2F binary — fp16 76.5 / 75.6 / 74.6, Q4_0 19.7 / 20.5 / 20.8, Q8_0 ffn_down 41.3 – 43.1, attn_q
+19.4 – 20.6, Q5_K 21.5 / 21.6, stable run to run. Installed = I2F.
+
+**40-layer token A/B, 3 pairs, not a conclusion.** ms/step (mean of steps 1–5) pre-q80 → new: 85.7 → 88.6,
+89.2 → 90.3, 87.7 → 89.7 (the trick build: 87.4, 89.5). The spread inside one side (85.7 vs 89.2) is as large as
+the gap; the pairs ran beside the production head, and two 40-layer guests do not fit the box: the head was
+SIGKILLed (status 9/KILL, load 24) at 12:37 and 12:46 JST while a pair loaded — the runs were stopped, no more
+40-layer guests are to be run on Xavier (a token-level control there is the 12-layer guest at most), and the
+head's 12:46:25 restart loaded the **pre-q80** spv (in place at that moment for the interleaved pair); the new
+spv were re-installed after it, so the running head keeps pre-q80 pipelines until its next restart. Not measured:
+the new binaries under the production head, Q4_0 / F16 attn_k, an odd-block-count row (as in tick 53), B70 / K16
+(these kernels are nvgpu-only). Scratch on the box: `/root/kgpu/q80wip/` (sources, spv variants, guests, outputs).
