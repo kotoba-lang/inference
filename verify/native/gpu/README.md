@@ -41,14 +41,16 @@ why the serving path records one command buffer per token (ADR-2609182100 D1).
 
 `kdot_f32_r1.comp` and the positions kernel now decode Prism's group-128
 `PQ2_0` (GGML type 142) and `PTQ1_0` (143), plus the BF16 projections used by
-Qwen3.5 gated delta net. PTQ1_0's physical block order is `qs[24], qh[2], d`;
+the Qwen3.8-27B gated delta net. Its GGUF architecture identifier is `qwen35`;
+that implementation identifier does not make the checkpoint a Qwen3.5 model.
+PTQ1_0's physical block order is `qs[24], qh[2], d`;
 it intentionally does not share PQ2_0's `d, qs[32]` offsets.
 `embed_iq4xs.comp -DPTQ1` supplies the corresponding token-row lookup.
 
 Folded Bonsai weights require an activation basis change before every folded
 matmul. `hadamard_signed.comp` implements the checkpoint contract: normalized
 1024-wide Sylvester Hadamard blocks, explicit signs, inverse-after-embedding,
-and the Qwen3.5 recurrent `ssm_out` reorder from tiled `[hd,nk,rep]` to grouped
+and the Qwen3.8 recurrent `ssm_out` reorder from tiled `[hd,nk,rep]` to grouped
 `[hd,rep,nk]` before the transform. It handles independent rows, so the same
 kernel is usable by the resident adaptive batch scheduler.
 
@@ -68,8 +70,25 @@ CPU codec to at most `1.526e-5`; 37 real rows of
 Hadamard cases at widths 5120, 6144, and 17408 agree to `2.384e-7` absolute.
 This evidence covers tensor execution and the activation transform. It does
 not claim a complete 64-layer token, HTTP throughput, or fleet concurrency;
-those require wiring these operations into the Qwen3.5 dense-hybrid layer
+those require wiring these operations into the Qwen3.8 dense-hybrid layer
 recipe and measuring the resident guest on the target GPU.
+
+`ternary_kdot_bench.js` measures the same production PTQ1_0 shaders with real
+checkpoint tensors and independent activation rows. It rejects dispatches
+larger than the WebGPU workgroup limit instead of reporting command-error
+overhead as throughput. A row limit can be used for the 248,320-row LM head;
+scaling that partial timing to the full vocabulary remains an estimate.
+
+```
+deno run --unstable-webgpu --allow-read --allow-write --allow-run \
+  verify/ternary_kdot_bench.js /path/to/Ternary-Bonsai-2-27B-PTQ1_0.gguf \
+  blk.0.ffn_gate.weight 1,4,8,16
+```
+
+The 2026-09-20 M1 Max measurements and their scope are recorded in
+`verify/evidence/ternary-bonsai-2-27b-m1max-20260920.json`. The Murakumo values
+there are real kernel timings accumulated over the model's tensor inventory,
+not a completed token or HTTP measurement.
 
 `kdot_f32_r8.comp` / `kdot_f32_r1.comp` are the GLSL twins of
 `shaders/ggml_kdot_f32_r8.wgsl` / `ggml_kdot_f32.wgsl` (Q4_K 12 / Q5_K 13 /
