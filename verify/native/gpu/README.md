@@ -1486,3 +1486,43 @@ the check bites. llama.cpp's own oracle (`tokenizer_oracle.cljk` over `models/gg
 `default` has no shipped oracle, so `oracles/ggml-vocab-gpt-neox.gguf.{inp,out}` (62 texts) was produced with
 `llama-tokenize` and is **62/62**. The oracle goes red for the reason named: `ignore_merges` off → 45/46 (`"Cửa Việt"`),
 `\p{N}{1,3}` → `\p{N}` → 35/46. Not done: SentencePiece (refused), gemma / mistral measurement, a jinja engine (by design).
+## Tick 54 (2026-09-20, HF coverage 1): the generator reads the architecture — Qwen2.5-0.5B and Llama-3.2-1B run
+
+Owner direction: reach toward the model families on huggingface.co/models. Three subagents worked in parallel
+(their sections above: the Q8_0 / Q4_0 / F16 kdot arms with 896-column tails, the dense f64 oracle `dense_ref.py` /
+`dense_check.py`, and the tokenizer families + `chat_templates.cljk`), and the generator grew an architecture recipe:
+
+- **Every dimension from the GGUF**: `general.architecture` (`qwen35moe` = Nex, `qwen2`, `llama`), `embedding_length`,
+  `head_count`, `head_count_kv`, head dim (dense: NE / NH), `feed_forward_length`, `rope.dimension_count` (default
+  the head dim), `rope.freq_base`, rms eps, vocab from `output.weight` (or the tied `token_embd.weight`), the lm_head /
+  embedding tensor TYPES, argmax partials = ceil(vocab / 4096) (61 / 38 / 32) and the pick slot from it, tensor byte
+  counts for F32 / F16 / Q8_0 / Q4_0. The box weight file is the GGUF's basename (or `NEX_BOX_GGUF`; Nex runs pass
+  `nex.gguf`). Nex regenerates to the same program (byte-identical before the pipeline list grew; oracle-exact after).
+- **A dense block** `emit-dense-layer!`: rmsnorm → q / k / v kdots (+ bias via `add_bias`, zero stand-ins when the
+  model has none) → rope (`p0 = 1` NORM pairs for llama, NEOX otherwise; `rope_freqs.weight` as per-frequency divisors
+  when present — llama3 scaling) → KV copy → `attn_decode` with `p0 = 1` (no output gate) → o → residual + rmsnorm →
+  SwiGLU → residual. The resident / adaptive-batch / batch-prefill machinery is shared: `WSTRIDE` 12 handles per layer,
+  every layer an attention layer, KV slot = `NKV · HD`. `embed_iq4xs.comp -DQ8` reads a Q8_0 embedding row.
+- Two bugs found by reading intermediates (`NEX_DEBUG_BUFS=x,h,dq,…` appends named READs to a fn-mode answer): the rope
+  base came from the Nex-only key (nil → NaN θ from the second element on), and the final norm ran over 2048 elements
+  for an 896-wide row (argmax-invariant — the fn guest matched the oracle's argmax chain anyway — but distribution-wrong,
+  and rows ≥ 1 of a batch read the wrong offset). Both are now dims.
+
+Measured on K16 (RADV), f64 oracle = `dense_ref.py` (which itself matched llama.cpp's greedy continuation and full
+distribution at KL 1.5e-3 / 4.2e-4 nats, see the oracle section):
+
+| model | prompt | native ids | oracle | `x rel` | GPU ms/token |
+|---|---|---|---|---|---|
+| Qwen2.5-0.5B-Instruct Q8_0, 24 L | 785,6722,315,9625,374 | 2701,315,279,374, **12095,13,1084,374**, 279 | 8/8 | ≤ 1.9e-6 | **16.0** |
+| Llama-3.2-1B-Instruct Q8_0, 16 L | 128000,791,6864,315,9822,374 | 16309,2768,315,9822,374, **12366,13,578,469** | 9/9 | ≤ 1.1e-6 | **34.5** |
+
+Adaptive guests (`prefill:8 batch:1,2,4`): Qwen prefill-chunked row + plain row both oracle-exact (`--parts 38`), B=4
+four rows exact at 17.8 ms/step (≈ 225 sequence-tokens/s), B=1 16.0; Llama prefill + plain rows exact at 36.3 ms/step.
+**Served over HTTP** (`serve_http.cljk`, template recognized from the GGUF): Qwen chat "What is the capital of France?
+Answer in one word." → `"Paris"` (llama-server on the same GGUF: `"Paris"`), completion "The capital of France is" →
+`" Paris. It is the largest city in"` = llama-server, 215 ms; Llama-3.2 → `"Paris"` / `" Paris. The Eiffel Tower is"`
+= llama-server. The K16 shells stay up on :8100 (Qwen) and :8101 (Llama) beside the Nex one on :8099.
+
+Not done: B70 / Xavier runs of the dense guests (anv int8 / nvgpu h2 layouts have no Q8_0 arm yet — `kdot_i8_x8r4`,
+`kdot_h2_r1`; on those boxes a dense model would fall to the f32 kernels), Q4_K_M mixes with Q5_0 (type 6: kdot arm
+missing), SentencePiece models (refused by name), the Xavier head shell not yet updated to the new tokenizer core.
