@@ -1,11 +1,16 @@
 # drive a `resident-replay … batch:<B>` guest: B sequences advance together, one message "t0,…,tB-1,f0,…,fB-1" per step
 # (TEST HARNESS beside the oracle). Each row has its own prompt and token budget; a finished or empty row is fed
 # token 0 with flag 1 (a rewind that costs nothing). Rows are compared with the single-sequence oracles.
-# python3 batch_drive.py <loader> <batch.bin> <offset> <isa> <B> <prompt-ids>:<ntok>[:<expected-ids>] ...
+# python3 batch_drive.py <loader> <batch.bin> <offset> <isa> <B> [--prefill P] <prompt-ids>:<ntok>[:<expected-ids>] ...
 import subprocess, sys, os, struct, time
 loader, binf, off, isa, B = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5])
+# --prefill P (iteration 57): a row with more than P prompt tokens left gets its own prefill message "P tokens, row, flag, 0"
+# (one row per tick) before the batch ticks resume
+PB = 0
+specs = sys.argv[6:]
+if "--prefill" in specs: k = specs.index("--prefill"); PB = int(specs[k + 1]); specs = specs[:k] + specs[k + 2:]
 rows = []
-for spec in sys.argv[6:]:
+for spec in specs:
     parts = spec.split(":"); ids = [int(t) for t in parts[0].split(",")]; ntok = int(parts[1])
     exp = [int(t) for t in parts[2].split(",")] if len(parts) > 2 and parts[2] else None
     rows.append({"ids": ids, "ntok": ntok, "exp": exp, "i": 0, "out": [], "next": ids[0], "reset": True})
@@ -15,6 +20,14 @@ p = subprocess.Popen([loader, binf, off, "0", isa, "42,33,41,37,39"], stdin=subp
 def active(r): return r["i"] < len(r["ids"]) or len(r["out"]) < r["ntok"]
 nss = []; t0 = None; steps = 0
 while any(active(r) for r in rows):
+    pre = next((ri for ri, r in enumerate(rows) if active(r) and len(r["ids"]) - r["i"] > PB > 0), None)
+    if pre is not None:
+        r = rows[pre]; chunk = r["ids"][r["i"]:r["i"] + PB]
+        p.stdin.write((",".join(map(str, chunk + [pre, 1 if r["reset"] else 0, 0]))).encode()); p.stdin.flush()
+        if t0 is None: t0 = time.time()
+        line = p.stdout.readline().decode().strip(); ns, idhex = line.split("|"); nss.append(int(ns)); steps += 1
+        r["reset"] = False; r["i"] += PB; r["next"] = r["ids"][r["i"]]
+        continue
     toks = []; flags = []
     for r in rows:
         if active(r): toks.append(r["next"]); flags.append(1 if r["reset"] else 0)

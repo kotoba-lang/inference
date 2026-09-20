@@ -24,6 +24,8 @@ void main() {
   uint row = gl_WorkGroupID.y;   // prefill: token row of the batch (decode dispatches y = 1)
 #ifdef BATCH
   uint tok = ids[row * P.pad1 + pos[row]];   // C-4 (iteration 51): rows are sequences; pad1 = token-buffer stride per row
+#elif defined(BPREFILL)
+  uint tok = ids[pos[1] * P.pad1 + pos[0] + row];   // iteration 57: P positions of sequence pos[1] from its base pos[0]
 #else
   uint tok = ids[((P.dyn != 0u) ? pos[0] : P.slot) + row];
 #endif

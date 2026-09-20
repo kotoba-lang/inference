@@ -1293,3 +1293,31 @@ decode + ~5 ms sampler; its 1.65 s comes from the prefill chunks the batch step 
 N=8 **16.7 seq-tokens/s** vs 11.5. The serial guest stays the Xavier head until per-row prefill lands — the
 one remaining gap. The h2 positions-inner-loop kernel that tick 50 named is not needed: at B = 1 the h2 decode
 kernel is the right form, and at B ≥ 2 the f32 positions kernel already wins on Xavier.
+
+## Tick 52 (2026-09-20, C-4): per-row prefill in the batch step — the adaptive guest takes the Xavier head
+
+`… resident-replay prefill:<P> batch:1,2,4`: the adaptive guest records one more kept buffer, a BATCH PREFILL —
+P positions of the ONE sequence the message names (`P tokens, row, flag, pad` = P+3 words; the generator refuses
+a P whose P+3 collides with a 2B / 5B message). `-DBPREFILL` kernel twins add the sequence's slice offsets to the
+prefill kernels: `ctl` writes the P tokens into the row's token buffer at its base, rewinds it on the flag, and
+leaves `rowsel = [base, row]`; `embed` reads `tokbuf[row·4096 + base + i]`; `copy_at` / `attn_decode` address the
+row's KV slice (`row · 4096 · 512`); `pos_seed` seeds each layer's stepbuf `[base, 0, row]` and `deltanet_fused`
+offsets its ring and state by `pos[2]`; `pos_add` advances `rowpos[row]` by P. The prefill's argmax lands in
+row 0's slot as before (the shell ignores it unless the prompt ends there — it never does: chunks are taken
+only while more than P tokens remain). The scheduler runs a prefill tick for one such row before each batch tick.
+
+Two things had to give for the 40-layer program to compile: the single-row functions are not emitted for
+adaptive guests (never called there), and the 733 `MAP` literals no longer each carry the weight file's path
+(`(M "off len")` through one helper) — 66.7 → 49.1 KB of the 64 KiB string budget.
+
+K16 12 L (`rap12.bin`, `batch_drive.py --prefill 8`): a 12-token prompt row (one 8-chunk + 4 singles) next to a
+3-token row → `4032, 268` and `169222, 169484`, both = oracle, 6 steps / 267 ms vs 13 steps / 476 ms without
+chunks; the same with the long prompts in rows 1 and 3 of a 4-row batch → 4/4. Over HTTP through the scheduler
+(`… 8 1,2,4`): a 19-token prompt alone in 338 ms (2 chunks + 3 singles + 3 generated), three of them plus a short
+one concurrently in 1.04 s, identical ids.
+
+**Xavier's head unit now runs `rap40-nv.bin` (`prefill:8 batch:1,2,4`)** — the previous unit file is kept as
+`murakumo-xavier-nex-native.service.serial`. Against the serial head on the same requests: greedy chat 21 prompt
+tokens → `"Paris"` in **1.70–1.74 s** (serial 1.65–1.70), the seeded haiku (T 0.7 / top_p 0.9 / seed 7) → the
+**same three lines** in 22 tokens / 3.05 s (serial 2.9 s), load N=4 15.8 and N=8 **17.2 seq-tokens/s** (serial
+11.5). No feature is lost: greedy, sampling with seed, streaming, chunked prefill, and now batching (1.5× at N=8).

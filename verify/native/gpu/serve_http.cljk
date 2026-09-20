@@ -35,9 +35,9 @@
 ;; batch rows B of a `… batch:<B>` guest (iteration 53, C-4): the shell becomes a SCHEDULER -- B rows are slots, a
 ;; request takes a free row and leaves it on stop / length, and every step is one 2B-word message (B tokens, B flags)
 ;; that advances every occupied row at once (an empty row is fed 0 with flag 1). The batch step is greedy and one
-;; token per row per step, so in batch mode prefill chunks are not used (the single-row steps share row 0's state with
-;; the batch step and cannot be mixed in); sampling is per row (iteration 55: the message carries T / top_p / seed per
-;; row, T = 0 rows take the argmax). 0 = the serial shell as before.
+;; token per row per step; sampling is per row (iteration 55: the message carries T / top_p / seed per row, T = 0 rows
+;; take the argmax); with prefill-bucket P and a `prefill:<P>` adaptive guest a row with more than P prompt tokens left
+;; gets its own prefill tick (iteration 57). 0 = the serial shell as before.
 ;; iteration 54: "1,2,4" names an ADAPTIVE guest (`batch:1,2,4`) -- one kept step per B; each tick uses the smallest B that
 ;; covers the highest occupied row, so a lone request in row 0 pays a one-row step.
 (def batch-sizes (vec (sort (map js/parseInt (str/split (or (get args 8) "0") #",")))))
@@ -144,10 +144,24 @@
                                              (let [r (first @pending)] (swap! pending subvec 1) (assoc rs i (assoc r :reset? true)))
                                              rs))
                                rs (range (count rs))))))
+(defn prefill-tick!
+  "Batch prefill (iteration 57): row I has more than prefill-bucket prompt tokens left -- one message 'P tokens, row, flag, 0'
+   advances that row by P (its reply is not kept); the batch tick follows."
+  [g i]
+  (let [row (@rows i) P prefill-bucket chunk (subvec (:ids row) (:i row) (+ (:i row) P))]
+    (js/Promise. (fn [resolve _]
+                   (reset! (:waiter g) (fn [line] (swap! (:steps g) inc) (resolve (some? line))))
+                   (.write (.-stdin (:proc g)) (str/join "," (concat chunk [i (if (:reset? row) 1 0) 0])))))))
 (defn tick! []
   (admit!)
   (if (every? nil? @rows)
     (reset! ticking false)
+    (if-let [i (and (pos? prefill-bucket) (first (keep-indexed (fn [i r] (when (and r (> (- (count (:ids r)) (:i r)) prefill-bucket)) i)) @rows)))]
+      (.then (prefill-tick! (ensure-guest!) i)
+             (fn [ok?]
+               (if-not ok?
+                 (do (doseq [row @rows :when row] ((:resolve row) {:error "guest died"})) (reset! rows (vec (repeat batch-rows nil))) (reset! ticking false))
+                 (do (swap! rows update i (fn [r] (let [i2 (+ (:i r) prefill-bucket)] (assoc r :reset? false :i i2 :next ((:ids r) i2))))) (tick!)))))
     (let [g (ensure-guest!) rs @rows t0 (js/Date.now)
           top (inc (apply max (keep-indexed (fn [i r] (when r i)) rs)))   ;; rows 0..top-1 must be in the step
           B (or (first (filter #(>= % top) batch-sizes)) batch-rows)   ;; the smallest step that covers them
@@ -174,7 +188,7 @@
                                                  (do ((:resolve row) {:generated (:out row) :ns (:ns row) :finish "length"}) nil)
                                                  row))))))
                            cur))))
-                   (tick!))))))))
+                   (tick!)))))))))
 (defn run-batched
   "Prompt ids -> promise; the request joins the batch step at the next tick."
   [ids max-tokens & [on-token sample]]

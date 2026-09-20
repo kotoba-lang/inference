@@ -39,14 +39,20 @@ float wg_sum(uint t, float v) {
 #ifdef BATCH
 #define ROW gl_WorkGroupID.y
 #define MYPOS pos[ROW]
+#define SEQ ROW
+#elif defined(BPREFILL)
+// -DBPREFILL (iteration 57): a PREFILL of P positions of ONE batch sequence -- the stepbuf is [position, row, seq]
+#define ROW pos[1]
+#define MYPOS pos[0]
+#define SEQ pos[2]
 #else
 #define ROW pos[1]
 #define MYPOS pos[0]
 #endif
 float conv_step(uint c, uint p, bool own, uint qoff) {
   uint n = P.n, rb = p * 3u * n, wb = (1u - p) * 3u * n;
-#ifdef BATCH
-  rb += ROW * 6u * n; wb += ROW * 6u * n;
+#if defined(BATCH) || defined(BPREFILL)
+  rb += SEQ * 6u * n; wb += SEQ * 6u * n;
 #endif
   // position 0 has no history (iteration 43): a resident guest rewinds the position to 0 for a new
   // request and never zeroes the ring or the state, so both read as zero when pos[0] == 0.
@@ -78,8 +84,8 @@ void main() {
   float decay = exp(softplus(alpha[hoff + h] + dt[h]) * ssm_a[h]), b = sigmoid(betaL[hoff + h]);
   // delta rule on the head's state (K_ x V_): this thread owns column j, keys [i0, i1)
   uint sbase = h * K_ * V_, quarter = K_ / 4u, i0 = part * quarter, i1 = i0 + quarter;
-#ifdef BATCH
-  sbase += row * P.heads * K_ * V_;
+#if defined(BATCH) || defined(BPREFILL)
+  sbase += SEQ * P.heads * K_ * V_;
 #endif
   float kv_mem = 0.0;
   bool fresh = MYPOS == 0u;   // no history at position 0 (iteration 43)
