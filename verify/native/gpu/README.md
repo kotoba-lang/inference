@@ -1271,3 +1271,25 @@ seed 7) came back in 21 tokens / 4.3 s. **The serial guest stays the Xavier head
 guest's single-request path is 1.4× slower (kernel, not protocol) and lacks prefill chunks; the adaptive guest
 is ready for a bandwidth-bound box (K16) where its B=1 step equals a decode step. The two items that remain
 for the head switch on Xavier: an h2 batch kdot (positions inner loop on the h2 layout) and per-row prefill.
+
+## Tick 51 (2026-09-20, C-4): the B=1 batch step is the decode step — the kdot form per B
+
+Each batch step's non-MoE kdots now take one of two forms by B (`:batch-layout-upto`, default 1, env
+`NEX_BATCH_LAYOUT_UPTO`): up to that B the backend's DECODE kernels with the rows as the positions dispatch
+dimension (weights read B times; for B = 1 this is the decode step itself, int8 / h2 / r8 included — the int8 and
+dual forms are enabled for the B = 1 step), above it the positions kernel (weights once, rows inner). Measured
+12 layers, adaptive guests `batch:1,2,4`, GPU ms/step, rows oracle-exact throughout:
+
+| box | decode step | B=1 positions → **decode form** | B=2 positions / decode form | B=4 positions / decode form |
+|---|---|---|---|---|
+| K16 radv | 27.1 | 36.8 → **29.1** | **36.7** / 44.4 | **57.8** / 77.4 |
+| B70 anv | 5.0 | 7.8 → **5.23** (int8) | **9.02** / 9.55 | **13.3** / 17.3 |
+| Xavier nvgpu | 36.6 | 45.6 → **39.7** (h2) | 60.8 / 61.7 | **88.5** / 108.4 |
+
+So the lone request in the adaptive guest costs 1.05–1.08× a decode step (the difference is the sampler chain
+and the batch ops), and B ≥ 2 keeps the positions form on every box. Xavier 40 layers (`ra40-nv.bin`, head
+swapped for the run and restored): greedy chat 25 steps in 2.27–2.31 s = 91 ms/step (the serial head's 86 ms
+decode + ~5 ms sampler; its 1.65 s comes from the prefill chunks the batch step still lacks), N=4 15.9 and
+N=8 **16.7 seq-tokens/s** vs 11.5. The serial guest stays the Xavier head until per-row prefill lands — the
+one remaining gap. The h2 positions-inner-loop kernel that tick 50 named is not needed: at B = 1 the h2 decode
+kernel is the right form, and at B ≥ 2 the f32 positions kernel already wins on Xavier.

@@ -234,8 +234,15 @@
 ;; with the positions inner loop. Per backend (layout :prows), overridable with NEX_PROWS for the sweep.
 (def PROWS (js/parseInt (or (aget js/process.env "NEX_PROWS") (str (get layouts :prows 1)))))
 (defn pwg [rows] (quot (+ rows PROWS -1) PROWS))
-(defn pkdot! [pipe spv rows meta w x out ids] (if prefill? (dispatch! kdot-p (pwg rows) 1 1 meta w x out ids) (dispatch! pipe (wg-of spv rows) PF 1 meta w x out ids)))
-(defn pkdotc! [pipe spv rows meta w x out ids] (if prefill? (dispatchc! kdot-p (pwg rows) 1 1 meta w x out ids) (dispatchc! pipe (wg-of spv rows) PF 1 meta w x out ids)))
+;; batch kdot form (iteration 56): a batch step's non-MoE kdots use the backend's DECODE kernels with the rows as the
+;; positions dispatch dimension (weights read B times) when B <= the layout's :batch-layout-upto (NEX_BATCH_LAYOUT_UPTO),
+;; else the positions kernel (weights once, rows inner). Measured: the decode form wins at B = 1 on every box (it IS the
+;; decode step plus the sampler), the positions form from B = 2 on the bandwidth-bound boxes.
+(def ^:dynamic batch? false)
+(def batch-layout-upto (js/parseInt (or (aget js/process.env "NEX_BATCH_LAYOUT_UPTO") (str (get layouts :batch-layout-upto 1)))))
+(defn p-form? [] (and prefill? (not (and batch? (<= PF batch-layout-upto)))))
+(defn pkdot! [pipe spv rows meta w x out ids] (if (p-form?) (dispatch! kdot-p (pwg rows) 1 1 meta w x out ids) (dispatch! pipe (wg-of spv rows) PF 1 meta w x out ids)))
+(defn pkdotc! [pipe spv rows meta w x out ids] (if (p-form?) (dispatchc! kdot-p (pwg rows) 1 1 meta w x out ids) (dispatchc! pipe (wg-of spv rows) PF 1 meta w x out ids)))
 (def expert-spv (or (:expert layouts) (:narrow layouts)))
 (def deltanet (pipeline! "deltanet_step.spv" 8))
 (def deltanet-fused (when fused? (pipeline! "deltanet_fused.spv" 13)))
@@ -244,7 +251,6 @@
 (def embed-b (when BB (pipeline! "embed_iq4xs_b.spv" 5)))
 (def batch-op-names ["copy_at" "rope_neox" "attn_decode" "argmax_partial" "argmax_final" "pos_incr" "ctl"
                      "params" "sample_part" "sample_probs" "sample_bisect_part" "sample_bisect_step" "sample_final"])   ;; iteration 55: per-row sampling
-(def ^:dynamic batch? false)   ;; the batch phase is being emitted
 (def w-embd (map-tensor! "token_embd.weight"))
 (def prompt-ids (alloc! (max 16 (* 4 (count prompt)))))
 (def x (alloc! (* PMAX 8192)))
@@ -297,8 +303,11 @@
 (defn with-phase [ph f]
   (with-bindings (merge (into {} (map (fn [[v k]] [v (get ph k)]) phase-vars))
                         {#'PF (:pf ph) #'prefill? (:pre? ph) #'batch? (:batch? ph)
-                         #'i8-wide (when-not (:pre? ph) i8-wide*) #'i8-lm (when-not (:pre? ph) i8-lm*)
-                         #'i8-expert (when-not (:pre? ph) i8-expert*) #'kdot-expert-dual (when-not (:pre? ph) kdot-expert-dual*)})
+                         ;; int8 / dual forms: the decode phase, and a B = 1 batch step in the decode-layout form (it is the decode step)
+                         #'i8-wide (when (or (not (:pre? ph)) (and (:batch? ph) (= 1 (:pf ph)) (<= 1 batch-layout-upto))) i8-wide*)
+                         #'i8-lm (when (or (not (:pre? ph)) (and (:batch? ph) (= 1 (:pf ph)) (<= 1 batch-layout-upto))) i8-lm*)
+                         #'i8-expert (when (or (not (:pre? ph)) (and (:batch? ph) (= 1 (:pf ph)) (<= 1 batch-layout-upto))) i8-expert*)
+                         #'kdot-expert-dual (when (or (not (:pre? ph)) (and (:batch? ph) (= 1 (:pf ph)) (<= 1 batch-layout-upto))) kdot-expert-dual*)})
     (f))) (def m-gd (ops-meta! 32 32 32 0 0 0)) (def m-gd0 (ops-meta! 32 32 0 0 0 0)) (def m-conv (ops-meta! 8192 1 0 0 0 0))
 (def m-l2q (ops-meta! 128 16 0 0 eps (/ 1.0 (js/Math.sqrt 128)))) (def m-l2k (ops-meta! 128 16 0 2048 eps 0))
 (def m-dn (let [m (alloc! 32)] (write! m (str (le32 32) (le32 128) (le32 128) (le32 16) (le32 4096) (le32 0) (le32 0) (le32 0))) m))
