@@ -1,6 +1,6 @@
 # CPU dequant oracle for the :gpu/compute K-quant dot guests (verify/native/gpu). Python because it is a
 # TEST ORACLE beside numpy, not operations tooling (CLAUDE.md kbb-first is for tooling); a .cljk twin is debt.
-# GGUF tensor directory + CPU dequant reference for Q5_K / Q6_K / IQ4_XS rows.
+# GGUF tensor directory + CPU dequant reference for Q5_K / Q6_K / IQ4_XS / Q8_0 / Q4_0 / F16 rows.
 # Prints "name type offset(bytes, absolute in file) dims" and writes a reference dot.
 import struct, sys, numpy as np, json
 def read_gguf_dir(path):
@@ -72,7 +72,26 @@ def deq_q6k(blk):
             out[128*g+l]=d*scg[l//16]*q1; out[128*g+32+l]=d*scg[2+l//16]*q2
             out[128*g+64+l]=d*scg[4+l//16]*q3; out[128*g+96+l]=d*scg[6+l//16]*q4
     return out
-BLOCK={13:(176,deq_q5k),14:(210,deq_q6k),23:(136,deq_iq4xs)}
+# Q8_0 (8) / Q4_0 (2) / F16 (1), iteration 53: 32-value blocks (34 B / 18 B) or none (2 B/value), so a row is
+# ceil(cols/32) blocks and cols need not be a 256-multiple (Qwen2.5-0.5B: 896). BLOCK32 is the native unit the
+# main loop uses for these types; the deq_*(256-group) forms below are the 8-block wrappers for callers that
+# want the K-quant shape (272 / 144 / 512 B per 256 values, block_bytes_of() in the kernels).
+def deq_q8_0_32(b):
+    return (f16(b[0:2])*np.frombuffer(b[2:34],dtype=np.int8).astype(np.float32)).astype(np.float32)
+def deq_q4_0_32(b):
+    d=f16(b[0:2]); qs=np.frombuffer(b[2:18],dtype=np.uint8)
+    return np.concatenate([d*((qs&0xf).astype(np.float32)-8), d*((qs>>4).astype(np.float32)-8)]).astype(np.float32)
+def deq_f16_32(b): return np.frombuffer(b[0:64],dtype=np.float16).astype(np.float32)
+def deq_q8_0(blk): return np.concatenate([deq_q8_0_32(blk[34*i:34*i+34]) for i in range(8)])
+def deq_q4_0(blk): return np.concatenate([deq_q4_0_32(blk[18*i:18*i+18]) for i in range(8)])
+def deq_f16(blk): return np.frombuffer(blk[0:512],dtype=np.float16).astype(np.float32)
+BLOCK={1:(512,deq_f16),2:(144,deq_q4_0),8:(272,deq_q8_0),13:(176,deq_q5k),14:(210,deq_q6k),23:(136,deq_iq4xs)}
+BLOCK32={1:(64,deq_f16_32),2:(18,deq_q4_0_32),8:(34,deq_q8_0_32)}
+def row_geometry(typ,cols):
+    """(block bytes, dequant, blocks per row): the native unit -- 32-value blocks for BLOCK32 types, else 256."""
+    if typ in BLOCK32:
+        bb,deq=BLOCK32[typ]; assert cols%32==0,(typ,cols); return bb,deq,cols//32
+    bb,deq=BLOCK[typ]; assert cols%256==0,(typ,cols); return bb,deq,cols//256
 if __name__=='__main__':
     path=sys.argv[1]; names=sys.argv[2:]
     kv,tensors,ds=read_gguf_dir(path)
@@ -80,7 +99,7 @@ if __name__=='__main__':
     f=open(path,'rb')
     for name,typ,off,dims in tensors:
         if name in names:
-            cols,rows=dims[0],dims[1]; bb,deq=BLOCK[typ]; nb=cols//256; rowbytes=nb*bb
+            cols,rows=dims[0],dims[1]; bb,deq,nb=row_geometry(typ,cols); rowbytes=nb*bb
             print(name,typ,ds+off,dims,"bytes",rows*rowbytes)
             rng=np.random.default_rng(11); x=rng.standard_normal(cols).astype(np.float32); x.tofile(name.replace('.','_')+'.x.f32')
             f.seek(ds+off); raw=f.read(rows*rowbytes)

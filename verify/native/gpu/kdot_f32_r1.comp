@@ -6,7 +6,7 @@
 // :gpu/compute path (root ADR-2609182400 C). Same bindings, same Meta, same
 // dequant helpers; every buffer is std430 storage so the .kotoba guest's
 // PIPELINE declares five storage bindings and nothing else.
-//   tensor_type: 12 Q4_K (144 B/256) | 13 Q5_K (176) | 14 Q6_K (210) | 23 IQ4_XS (136)
+//   tensor_type: 12 Q4_K (144 B/256) | 13 Q5_K (176) | 14 Q6_K (210) | 23 IQ4_XS (136) | 8 Q8_0 (272) | 2 Q4_0 (144) | 1 F16 (512)
 // Dispatch: (ceil(rows / 8), positions, 1).
 layout(local_size_x = 64) in;
 layout(std430, binding = 0) readonly buffer Meta {
@@ -91,8 +91,32 @@ int iq4xs_scale(uint base, uint ib) {
   uint scales_l = weight_byte(base + 4u + ib / 2u);
   return int(((scales_l >> (4u * (ib & 1u))) & 15u) | (((scales_h >> (2u * ib)) & 3u) << 4u));
 }
+// Q8_0 (type 8) / Q4_0 (type 2) / F16 (type 1), iteration 53: not K-quant super-blocks but 32-value blocks
+// (Q8_0 34 B = f16 d + 32 int8; Q4_0 18 B = f16 d + 16 B of nibbles, code q - 8) or none (F16, 2 B/value).
+// block_bytes_of() still answers bytes per 256 values (272 / 144 / 512 = eight blocks or 256 halves), so the
+// 256-group loop and `wb` work unchanged; the 32-value block of this thread's four values sits at
+// wb + (index / 32) * 34 (or 18). Rows need not be 256-multiples (Qwen2.5-0.5B: cols 896 = 28 blocks): the
+// group count is ceil(cols / 256), row_bytes = ceil(cols / 32) * 34 (18 / 64), and main masks the tail
+// group (index past cols). A block start is only 2-byte aligned (34 = 18 = 2 mod 4), so the codes go through
+// weight_u32_at (the unaligned word read q6 uses); the last block of a row whose block count is odd makes
+// that read straddle the row end by 2 B -- inside the buffer except at the tensor's very end (Qwen's
+// 28 / 152 blocks per row are even, so unmeasured).
+ivec4 q8_0_word_values(uint base, uint index) {
+  uint w = weight_u32_at(base + (index / 32u) * 34u + 2u + (index & 31u));
+  return ivec4(bitfieldExtract(int(w), 0, 8), bitfieldExtract(int(w), 8, 8), bitfieldExtract(int(w), 16, 8), bitfieldExtract(int(w), 24, 8));
+}
+ivec4 q4_0_word_values(uint base, uint index) {
+  uint within = index & 31u; uint shift = (within >= 16u) ? 4u : 0u;   // value j < 16: low nibble of byte j; j >= 16: high nibble of byte j - 16
+  uint w = weight_u32_at(base + (index / 32u) * 18u + 2u + (within & 15u));
+  return ivec4(int((w >> shift) & 15u), int((w >> (8u + shift)) & 15u), int((w >> (16u + shift)) & 15u), int((w >> (24u + shift)) & 15u)) - ivec4(8);
+}
+vec4 f16_values(uint base, uint index) {   // four halves = two words; aligned because cols is even (row_bytes = 2 * cols)
+  uint w = (base + index * 2u) >> 2u;
+  return vec4(unpackHalf2x16(weights[w]), unpackHalf2x16(weights[w + 1u]));
+}
 uint block_bytes_of(uint t) {
-  if (t == 12u) return 144u; if (t == 13u) return 176u; if (t == 14u) return 210u; if (t == 23u) return 136u; return 0u;
+  if (t == 12u) return 144u; if (t == 13u) return 176u; if (t == 14u) return 210u; if (t == 23u) return 136u;
+  if (t == 8u) return 272u; if (t == 2u) return 144u; if (t == 1u) return 512u; return 0u;
 }
 
 void main() {
@@ -101,15 +125,17 @@ void main() {
   uint t = gl_LocalInvocationID.x;
   uint expert = expert_ids[position];
   uint in_row = ((params.input_per_expert == 1u) ? ((params.pad0 > 1u) ? position / params.pad0 : position) : 0u) + params.pad1;   // pad0 > 1: positions per input row (prefill MoE); pad1: input row offset (the lm_head on a prefill's last row) -- iterations 36-37
-  uint blocks = params.cols / 256u;
   uint tt = params.tensor_type;
+  bool b32 = (tt == 8u || tt == 2u || tt == 1u);   // 32-value blocks / no blocks: rows need not be 256-multiples
+  uint blocks = b32 ? (params.cols + 255u) / 256u : params.cols / 256u;
   uint block_bytes = block_bytes_of(tt);
-  uint row_bytes = blocks * block_bytes;
+  uint row_bytes = b32 ? ((params.cols + 31u) / 32u) * (block_bytes / 8u) : blocks * block_bytes;
   uint index = t * 4u;
   float acc = 0.0; float mins = 0.0;
   if (row < params.rows && position < params.positions) {
     uint rowbase = (expert * params.rows + row) * row_bytes;
     for (uint block = 0u; block < blocks; block++) {
+      if (block * 256u + index >= params.cols) continue;   // tail of a non-256-multiple row (b32 only; never true for K-quant)
       uint xb = in_row * params.cols + block * 256u + index;
       vec4 y = vec4(x[xb], x[xb + 1u], x[xb + 2u], x[xb + 3u]);
       uint wb = rowbase + block * block_bytes;
@@ -124,6 +150,12 @@ void main() {
         float ls = float(iq4xs_scale(wb, ib) - 32);
         ivec4 q = iq4xs_word_values(wb, index);
         acc += weight_half(wb) * ls * dot(vec4(q), y);
+      } else if (tt == 8u) {
+        acc += weight_half(wb + (index / 32u) * 34u) * dot(vec4(q8_0_word_values(wb, index)), y);
+      } else if (tt == 2u) {
+        acc += weight_half(wb + (index / 32u) * 18u) * dot(vec4(q4_0_word_values(wb, index)), y);
+      } else if (tt == 1u) {
+        acc += dot(f16_values(wb, index), y);
       } else {
         uint j = index / 16u;
         uint sb = weight_byte(wb + 192u + j);

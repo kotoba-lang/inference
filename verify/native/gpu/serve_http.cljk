@@ -20,6 +20,10 @@
 ;; ends inside a UTF-8 sequence waits for the next), the chat form as `delta.reasoning_content` until `</think>` and
 ;; `delta.content` after, then a final chunk with `finish_reason` and `usage`, then `data: [DONE]`. `chat_template_kwargs.enable_thinking false` closes the
 ;; think block in the prompt (ours: the llama-server on K16 ignores that kwarg for this template).
+;; Iteration 58: the template is no longer hardcoded -- chat_templates.cljk recognizes the family of tokenizer.chat_template
+;; (chatml-think = this Nex rendering, unchanged; chatml with Qwen2.5's default system prompt; llama3 header ids + bos) and
+;; the prompt ids get the bos id first when the GGUF says add_bos_token (tokenizer_core encode-prompt); stop tokens come from
+;; eos_token_id + the family's list. The guest itself is still the Nex kexe -- another family's GGUF only changes the shell's text side.
 ;;
 ;;   NEX_GGUF=<gguf or head dump> node /opt/kbb-engine/cli.js serve_http.cljk <kexe-loader> <resident.bin> <offset> <x86_64|aarch64> <port> [allow-csv] [steps-per-life]
 ;;   curl -s localhost:8099/v1/completions -H 'Content-Type: application/json' -d '{"prompt":"The capital of France is","max_tokens":8}'
@@ -43,8 +47,14 @@
 (def batch-sizes (vec (sort (map js/parseInt (str/split (or (get args 8) "0") #",")))))
 (def batch-rows (apply max batch-sizes))
 (load-file (path/join (path/dirname *file*) "tokenizer_core.cljk"))
-(def eog-ids (set (keep token->id ["<|im_end|>" "<|endoftext|>"])))
-(when (empty? eog-ids) (println "REFUSE the GGUF names no <|im_end|> / <|endoftext|>") (js/process.exit 2))
+(load-file (path/join (path/dirname *file*) "chat_templates.cljk"))
+;; the pick's slot in a row of the guest's ids buffer = the argmax partial count ceil(vocab / 4096) (61 Nex, 38 Qwen2.5, 32 Llama-3.2);
+;; from the tokenizer's token count, or NEX_PICK_SLOT when the GGUF's output rows are padded past the next 4096 boundary (iteration 59)
+(def pick-slot (js/parseInt (or (aget js/process.env "NEX_PICK_SLOT") (str (quot (+ (count tokens) 4095) 4096)))))
+(def pick-off (* 4 pick-slot))   ;; iteration 58: template-family / render / stop-tokens from tokenizer.chat_template
+(def eog-ids (set (concat (when eos-id [eos-id]) (keep token->id (stop-tokens template-family)))))
+(when (empty? eog-ids) (println "REFUSE the GGUF names no eos_token_id and none of" (pr-str (stop-tokens template-family))) (js/process.exit 2))
+(println (str "TEMPLATE\t" (name template-family) "\tpre " pre-name "\tadd_bos " add-bos? "\teog " (pr-str (vec (sort eog-ids)))))
 ;; --- the resident guest: one process, a line reader, a waiter for the next reply ---
 (def guest (atom nil))   ;; {:proc :buf :waiter :steps :born}
 (defn spawn-guest! []
@@ -82,7 +92,7 @@
   (js/Promise. (fn [resolve _]
                  (reset! (:waiter g) (fn [line] (swap! (:steps g) inc)
                                        (resolve (when line (let [[ns idhex] (str/split line #"\|") buf (js/Buffer.from idhex "hex")]
-                                                             [(js/parseInt ns) (mapv #(.readUInt32LE buf (+ (* % 256) 244)) (range (count toks)))])))))
+                                                             [(js/parseInt ns) (mapv #(.readUInt32LE buf (+ (* % 256) pick-off)) (range (count toks)))])))))
                  (.write (.-stdin (:proc g)) (str/join "," (concat toks flags (mapcat (fn [sm] (if sm [(f32-bits (:T sm)) (f32-bits (:top-p sm)) (:seed sm)] [0 0 0])) samples)))))))
 (defn ensure-guest! []
   (let [g @guest]
@@ -122,12 +132,11 @@
                                      (array-seq c)))
           :else (str c))))
 (defn render-chat
-  "The ChatML template of this GGUF as llama-server's /apply-template renders it (checked on two message shapes)."
+  "The chat template of this GGUF as llama-server's /apply-template renders it (chat_templates.cljk: the family is recognized
+   from tokenizer.chat_template; checked byte for byte on 3 message shapes for Nex / Qwen2.5 / Llama-3.2 by chat_template_check.cljk).
+   thinking? closes the think block when false (:chatml-think only)."
   [messages thinking?]
-  (str (apply str (map (fn [m] (let [role (.-role m) content (message-text m)]
-                                 (str "<|im_start|>" role "\n" (if (= role "assistant") (str "<think>\n\n</think>\n\n" content) content) "<|im_end|>\n")))
-                       (array-seq messages)))
-       "<|im_start|>assistant\n<think>" (when-not thinking? "\n\n</think>\n\n")))
+  (render (mapv (fn [m] {:role (.-role m) :content (message-text m)}) (array-seq messages)) thinking?))
 (defn split-think
   "Generated text after a prompt that ends in <think>: [reasoning content]."
   [text]
@@ -249,7 +258,7 @@
                     (fn [finish usage timing] #js {:id id :object "chat.completion.chunk" :created created :model "nex-n2.5-mini/kotoba-native" :choices #js [#js {:index 0 :delta #js {} :finish_reason finish}] :usage usage :timing timing})
                     (sample-of body))))
 (defn completion [body]
-  (let [prompt (or (.-prompt body) "") max-tokens (or (.-max_tokens body) 16) ids (encode prompt) t0 (js/Date.now) sample (sample-of body)]
+  (let [prompt (or (.-prompt body) "") max-tokens (or (.-max_tokens body) 16) ids (encode-prompt prompt) t0 (js/Date.now) sample (sample-of body)]
     (if (empty? ids)
       (js/Promise.resolve #js {:error #js {:message "empty prompt" :type "invalid_request_error"}})
       (.then (submit ids max-tokens nil sample)
@@ -264,7 +273,7 @@
 (defn chat-completion [body]
   (let [messages (or (.-messages body) #js []) max-tokens (or (.-max_tokens body) 256)
         thinking? (not (false? (some-> body .-chat_template_kwargs .-enable_thinking)))
-        prompt (render-chat messages thinking?) ids (encode prompt) t0 (js/Date.now) sample (sample-of body)]
+        prompt (render-chat messages thinking?) ids (encode-prompt prompt) t0 (js/Date.now) sample (sample-of body)]
     (if (zero? (.-length messages))
       (js/Promise.resolve #js {:error #js {:message "no messages" :type "invalid_request_error"}})
       (.then (submit ids max-tokens nil sample)
@@ -288,7 +297,7 @@
                           (let [body (try (js/JSON.parse (.toString (js/Buffer.concat (clj->js @chunks)) "utf8")) (catch :default _ nil))
                                 chat? (= "/v1/chat/completions" (.-url req))]
                             (if (and body (true? (.-stream body)))
-                              (let [ids (if chat? (encode (render-chat (or (.-messages body) #js []) (not (false? (some-> body .-chat_template_kwargs .-enable_thinking))))) (encode (or (.-prompt body) "")))
+                              (let [ids (encode-prompt (if chat? (render-chat (or (.-messages body) #js []) (not (false? (some-> body .-chat_template_kwargs .-enable_thinking)))) (or (.-prompt body) "")))
                                     max-tokens (or (.-max_tokens body) (if chat? 256 16))]
                                 (if (empty? ids)
                                   (do (.writeHead res 400 #js {"Content-Type" "application/json"}) (.end res (js/JSON.stringify #js {:error #js {:message "empty prompt" :type "invalid_request_error"}})))

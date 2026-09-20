@@ -1,13 +1,14 @@
 # drive a `resident-replay … batch:<B>` guest: B sequences advance together, one message "t0,…,tB-1,f0,…,fB-1" per step
 # (TEST HARNESS beside the oracle). Each row has its own prompt and token budget; a finished or empty row is fed
 # token 0 with flag 1 (a rewind that costs nothing). Rows are compared with the single-sequence oracles.
-# python3 batch_drive.py <loader> <batch.bin> <offset> <isa> <B> [--prefill P] <prompt-ids>:<ntok>[:<expected-ids>] ...
+# python3 batch_drive.py <loader> <batch.bin> <offset> <isa> <B> [--prefill P] [--parts N] <prompt-ids>:<ntok>[:<expected-ids>] ...
 import subprocess, sys, os, struct, time
 loader, binf, off, isa, B = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5])
 # --prefill P (iteration 57): a row with more than P prompt tokens left gets its own prefill message "P tokens, row, flag, 0"
 # (one row per tick) before the batch ticks resume
-PB = 0
+PB = 0; PICK = 61   # the pick's slot in a row of the ids buffer = the argmax partial count, ceil(vocab / 4096) (61 for Nex, 38 for Qwen2.5, 32 for Llama-3.2)
 specs = sys.argv[6:]
+if "--parts" in specs: k = specs.index("--parts"); PICK = int(specs[k + 1]); specs = specs[:k] + specs[k + 2:]
 if "--prefill" in specs: k = specs.index("--prefill"); PB = int(specs[k + 1]); specs = specs[:k] + specs[k + 2:]
 rows = []
 for spec in specs:
@@ -39,7 +40,7 @@ while any(active(r) for r in rows):
     words = [struct.unpack("<I", bytes.fromhex(idhex[k:k + 8]))[0] for k in range(0, len(idhex), 8)]
     for ri, r in enumerate(rows):
         if not active(r): continue
-        pick = words[ri * 64 + 61]
+        pick = words[ri * 64 + PICK]
         r["reset"] = False; r["i"] += 1
         if r["i"] < len(r["ids"]): r["next"] = r["ids"][r["i"]]          # still the prompt
         else: r["out"].append(pick); r["next"] = pick
