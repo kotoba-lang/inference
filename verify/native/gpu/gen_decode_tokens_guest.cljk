@@ -44,7 +44,11 @@
 (def adaptive? (boolean (and BBs (> (count BBs) 1))))
 (when (and BB (or (not (= "resident-replay" (get args 9))) (and (not adaptive?) (< BB 2)) (and (not adaptive?) (contains? #{2 5 (when PB (inc PB))} (* 2 BB)))))
   (println "REFUSE batch:" BB "-- needs resident-replay, B >= 2, and 2B not in {2, 5, P+1}") (js/process.exit 2))
-(when (and adaptive? PB) (println "REFUSE batch:<list> with prefill:<P> -- the adaptive guest holds only batch steps") (js/process.exit 2))
+;; adaptive + prefill:<P> (iteration 57): a BATCH PREFILL step -- P positions of ONE sequence (the message names the row) --
+;; as the kept buffer after the batch steps; -DBPREFILL kernel twins add the sequence's slice offsets. Message = P tokens,
+;; row, flag, pad (P+3 words), so P+3 may not collide with any 2B / 5B.
+(def bprefill? (boolean (and adaptive? PB)))
+(when (and bprefill? (some #(contains? #{(* 2 %) (* 5 %)} (+ PB 3)) BBs)) (println "REFUSE prefill:" PB "with batch:" BBs "-- P+3 words collide with a batch message") (js/process.exit 2))
 (def replay? (= "resident-replay" (get args 9)))
 (when (and PB (not replay?)) (println "REFUSE prefill:<P> needs resident-replay") (js/process.exit 2))
 ;; resident sampling (iteration 50): every resident-replay guest also records kept command buffer 2, the SAMPLED decode
@@ -251,6 +255,10 @@
 (def embed-b (when BB (pipeline! "embed_iq4xs_b.spv" 5)))
 (def batch-op-names ["copy_at" "rope_neox" "attn_decode" "argmax_partial" "argmax_final" "pos_incr" "ctl"
                      "params" "sample_part" "sample_probs" "sample_bisect_part" "sample_bisect_step" "sample_final"])   ;; iteration 55: per-row sampling
+(def bprefill-op-names ["copy_at" "attn_decode" "pos_add" "pos_seed" "ctl"])   ;; iteration 57: the batch-prefill twins
+(def ^:dynamic bp? false)   ;; the batch-prefill phase is being emitted
+(def deltanet-fused-bp (when bprefill? (pipeline! "deltanet_fused_bp.spv" 13)))
+(def embed-bp (when bprefill? (pipeline! "embed_iq4xs_bp.spv" 5)))
 (def w-embd (map-tensor! "token_embd.weight"))
 (def prompt-ids (alloc! (max 16 (* 4 (count prompt)))))
 (def x (alloc! (* PMAX 8192)))
@@ -289,6 +297,7 @@
 (def phase-prefill (when PB (phase-metas PB true)))
 (def phase-batch (when BB (phase-metas BB true true)))   ;; prefill-shaped (P-row kdots) with batch semantics
 (def phase-batches (when BBs (into {} (for [b BBs] [b (if (= b BB) phase-batch (phase-metas b true true))]))))   ;; adaptive: one phase per B
+(def phase-bprefill (when bprefill? (assoc (phase-metas PB true) :bp? true)))
 ;; root values = the decode phase, so every legacy emission sees them unbound
 (def ^:dynamic m-norm (:m-norm phase-decode)) (def ^:dynamic m-qkv (:m-qkv phase-decode)) (def ^:dynamic m-gate (:m-gate phase-decode))
 (def ^:dynamic m-ab (:m-ab phase-decode)) (def ^:dynamic m-out (:m-out phase-decode)) (def ^:dynamic m-q (:m-q phase-decode))
@@ -302,7 +311,7 @@
                  #'m-silu-sh :m-silu-sh #'m-add :m-add #'m-lm :m-lm #'m-copy-dyn :m-copy-dyn #'m-padd :m-padd #'kdot-p :kdot-p})
 (defn with-phase [ph f]
   (with-bindings (merge (into {} (map (fn [[v k]] [v (get ph k)]) phase-vars))
-                        {#'PF (:pf ph) #'prefill? (:pre? ph) #'batch? (:batch? ph)
+                        {#'PF (:pf ph) #'prefill? (:pre? ph) #'batch? (:batch? ph) #'bp? (boolean (:bp? ph))
                          ;; int8 / dual forms: the decode phase, and a B = 1 batch step in the decode-layout form (it is the decode step)
                          #'i8-wide (when (or (not (:pre? ph)) (and (:batch? ph) (= 1 (:pf ph)) (<= 1 batch-layout-upto))) i8-wide*)
                          #'i8-lm (when (or (not (:pre? ph)) (and (:batch? ph) (= 1 (:pf ph)) (<= 1 batch-layout-upto))) i8-lm*)
@@ -350,14 +359,17 @@
 (def m-embed-b (when BB (let [m (alloc! 16)] (write! m (str (le32 2048) (le32 0) (le32 1) (le32 4096))) m)))
 (def m-copy-b (when BB (ops-meta! 512 1 (* 4096 512) 512 0 0)))   ;; n per row, aux = cache stride per sequence, aux2 = per position
 (def m-am2-dyn (let [m (alloc! 32)] (write! m (str (le32 248320) (le32 1) (le32 61) (le32 (if resident? 4096 (count prompt))) (lef32 0) (lef32 0) (lef32 0) (lef32 1))) m))   ;; resident: the shell is the only writer of the token buffer
-(def ctrl (when resident? (alloc! (max 20 (* 4 (inc (or PB 1))) (* 20 (or BB 1))))))   ;; batch: 5B words (tokens, flags, T/top_p/seed per row)   ;; >= 5 words: the sampled message   ;; resident: "<token id>,<reset flag>" (or P tokens + flag) lands here (WRITEDEC), read by ctl
+(def ctrl (when resident? (alloc! (max 20 (* 4 (+ 3 (or PB 1))) (* 20 (or BB 1))))))   ;; batch: 5B words (tokens, flags, T/top_p/seed per row)   ;; >= 5 words: the sampled message   ;; resident: "<token id>,<reset flag>" (or P tokens + flag) lands here (WRITEDEC), read by ctl
 (def m-ctlP (when PB (ops-meta! PB 1 0 0 0 0)))   ;; ctl with n = P tokens
 (def m-ctlBs (when BBs (into {} (for [b BBs] [b (ops-meta! b 1 4096 0 0 0)]))))   ;; batch ctl per B: n = B rows, aux = token-buffer row stride
 (def m-incrBs (when BBs (into {} (for [b BBs] [b (ops-meta! b 1 0 0 0 0)]))))   ;; batch pos_incr per B: every row
 (def m-ctlB (when BB (m-ctlBs BB))) (def m-incrB (when BB (m-incrBs BB)))
 (def ^:dynamic m-incrB* m-incrB)   ;; the B being emitted
 (def ops-b (when BB (into {} (for [op batch-op-names] [op (pipeline! (str "nex_" op "_b.spv") 7)]))))
-(defn op* [nm] (if (and batch? (contains? ops-b nm)) (ops-b nm) (ops nm)))   ;; the phase's kernel twin
+(def ops-bp (when bprefill? (into {} (for [op bprefill-op-names] [op (pipeline! (str "nex_" op "_bp.spv") 7)]))))
+(defn op* [nm] (cond (and batch? (contains? ops-b nm)) (ops-b nm) (and bp? (contains? ops-bp nm)) (ops-bp nm) :else (ops nm)))   ;; the phase's kernel twin
+(def rowsel (when bprefill? (let [b (alloc! 16)] (zero! b) b)))   ;; batch prefill: [base position, row] of the sequence being prefilled (written by ctl)
+(def m-ctlBP (when bprefill? (ops-meta! PB 1 4096 0 0 0)))   ;; batch-prefill ctl: n = P tokens, aux = token-buffer row stride
 (def m-incr (ops-meta! 1 1 0 0 0 0))
 ;; sampler meta: n rows aux(=ids slot 61) aux2(=prompt length) eps(=T) scale(=top_p) p0(=seed bits) p1(=1)
 (def m-sample (when sampling (let [m (alloc! 32)] (write! m (str (le32 248320) (le32 1) (le32 61) (le32 (count prompt)) (lef32 (:T sampling)) (lef32 (:top-p sampling)) (le32 (:seed sampling)) (lef32 1))) m)))
@@ -387,7 +399,7 @@
 
 ;; one layer's dispatches, for any handle representation (literal or "$symbol")
 (defn emit-layer! [il w xin xout ring S kc vc mrq mrk mattn mcopy pb & [sb]]
-        (when (and prefill? sb fn-mode? (not batch?)) (dispatch! (ops "pos_seed") 1 1 1 m-incr pb zeros16 zeros16 zeros16 zeros16 sb))   ;; stepbuf = [base position, row 0]
+        (when (and prefill? sb fn-mode? (not batch?)) (dispatch! (op* "pos_seed") 1 1 1 m-incr pb zeros16 zeros16 zeros16 zeros16 sb))   ;; stepbuf = [base position, row 0(, seq)]
         (dispatch! (ops "rmsnorm") PF 1 1 m-norm xin (:norm w) zeros16 h zeros16 zeros16)
         (if (= 1 (recurrent il))
           (do
@@ -406,7 +418,7 @@
                 prefill?
                 (let [sb (or sb (stepbufs (count (filter #(= 1 (recurrent %)) (range il)))))]
                   (dotimes [_ PF]
-                    (dispatch! deltanet-fused 32 1 1 m-fused qkv (:conv w) ring alpha betaL (:dt w) (:a w) S (:ssm-norm w) z gnorm sb)
+                    (dispatch! (if bp? deltanet-fused-bp deltanet-fused) 32 1 1 m-fused qkv (:conv w) ring alpha betaL (:dt w) (:a w) S (:ssm-norm w) z gnorm sb)
                     (dispatch! (ops "pos_incr2") 1 1 1 m-incr zeros16 zeros16 zeros16 zeros16 zeros16 sb)))
                 :else (dispatch! deltanet-fused 32 1 1 m-fused qkv (:conv w) ring alpha betaL (:dt w) (:a w) S (:ssm-norm w) z gnorm pb))
               (do
@@ -431,8 +443,8 @@
             (if batch?
               (do (dispatchc! (op* "copy_at") 2 PF 1 mcopy vproj zeros16 zeros16 vc zeros16 pb)   ;; C-4: (2, B): row's 512 into its cache slice at its position
                   (dispatch! (op* "copy_at") 2 PF 1 mcopy krope zeros16 zeros16 kc zeros16 pb))
-              (do (dispatchc! (ops "copy_at") (* 2 PF) 1 1 mcopy vproj zeros16 zeros16 vc zeros16 pb)
-                  (dispatch! (ops "copy_at") (* 2 PF) 1 1 mcopy krope zeros16 zeros16 kc zeros16 pb)))
+              (do (dispatchc! (op* "copy_at") (* 2 PF) 1 1 mcopy vproj zeros16 zeros16 vc zeros16 pb)
+                  (dispatch! (op* "copy_at") (* 2 PF) 1 1 mcopy krope zeros16 zeros16 kc zeros16 pb)))
             (dispatch! (op* "attn_decode") 16 PF 1 mattn qrope kc vc attno qfull pb)
             (pkdot! kdot-out out-spv 2048 m-attn-o (:o w) attno attn-out zerosP)))
         (dispatch! (ops "add_rmsnorm") PF 1 1 m-addn xin attn-out (:post w) resid h2 zeros16)
@@ -543,7 +555,7 @@
 (defn fn-body-src [fname keys rec?]
   (reset! lines [])
   (let [w (into {} (map-indexed (fn [i k] [k (hexpr (str "(+ w0 " i ")"))]) keys))]
-    (emit-layer! (if rec? 0 3) w (hexpr "xin") (hexpr "xout") (when rec? (hexpr "ring")) (when rec? (hexpr "S")) (when-not rec? (hexpr "kc")) (when-not rec? (hexpr "vc")) m-ropeq-dyn m-ropek-dyn m-attn-dyn (if batch? m-copy-b m-copy-dyn) (if batch? rowpos posbuf)
+    (emit-layer! (if rec? 0 3) w (hexpr "xin") (hexpr "xout") (when rec? (hexpr "ring")) (when rec? (hexpr "S")) (when-not rec? (hexpr "kc")) (when-not rec? (hexpr "vc")) m-ropeq-dyn m-ropek-dyn m-attn-dyn (if batch? m-copy-b m-copy-dyn) (cond batch? rowpos bp? rowsel :else posbuf)
                  (when (and rec? prefill?) (hexpr (str "(+ S " (- (js/parseInt (first stepbufs)) (js/parseInt (first states))) ")")))))   ;; stepbuf handle = S + (SB0 - S0): both run one per recurrent layer
   (let [params (concat ["w0" "xin" "xout"] (if rec? ["ring" "S"] ["kc" "vc"])) body @lines]
     (str "(defn " fname " [" (str/join " " (map #(str % " :i64") params)) "] :string\n"
@@ -558,11 +570,11 @@
        "          (recurrent-layer" sfx " (+ " W0 " (* il 19)) (xin-of il) (xout-of il) (+ " R0 " (- il (quot il 4))) (+ " S0 " (- il (quot il 4)))))\n"
        "        (layers" sfx " (+ il 1) n))\n"
        "    il))\n"))
-(def fn-layers-src (when fn-mode? (str
+(def xinout-src (when fn-mode? (str
   ";; layer il: attention when (il + 1) mod 4 = 0; xin/xout alternate x, xa, xb; state index = il - il/4 (recurrent) or il/4 (attention)\n"
   "(defn xin-of [il :i64] :i64 (if (= il 0) " x " (if (= 1 (bit-and il 1)) " xa " " xb ")))\n"
-  "(defn xout-of [il :i64] :i64 (if (= 1 (bit-and il 1)) " xb " " xa "))\n"
-  (layers-src ""))))
+  "(defn xout-of [il :i64] :i64 (if (= 1 (bit-and il 1)) " xb " " xa "))\n")))
+(def fn-layers-src (when fn-mode? (str xinout-src (layers-src ""))))
 ;; the prefill PHASE (prefill:<P>): the same two layer bodies emitted with PF = P, plus their recursion
 (def fn-rec-p-src (when PB (with-phase phase-prefill #(fn-body-src "recurrent-layer-p" rec-keys true))))
 (def fn-att-p-src (when PB (with-phase phase-prefill #(fn-body-src "attention-layer-p" att-keys false))))
@@ -574,12 +586,15 @@
   (reset! lines [])
   (let [x-final (if (odd? (dec layers)) xb xa)]
     (step! (q "BEGIN"))
-    (when resident? (dispatch! (op* "ctl") 1 1 1 ctl-meta zeros16 tokbuf ctrl zeros16 zeros16 (if batch? rowpos posbuf)))
+    (when resident? (if bp?
+                      (dispatch! (op* "ctl") 1 1 1 ctl-meta zeros16 tokbuf ctrl rowsel zeros16 rowpos)   ;; batch prefill: o = rowsel, ids = rowpos
+                      (dispatch! (op* "ctl") 1 1 1 ctl-meta zeros16 tokbuf ctrl zeros16 zeros16 (if batch? rowpos posbuf))))
     (when sampled? (dispatch! (ops "params") 1 1 1 m-params zeros16 zeros16 ctrl m-sample-dyn zeros16 zeros16))   ;; T / top_p / seed from the message
     (when batch? (dispatch! (op* "params") 1 1 1 m-incrB* zeros16 zeros16 ctrl sparams zeros16 zeros16))   ;; batch: every row's (T, top_p, seed) from the message
-    (if batch?
-      (dispatch! embed-b 1 PF 1 m-embed-b w-embd tokbuf x rowpos)
-      (dispatch! embed 1 PF 1 m-embed-dyn w-embd tokbuf x posbuf))
+    (cond
+      batch? (dispatch! embed-b 1 PF 1 m-embed-b w-embd tokbuf x rowpos)
+      bp? (dispatch! embed-bp 1 PF 1 m-embed-b w-embd tokbuf x rowsel)
+      :else (dispatch! embed 1 PF 1 m-embed-dyn w-embd tokbuf x posbuf))
     (step! (str "(" layers-name " 0 " layers ")"))
     (dispatch! (ops "rmsnorm") PF 1 1 m-norm x-final w-out-norm zeros16 hN zeros16 zeros16)
     (if i8-lm
@@ -608,6 +623,7 @@
               (apply dispatch! (op* "sample_final") 1 PF 1 h)))))
     (cond
       batch? (dispatch! (op* "pos_incr") 1 1 1 m-incrB* zeros16 zeros16 zeros16 zeros16 zeros16 rowpos)
+      bp? (dispatch! (op* "pos_add") 1 1 1 m-padd rowsel zeros16 zeros16 zeros16 zeros16 rowpos)   ;; rowpos[seq] += P
       prefill? (dispatch! (ops "pos_add") 1 1 1 m-padd zeros16 zeros16 zeros16 zeros16 zeros16 posbuf)
       :else (dispatch! (ops "pos_incr") 1 1 1 m-incr zeros16 zeros16 zeros16 zeros16 zeros16 posbuf))
     @lines))
@@ -623,8 +639,14 @@
                                                                (layers-src (bsfx b)))))]))))
 (def batch-step-liness (when BBs (into {} (for [b BBs] [b (with-phase (phase-batches b) #(binding [m-incrB* (m-incrBs b)] (step-lines! (m-ctlBs b) (str "layers" (bsfx b)))))]))))
 (def batch-step-lines (when BB (batch-step-liness BB)))
+(def fn-bprefill-src (when bprefill? (with-phase phase-bprefill #(str (fn-body-src "recurrent-layer-bp" rec-keys true) (fn-body-src "attention-layer-bp" att-keys false) (layers-src "-bp")))))
+(def bprefill-step-lines (when bprefill? (with-phase phase-bprefill #(step-lines! m-ctlBP "layers-bp"))))
+(def bprefill-slot (when bprefill? (count BBs)))
 ;; kept slot per B: adaptive guests use slots 0.. (no single-row steps), the single-B guest slot 3
 (def batch-slot (when BBs (if adaptive? (zipmap BBs (range)) {BB 3})))
+(declare fn-token-src)
+(defn cut-defn [src name] (let [i (.indexOf src (str "(defn " name " "))] (if (neg? i) src (let [j (.indexOf src "\n(defn " (inc i)) j2 (.indexOf src "\n;; " (inc i)) k (min (if (neg? j) (count src) j) (if (neg? j2) (count src) j2))] (str (subs src 0 i) (subs src k))))))
+(def adaptive-token-src (delay (reduce cut-defn fn-token-src ["token-step" "record-step" "record-sampled"])))
 (def fn-token-src (when fn-mode?
   (step-lines! m-incr "layers")
   (let [x-final (if (odd? (dec layers)) xb xa)]
@@ -659,7 +681,14 @@
                                                      (= % (q "BEGIN")) (str "      (gpu \"BEGINK " (batch-slot b) "\")")
                                                      :else (str "      (gpu " % ")")) (batch-step-liness b))) "\n"
                          "      (gpu \"SUBMIT\")))\n"))))
-                (when PB
+                (when bprefill?
+                  (str ";; batch prefill:" PB " (iteration 57): kept command buffer " bprefill-slot " -- P positions of the sequence the message names; message = P tokens, row, flag, pad\n"
+                       "(defn record-bprefill [] :string\n  (do\n"
+                       (str/join "\n" (map #(cond (str/starts-with? % "(layers") (str "      " %)
+                                                   (= % (q "BEGIN")) (str "      (gpu \"BEGINK " bprefill-slot "\")")
+                                                   :else (str "      (gpu " % ")")) bprefill-step-lines)) "\n"
+                       "      (gpu \"SUBMIT\")))\n"))
+                (when (and PB (not adaptive?))
                   (str ";; prefill:" PB " (iteration 49): the P-token step as kept command buffer 1; a message of P tokens + flag replays it\n"
                        "(defn record-prefill [] :string\n  (do\n"
                        (str/join "\n" (map #(cond (str/starts-with? % "(layers") (str "      " %)
@@ -674,7 +703,10 @@
                        (if adaptive?
                          ;; batch messages are 5B words (tokens, flags, T / top_p / seed per row); 2B (no sampler words) still routes
                          (str "      (let [ns " (reduce (fn [acc b] (str "(if (string=? nw \"" (* 5 b) "\") (gpu \"REPLAY " (batch-slot b) "\") (if (string=? nw \"" (* 2 b) "\") (gpu \"REPLAY " (batch-slot b) "\") " acc "))"))
-                                                        (str "(gpu \"REPLAY " (batch-slot (last BBs)) "\")") (reverse (butlast BBs))) "\n")
+                                                        (if bprefill?
+                                                          (str "(if (string=? nw \"" (+ PB 3) "\") (gpu \"REPLAY " bprefill-slot "\") (gpu \"REPLAY " (batch-slot (last BBs)) "\"))")
+                                                          (str "(gpu \"REPLAY " (batch-slot (last BBs)) "\")"))
+                                                        (reverse (butlast BBs))) "\n")
                          (str "      (let [ns (if (string=? nw \"2\") (gpu \"REPLAY 0\") (if (string=? nw \"5\") (gpu \"REPLAY 2\") "
                               (if BB (str "(if (string=? nw \"" (* 2 BB) "\") (gpu \"REPLAY 3\") (gpu \"REPLAY 1\"))") "(gpu \"REPLAY 1\")") "))\n"))
                        ;; batch: the reply carries every row's 64 slots (slot 61 = the pick); single steps write row 0
@@ -709,19 +741,27 @@
               ";; Answer: per token \"<ns>|<hex x after the last layer>|<hex argmax id>\", tokens joined by \"#\".\n"
               (if (and runtime? (not resident?)) "(ns gpu.decode-tokens (:export [main serve]))\n" "(ns gpu.decode-tokens (:export [main]))\n")
               "(defn gpu [r :string] :string\n  (typed-cap-call :gpu/compute :string :string r))\n"
+              ;; the weight file's path once (iteration 57): 733 MAP literals carried it, ~15 KiB of the 64 KiB string budget
+              (when fn-mode? (str "(defn M [tail :string] :string (gpu (string-concat \"MAP " box "/nex.gguf \" tail)))\n"))
               (when stream? (str rec-body-src att-body-src layer-fns-src))
-              (when fn-mode? (str fn-rec-src fn-att-src fn-layers-src (when PB (str fn-rec-p-src fn-att-p-src fn-layers-p-src)) (when BBs (apply str (map fn-batch-srcs BBs))) fn-token-src))
+              ;; adaptive guests carry only the batch (+ batch-prefill) functions: the single-row bodies would push a 40-layer program past the
+;; 64 KiB string-literal limit (iteration 57) and are never called there
+(when fn-mode? (str (if adaptive? xinout-src (str fn-rec-src fn-att-src fn-layers-src (when PB (str fn-rec-p-src fn-att-p-src fn-layers-p-src))))
+                    (when BBs (apply str (map fn-batch-srcs BBs))) fn-bprefill-src
+                    (if adaptive? @adaptive-token-src fn-token-src)))
               ;; runtime: `main` must take no arguments (frontend rule), so the entry with arguments is the
               ;; exported `serve [plen ntok]` -- extract-native --symbol serve, run with arity 2 and the two
               ;; i64s on the loader's argv; `main` runs `serve` with the build-time counts.
               (cond resident? "(defn main [] :string\n"
                     runtime? (str "(defn main [] :string (serve " (count prompt) " " ntok "))\n(defn serve [plen :i64 ntok :i64] :string\n")
                     :else "(defn main [] :string\n")
-              "    (do\n" (str/join "\n" (map #(str "      (gpu " % ")") const-steps)) "\n"
+              "    (do\n" (str/join "\n" (map #(if (and fn-mode? (str/starts-with? % (str "\"MAP " box "/nex.gguf ")))
+                                                  (str "      (M \"" (subs % (count (str "\"MAP " box "/nex.gguf "))) ")")
+                                                  (str "      (gpu " % ")")) const-steps)) "\n"
               (if fn-mode?
                 (cond
-                  replay? (str (when-not adaptive? "      (record-step)\n      (record-sampled)\n") (when PB "      (record-prefill)\n")
-                               (when BBs (apply str (for [b BBs] (str "      (record-batch" (bsfx b) ")\n")))) "      (string-from-i64 (serve-loop 0))")
+                  replay? (str (when-not adaptive? "      (record-step)\n      (record-sampled)\n") (when (and PB (not adaptive?)) "      (record-prefill)\n")
+                               (when BBs (apply str (for [b BBs] (str "      (record-batch" (bsfx b) ")\n")))) (when bprefill? "      (record-bprefill)\n") "      (string-from-i64 (serve-loop 0))")
                   resident? "      (string-from-i64 (serve-loop 0))"
                   runtime?
                   (str "      (let [prompt (typed-cap-call :env/read :string :string \"NEX_PROMPT\")]\n"
