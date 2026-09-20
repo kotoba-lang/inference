@@ -20,7 +20,7 @@ int kvalue(uint i) {
 void main() {
   uint t = gl_LocalInvocationID.x;
   uint blocks = P.cols / 256u;
-#ifndef Q8
+#if !defined(Q8) && !defined(PTQ1)
   if (t >= blocks * 8u) return;
 #endif
   uint row = gl_WorkGroupID.y;   // prefill: token row of the batch (decode dispatches y = 1)
@@ -31,14 +31,31 @@ void main() {
 #else
   uint tok = ids[((P.dyn != 0u) ? pos[0] : P.slot) + row];
 #endif
-#ifdef Q8
+#if defined(Q8)
   // -DQ8 (dense decoders, iteration 59): token_embd.weight in Q8_0 -- 32 values per block, f16 d + 32 int8 (34 B); thread t = block t
   uint nb = P.cols / 32u; if (t >= nb) return;
   uint b8 = tok * nb + t; uint bbase = b8 * 34u;
   float d8 = weight_half(bbase);
   for (uint j = 0u; j < 32u; j++) { int q = int(weight_byte(bbase + 2u + j)); if (q >= 128) q -= 256; o[row * P.cols + t * 32u + j] = d8 * float(q); }
   return;
-#endif
+#elif defined(PTQ1)
+  // Prism PTQ1_0: qs[24], qh[2], fp16 scale; 128 values per block.
+  uint nb1 = P.cols / 128u;
+  for (uint ib = t; ib < nb1; ib += 256u) {
+    uint base1 = (tok * nb1 + ib) * 28u;
+    float d1 = weight_half(base1 + 26u);
+    for (uint e = 0u; e < 128u; ++e) {
+      uint bv; uint n1;
+      if (e < 80u) { bv = weight_byte(base1 + (e & 15u)); n1 = e >> 4u; }
+      else if (e < 120u) { uint q = e - 80u; bv = weight_byte(base1 + 16u + (q & 7u)); n1 = q >> 3u; }
+      else { uint q = e - 120u; bv = weight_byte(base1 + 24u + (q & 1u)); n1 = q >> 1u; }
+      for (uint j = 0u; j < n1; ++j) bv = (bv * 3u) & 255u;
+      int trit = int((bv * 3u) >> 8u) - 1;
+      o[row * P.cols + ib * 128u + e] = d1 * float(trit);
+    }
+  }
+  return;
+#else
   uint blk = t / 8u, ib = t & 7u;
   uint base = (tok * blocks + blk) * 136u;
   float d = weight_half(base);
@@ -51,4 +68,5 @@ void main() {
     o[row * P.cols + blk * 256u + ib * 32u + j] = dl * float(kvalue(q & 15u));
     o[row * P.cols + blk * 256u + ib * 32u + 16u + j] = dl * float(kvalue(q >> 4u));
   }
+#endif
 }

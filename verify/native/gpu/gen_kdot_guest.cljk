@@ -35,8 +35,8 @@
 (dotimes [_ n-kv] (let [k (gstr) t (u32) v (read-value t)] (when (= k "general.alignment") (reset! alignment v))))
 (def tensors (vec (for [_ (range n-tensors)] (let [name (gstr) nd (u32) dims (vec (repeatedly nd u64)) typ (u32) off (u64)] {:name name :dims dims :type typ :offset off}))))
 (def data-start (* (quot (+ @pos @alignment -1) @alignment) @alignment))
-(def block-bytes {12 144 13 176 14 210 23 136 8 272 2 144 1 512 3 160 6 176 7 192})   ;; bytes per 256 values (8 Q8_0 / 2 Q4_0 / 1 F16 = eight 32-value blocks or 256 halves, iteration 53; 3 Q4_1 / 6 Q5_0 / 7 Q5_1 = eight 20 / 22 / 24 B blocks, 53b)
-(def block32-bytes {8 34 2 18 1 64 3 20 6 22 7 24})   ;; the native unit of the non-K-quant types: rows are ceil(cols / 32) blocks, cols need not be a 256-multiple
+(def block-bytes {12 144 13 176 14 210 23 136 142 68 143 56 8 272 2 144 1 512 30 512 3 160 6 176 7 192})   ;; bytes per 256 values (142/143 are two group-128 blocks)
+(def block32-bytes {8 34 2 18 1 64 30 64 3 20 6 22 7 24})   ;; the native unit of the non-K-quant types: rows are ceil(cols / 32) blocks, cols need not be a 256-multiple
 (def t (or (first (filter #(= tensor (:name %)) tensors)) (do (println "REFUSE no tensor" tensor "in" (count tensors)) (js/process.exit 2))))
 (def cols (first (:dims t))) (def rows (second (:dims t)))
 (def bb (or (block-bytes (:type t)) (do (println "REFUSE ggml type" (:type t) "has no kernel arm") (js/process.exit 2))))
