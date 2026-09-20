@@ -1344,3 +1344,46 @@ The adaptive anv guest hit the loader's `pipeline table full` (64): 23 ops + 13 
 twins + the kdot layouts with their int8 forms + a positions kernel per phase + three embed / delta-net variants
 + the quantizer ≈ 70. amu #1039 raises `KGPU_MAX_PIPELINES` to 128; built on the three boxes as `kexe-loader-gpu7`
 (promoted to `kexe-loader-gpu` when the PR lands). K16 and Xavier were under the old limit by a few entries.
+
+## Tick 58 (2026-09-20): the tokenizer follows `tokenizer.ggml.pre`; chat templates per family
+
+The serving shell's text side no longer assumes Nex. `tokenizer_core.cljk` reads `tokenizer.ggml.pre` and takes the
+regex list llama.cpp applies for it (spelled from `src/llama-vocab.cpp` at 911f6cdc, the checkout under
+`~/models/llama.cpp-src`, not from memory): `qwen2`, `qwen35` (Nex-N2.5's actual pre — the old hardcoded qwen2
+regex passed only because the corpus had no combining marks; `\p{M}` joins letters in qwen35), `llama-bpe`
+(`\p{N}{1,3}`, `ignore_merges`: a piece that is itself a token is emitted whole, `add_bos` default true), `gpt-2` and
+`default` (four regexes applied in sequence). The split keeps the text between matches as pieces of its own, as
+llama.cpp's `unicode_regex_split` does (that is why the gpt-2 regex may end in `\s+(?!\S)` with no `\s+`); user-defined
+tokens (type 4, gpt-neox's `"  "` indentation tokens) are matched verbatim even with `parse_special = false`, control
+tokens (type 3) only with it — `encode` is `parse_special = true`, `encode*` takes the flag. Unknown pre → `REFUSE`
+exit 2 naming the known set; `tokenizer.ggml.model` ≠ `gpt2` (`llama` = SentencePiece, `bert`, `t5`, `gemma4`) → `REFUSE`
+exit 2 (SPM is not implemented, it is refused, not approximated). The core also exposes `bos-id` / `eos-id` /
+`add-bos?` (the GGUF's `add_bos_token`, else llama.cpp's per-pre default) / `chat-template` and `encode-prompt`
+(bos first when `add-bos?`). `gguf_tokenizer.cljk … meta` prints them.
+
+`chat_templates.cljk` (`load-file` after the core) recognizes the family of `tokenizer.chat_template` by distinctive
+substrings — `<|start_header_id|>` llama3, `<start_of_turn>` gemma, `[INST]` mistral, `<|im_start|>` + `<think>`
+chatml-think, `<|im_start|>` chatml — and renders each with a hand-written function (no jinja). chatml-think is the
+Nex rendering of tick 45 unchanged (plus the `|trim` the template applies to every content); chatml carries Qwen2.5's
+default system prompt, read from the template's `{%- else %}` literal; llama3 renders the system header with
+`Cutting Knowledge Date` and `strftime_now("%d %b %Y")`, and like llama.cpp strips the template's leading bos string
+so the tokenizer adds the bos id once. `serve_http.cljk` delegates `render-chat` to it, tokenizes prompts with
+`encode-prompt`, and takes its stop ids from `eos_token_id` + the family's stop-token list (prints one
+`TEMPLATE\t<family>\tpre …\tadd_bos …\teog […]` line at startup). **gemma and mistral are written from their published
+templates and UNVERIFIED** — no GGUF of either was measured; they are not claimed to match.
+
+Measured (K16, node 18, `/opt/kbb-engine`; llama-server b10883 CPU-only `-ngl 0` on 8093 / 8094 for the two new models
+and the box's existing Nex server on 8097, both spare servers stopped afterwards):
+
+| GGUF | pre | `tokenizer_check` (corpus 18 lines: + numbers, contractions, Japanese, code, SQL, marks) | `chat_template_check` vs `/apply-template` (single user; system+user+assistant+user; whitespace stress) | `encode-prompt` vs `/tokenize add_special=true` |
+|---|---|---|---|---|
+| Qwen2.5-0.5B-Instruct-Q8_0 | qwen2 | **18/18** | chatml **3/3** | equal (35 ids, no bos) |
+| Llama-3.2-1B-Instruct-Q8_0 | llama-bpe | **18/18** | llama3 **3/3** | equal (41 ids, `<|begin_of_text|>` first) |
+| Nex-N2.5-mini IQ4_XS | qwen35 | **18/18** | chatml-think **3/3** | equal (15 ids) |
+
+Control: the old core (qwen2 regex, no `ignore_merges`) against Llama-3.2 on the same corpus is 13/18 (5 MISMATCH), so
+the check bites. llama.cpp's own oracle (`tokenizer_oracle.cljk` over `models/ggml-vocab-*.gguf.inp/.out`,
+`add_special = false, parse_special = false`): qwen2 **46/46**, llama-bpe **46/46**, gpt-2 **46/46**, qwen35 **50/50**;
+`default` has no shipped oracle, so `oracles/ggml-vocab-gpt-neox.gguf.{inp,out}` (62 texts) was produced with
+`llama-tokenize` and is **62/62**. The oracle goes red for the reason named: `ignore_merges` off → 45/46 (`"Cửa Việt"`),
+`\p{N}{1,3}` → `\p{N}` → 35/46. Not done: SentencePiece (refused), gemma / mistral measurement, a jinja engine (by design).
