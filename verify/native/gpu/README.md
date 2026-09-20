@@ -1679,3 +1679,34 @@ tokens — the same text the serial and the adaptive shells produced in ticks 50
 guest are the ids the old core fed it for this prompt. K16 :8099 (the 12-layer Nex prefix guest, same new core): greedy
 and seeded completions oracle-exact (`128186,116769,…` / `80072,…`), chat text meaningless as it was under the old core
 in tick 37 — a 12-layer prefix of a 40-layer model is not the model; the shell is judged on the ids.
+
+### Tick 55, after the anv arms landed: the dense guests on the anv layout (B70)
+
+With `kdot_x8r4` / `kdot_i8_x8r4` reading Q8_0 (section above), the generator's `anv` layout runs the dense recipe end
+to end. Oracle = `dense_ref.py` 9-token continuations (the same four Qwen prompts and two Llama prompts as below; a
+12-token prompt exercises the prefill-8 chunk), `batch_drive.py --prefill 8 --parts 38|32`, GPU frequency not pinned:
+
+| model, box | layout | B=1 ms/step | B=2 | B=4 | rows |
+|---|---|---|---|---|---|
+| Qwen2.5-0.5B Q8_0 24 L, B70 | f32 (radv table) | 5.37 | 4.62 | 4.08 | 4/4 |
+| same | anv as tuned for Nex (int8 lm B times, decode form to B=2) | **4.28** | 6.81 | 6.56 | 4/4 |
+| same | anv + `:lm-once` + `:batch-layout-upto 1` (now the dense rule) | **4.28** | **4.64** | **4.06** | 4/4 |
+| Llama-3.2-1B Q8_0 16 L, B70 | anv (dense rule) | **6.08** | 7.77 | 5.78 | 1/1, 2/2, 4/4 |
+
+Two of the anv table's Nex-tuned choices reverse on a dense model, and the reason is the lm_head: Qwen's 151936 × 896
+Q8_0 is 145 MB against 24 layers of 12 small tensors, so the B-times int8 lm_head read (`:lm-i8`) is the batch step's
+largest term — B=4 6.56 → 4.06 ms/step once the positions kernel reads it once — and the int8 decode form at B=2 pays
+the same weights twice (6.18 → 4.64 with `kdot_f32_p2`). Layer kdots keep `x8r4` (B=1 4.28 vs the f32 kernels' 5.37,
+−20%); the int8 `:wide-i8` class is not used by the dense recipe (it names Nex's qkv / gate / q). The rule lives in the
+generator as `(if (and dense? (= backend "anv")) (assoc layouts* :lm-once true :batch-layout-upto 1) layouts*)`; the
+Nex anv guest regenerates byte-identical (4 L control), and the dense anv guest with the rule is byte-identical to the
+hand-made `anv-lmonce` + `NEX_BATCH_LAYOUT_UPTO=1` guest it was measured with.
+
+Per token, B70 now runs Qwen2.5-0.5B at 4.3 ms and Llama-3.2-1B at 6.1 ms natively (K16: 16.0 / 34.5). Qwen rows:
+prompts `785,6722,315,9625,374` → `12095,13,1084,374,279,7772,3283,304,4505`; `9707,11,847,829,374` →
+`8515,323,358,1079,264,3162,15754,13,358`; `16,17,18,19` → `20,21,22,23,24,15,16,17,18`;
+`785,3974,13876,38835,34208,916,279,15678,5562,13,576,6722` → `315,9625,374,12095,13,3555,374,279,6722`. Llama rows:
+`128000,791,6864,315,9822,374` → `12366,13,578,469,3168,301,22703,374,7559`; `128000,9906,11,856,836,374` →
+`35266,323,358,2846,264,6908,8571,315,701`. `kdot_check.py` now exits 1 on a non-finite row or rel > 1e-3 (the
+quantized-activation oracle's error when `.refq.npy` exists) — the Q5_0-vs-old-shader NaN control had printed `nan`
+and exited 0; verified on synthetic ok / NaN / 1 % inputs (0 / 1 / 1).
