@@ -31,6 +31,8 @@
 (def args (vec *command-line-args*))
 (when (< (count args) 5) (println "usage: <kexe-loader> <resident.bin> <offset> <isa> <port> [allow-csv] [steps-per-life] [prefill-bucket] [batch-rows]") (js/process.exit 2))
 (def loader (args 0)) (def bin (args 1)) (def offset (args 2)) (def isa (args 3)) (def port (args 4))
+(def model-id (or (aget js/process.env "NEX_MODEL_ID") "nex-n2.5-mini/kotoba-native"))
+(def context-size (js/parseInt (or (aget js/process.env "NEX_CONTEXT") "4096")))
 (def allow (or (get args 5) "42,33,41,37,39"))
 (def steps-per-life (js/parseInt (or (get args 6) "15000")))
 ;; prefill bucket P of a `resident-replay … prefill:<P>` guest (iteration 49): the prompt goes in as chunks of P tokens
@@ -237,8 +239,8 @@
 (defn stream-completion [res body ids max-tokens]
   (let [id (str "cmpl-" (js/Date.now)) created (quot (js/Date.now) 1000)]
     (stream-request res ids max-tokens
-                    (fn [text] #js {:id id :object "text_completion" :created created :model "nex-n2.5-mini/kotoba-native" :choices #js [#js {:index 0 :text text :finish_reason nil}]})
-                    (fn [finish usage timing] #js {:id id :object "text_completion" :created created :model "nex-n2.5-mini/kotoba-native" :choices #js [#js {:index 0 :text "" :finish_reason finish}] :usage usage :timing timing})
+                    (fn [text] #js {:id id :object "text_completion" :created created :model model-id :choices #js [#js {:index 0 :text text :finish_reason nil}]})
+                    (fn [finish usage timing] #js {:id id :object "text_completion" :created created :model model-id :choices #js [#js {:index 0 :text "" :finish_reason finish}] :usage usage :timing timing})
                     (sample-of body))))
 (defn stream-chat [res body ids max-tokens]
   (let [id (str "chatcmpl-" (js/Date.now)) created (quot (js/Date.now) 1000) phase (atom :reasoning) buf (atom "")
@@ -254,18 +256,18 @@
                                     :lead (do (swap! buf str text) (recur-lead))
                                     #js {:content text})]
                         (when delta
-                          #js {:id id :object "chat.completion.chunk" :created created :model "nex-n2.5-mini/kotoba-native" :choices #js [#js {:index 0 :delta delta :finish_reason nil}]})))
-                    (fn [finish usage timing] #js {:id id :object "chat.completion.chunk" :created created :model "nex-n2.5-mini/kotoba-native" :choices #js [#js {:index 0 :delta #js {} :finish_reason finish}] :usage usage :timing timing})
+                          #js {:id id :object "chat.completion.chunk" :created created :model model-id :choices #js [#js {:index 0 :delta delta :finish_reason nil}]})))
+                    (fn [finish usage timing] #js {:id id :object "chat.completion.chunk" :created created :model model-id :choices #js [#js {:index 0 :delta #js {} :finish_reason finish}] :usage usage :timing timing})
                     (sample-of body))))
 (defn completion [body]
   (let [prompt (or (.-prompt body) "") max-tokens (or (.-max_tokens body) 16) ids (encode-prompt prompt) t0 (js/Date.now) sample (sample-of body)]
-    (if (empty? ids)
-      (js/Promise.resolve #js {:error #js {:message "empty prompt" :type "invalid_request_error"}})
+    (if (or (empty? ids) (not (pos? max-tokens)) (> (+ (count ids) max-tokens) context-size))
+      (js/Promise.resolve #js {:error #js {:message (if (empty? ids) "empty prompt" (str "prompt + max_tokens exceeds context " context-size)) :type "invalid_request_error"}})
       (.then (submit ids max-tokens nil sample)
              (fn [{:keys [generated ns error finish]}]
                (if error
                  #js {:error #js {:message error :type "server_error"}}
-                 #js {:id (str "cmpl-" (js/Date.now)) :object "text_completion" :created (quot (js/Date.now) 1000) :model "nex-n2.5-mini/kotoba-native"
+                 #js {:id (str "cmpl-" (js/Date.now)) :object "text_completion" :created (quot (js/Date.now) 1000) :model model-id
                       :seed (:seed sample) :temperature (:T sample 0) :top_p (:top-p sample)
                       :choices #js [#js {:index 0 :text (decode generated) :finish_reason finish :token_ids (clj->js generated)}]
                       :usage #js {:prompt_tokens (count ids) :completion_tokens (count generated) :total_tokens (+ (count ids) (count generated))}
@@ -274,14 +276,14 @@
   (let [messages (or (.-messages body) #js []) max-tokens (or (.-max_tokens body) 256)
         thinking? (not (false? (some-> body .-chat_template_kwargs .-enable_thinking)))
         prompt (render-chat messages thinking?) ids (encode-prompt prompt) t0 (js/Date.now) sample (sample-of body)]
-    (if (zero? (.-length messages))
-      (js/Promise.resolve #js {:error #js {:message "no messages" :type "invalid_request_error"}})
+    (if (or (zero? (.-length messages)) (not (pos? max-tokens)) (> (+ (count ids) max-tokens) context-size))
+      (js/Promise.resolve #js {:error #js {:message (if (zero? (.-length messages)) "no messages" (str "prompt + max_tokens exceeds context " context-size)) :type "invalid_request_error"}})
       (.then (submit ids max-tokens nil sample)
              (fn [{:keys [generated ns error finish]}]
                (if error
                  #js {:error #js {:message error :type "server_error"}}
                  (let [[reasoning content] (split-think (decode generated))]
-                   #js {:id (str "chatcmpl-" (js/Date.now)) :object "chat.completion" :created (quot (js/Date.now) 1000) :model "nex-n2.5-mini/kotoba-native"
+                   #js {:id (str "chatcmpl-" (js/Date.now)) :object "chat.completion" :created (quot (js/Date.now) 1000) :model model-id
                         :seed (:seed sample) :temperature (:T sample 0) :top_p (:top-p sample)
                         :choices #js [#js {:index 0 :message #js {:role "assistant" :content content :reasoning_content reasoning} :finish_reason finish}]
                         :usage #js {:prompt_tokens (count ids) :completion_tokens (count generated) :total_tokens (+ (count ids) (count generated))}
@@ -299,8 +301,8 @@
                             (if (and body (true? (.-stream body)))
                               (let [ids (encode-prompt (if chat? (render-chat (or (.-messages body) #js []) (not (false? (some-> body .-chat_template_kwargs .-enable_thinking)))) (or (.-prompt body) "")))
                                     max-tokens (or (.-max_tokens body) (if chat? 256 16))]
-                                (if (empty? ids)
-                                  (do (.writeHead res 400 #js {"Content-Type" "application/json"}) (.end res (js/JSON.stringify #js {:error #js {:message "empty prompt" :type "invalid_request_error"}})))
+                                (if (or (empty? ids) (not (pos? max-tokens)) (> (+ (count ids) max-tokens) context-size))
+                                  (do (.writeHead res 400 #js {"Content-Type" "application/json"}) (.end res (js/JSON.stringify #js {:error #js {:message (if (empty? ids) "empty prompt" (str "prompt + max_tokens exceeds context " context-size)) :type "invalid_request_error"}})))
                                   (if chat? (stream-chat res body ids max-tokens) (stream-completion res body ids max-tokens))))
                               (.then (cond (nil? body) (js/Promise.resolve #js {:error #js {:message "bad json" :type "invalid_request_error"}})
                                            chat? (chat-completion body)
@@ -314,9 +316,9 @@
        (cond (and (= "GET" (.-method req)) (contains? #{"/health" "/"} (.-url req)))
              (do (.writeHead res 200 #js {"Content-Type" "application/json"}) (.end res (js/JSON.stringify #js {:status "ok" :guest (if @guest "resident" "spawning") :guest_steps (if @guest @(:steps @guest) 0)})))
              (and (= "GET" (.-method req)) (= "/slots" (.-url req)))   ;; llama-server's shape, read by the gateway's capacity probe: one slot, busy while a step is in flight
-             (do (.writeHead res 200 #js {"Content-Type" "application/json"}) (.end res (js/JSON.stringify #js [#js {:id 0 :is_processing (boolean (some-> @guest :waiter deref)) :n_ctx 4096}])))
+             (do (.writeHead res 200 #js {"Content-Type" "application/json"}) (.end res (js/JSON.stringify #js [#js {:id 0 :is_processing (boolean (some-> @guest :waiter deref)) :n_ctx context-size}])))
              (and (= "GET" (.-method req)) (= "/v1/models" (.-url req)))
-             (do (.writeHead res 200 #js {"Content-Type" "application/json"}) (.end res (js/JSON.stringify #js {:object "list" :data #js [#js {:id "nex-n2.5-mini/kotoba-native" :object "model" :owned_by "kotoba-lang"}]})))
+             (do (.writeHead res 200 #js {"Content-Type" "application/json"}) (.end res (js/JSON.stringify #js {:object "list" :data #js [#js {:id model-id :object "model" :owned_by "kotoba-lang"}]})))
              :else (do (.writeHead res 404 #js {"Content-Type" "application/json"}) (.end res (js/JSON.stringify #js {:error "POST /v1/completions | /v1/chat/completions, GET /health | /slots | /v1/models"}))))))))
 (.listen server (js/parseInt port)
-         (fn [] (spawn-guest!) (println (str "SERVE\tnex kotoba-native resident\thttp://0.0.0.0:" port "/v1/{chat/,}completions\tguest " bin " @" offset "\tsteps-per-life " steps-per-life "\tprefill-bucket " prefill-bucket "\tbatch-rows " batch-rows))))
+         (fn [] (spawn-guest!) (println (str "SERVE\t" model-id "\thttp://0.0.0.0:" port "/v1/{chat/,}completions\tguest " bin " @" offset "\tsteps-per-life " steps-per-life "\tprefill-bucket " prefill-bucket "\tbatch-rows " batch-rows))))

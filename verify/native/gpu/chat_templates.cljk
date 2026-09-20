@@ -18,13 +18,14 @@
     (cond (str/includes? src "<|start_header_id|>") :llama3
           (str/includes? src "<start_of_turn>") :gemma
           (str/includes? src "[INST]") :mistral
+          (and (= "qwen35" pre-name) (str/includes? src "<|im_start|>") (str/includes? src "<think>")) :qwen35-think
           (and (str/includes? src "<|im_start|>") (str/includes? src "<think>")) :chatml-think
           (str/includes? src "<|im_start|>") :chatml
           :else nil)))
 (def template-family (classify-template chat-template))
 (when (nil? template-family)
   (println (str "REFUSE tokenizer.chat_template is " (if chat-template (str (count chat-template) " chars of an unrecognized template") "absent")
-                " (known families: chatml, chatml-think, llama3, gemma, mistral)"))
+                " (known families: chatml, chatml-think, qwen35-think, llama3, gemma, mistral)"))
   (js/process.exit 2))
 ;; ChatML default system prompt: the literal a `{%- else %}` branch emits when messages[0] is not a system message
 ;; (Qwen2.5: "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."); nil when the template has none.
@@ -33,7 +34,7 @@
     (some-> (re-find #"'<\|im_start\|>system\\n([^'<]+)<\|im_end\|>\\n'" chat-template) second)))
 (def stop-tokens
   "The end-of-generation token strings of each family (the shell stops on any of them that the vocab has, plus eos-id)."
-  {:chatml ["<|im_end|>" "<|endoftext|>"] :chatml-think ["<|im_end|>" "<|endoftext|>"]
+  {:chatml ["<|im_end|>" "<|endoftext|>"] :chatml-think ["<|im_end|>" "<|endoftext|>"] :qwen35-think ["<|im_end|>" "<|endoftext|>"]
    :llama3 ["<|eot_id|>" "<|end_of_text|>" "<|eom_id|>"] :gemma ["<end_of_turn>" "<eos>"] :mistral ["</s>"]})
 (defn- month-abbrev [m] (["Jan" "Feb" "Mar" "Apr" "May" "Jun" "Jul" "Aug" "Sep" "Oct" "Nov" "Dec"] m))
 (defn date-string
@@ -48,6 +49,20 @@
                            (str "<|im_start|>" role "\n" (if (= role "assistant") (str "<think>\n\n</think>\n\n" content) content) "<|im_end|>\n")))
                        messages))
        "<|im_start|>assistant\n<think>" (when-not thinking? "\n\n</think>\n\n")))
+(def qwen35-default-system
+  "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.")
+(defn- render-qwen35-think
+  "Qwen3.5 thinking ChatML: the model's xhigh directive is always the first system content."
+  [messages thinking?]
+  (let [system? (= "system" (:role (first messages)))
+        system-content (str qwen35-default-system (when system? (str "\n\n" (str/trim (:content (first messages))))))
+        rest-messages (if system? (rest messages) messages)]
+    (str "<|im_start|>system\n" system-content "<|im_end|>\n"
+         (apply str (map (fn [{:keys [role content]}]
+                           (let [content (str/trim content)]
+                             (str "<|im_start|>" role "\n" (if (= role "assistant") (str "<think>\n\n</think>\n\n" content) content) "<|im_end|>\n")))
+                         rest-messages))
+         "<|im_start|>assistant\n<think>\n" (when-not thinking? "\n</think>\n\n"))))
 (defn- render-chatml
   "Qwen2.5-style ChatML: no <think>; a default system prompt when the first message is not a system message; content verbatim."
   [messages]
@@ -93,6 +108,7 @@
    :chatml-think only (false closes the think block as chat_template_kwargs.enable_thinking false would)."
   [messages thinking?]
   (case template-family
+    :qwen35-think (render-qwen35-think messages thinking?)
     :chatml-think (render-chatml-think messages thinking?)
     :chatml (render-chatml messages)
     :llama3 (render-llama3 messages)
