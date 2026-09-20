@@ -1,5 +1,6 @@
 # Distribution parity of the native :gpu/compute decode against the f64 oracle and llama-server (iteration 14).
-# usage: python3 parity_check.py <loader output> <decode_tokens_ref.npz> <llama /completion json with n_probs>
+# usage: python3 parity_check.py <loader output> <decode_tokens_ref.npz> [llama /completion json with n_probs]
+# (tick 58: the llama-server json is optional -- without it the check is oracle-only, e.g. the h2 dense layout on Xavier)
 # The guest (stream mode) answers its LAST token as "ns|x hex|argmax hex|logits hex"; the oracle's logits[-1]
 # and llama-server's top_logprobs are the two references. Prints KL(ref||gpu) over the reference's support,
 # top-1 / top-10 agreement and the argmax chain; exit 1 on a trap or a broken answer.
@@ -12,7 +13,7 @@ ref = np.load(sys.argv[2]); toks = ref["tokens"]; am = ref["argmaxes"]; xs = ref
 for i, part in enumerate(parts):
     f = part.split("|"); ns, hx, hid = f[0], f[1], f[2]
     got = np.frombuffer(bytes.fromhex(hx), dtype=np.float32).astype(np.float64); tok = int(np.frombuffer(bytes.fromhex(hid), dtype=np.uint32)[0])
-    r = xs[i]; rel = np.max(np.abs(got - r)) / np.sqrt(np.mean(r * r))
+    r = xs[i]; got = got[:len(r)]; rel = np.max(np.abs(got - r)) / np.sqrt(np.mean(r * r))   # dense rows sit at the front of the 2048-wide buffer
     print(f"step {i}: in {int(toks[i])} -> argmax gpu {tok} ref {int(am[i])} {'OK' if tok == int(am[i]) else 'MISMATCH'} ; x rel {rel:.2e} ; lm_head command buffer {int(ns)/1e6:.2f} ms")
 last = parts[-1].split("|")
 if len(last) < 4: print("no logits in the last answer (not a stream guest?)"); sys.exit(1)
@@ -20,6 +21,7 @@ lg = np.frombuffer(bytes.fromhex(last[3]), dtype=np.float32).astype(np.float64)
 def softmax(v): z = v - v.max(); e = np.exp(z); return e / e.sum()
 pg = softmax(lg); po = softmax(ref["logits"][-1].astype(np.float64))
 print(f"logits: gpu vs oracle max|diff| {np.max(np.abs(lg - ref['logits'][-1])):.3e}, KL(oracle||gpu) {float(np.sum(po * (np.log(po + 1e-30) - np.log(pg + 1e-30)))):.3e} nats, top-1 gpu {int(pg.argmax())} oracle {int(po.argmax())}")
+if len(sys.argv) < 4: sys.exit(0 if int(pg.argmax()) == int(po.argmax()) else 1)   # oracle-only: red when the top-1 differs
 d = json.load(open(sys.argv[3])); cp = d["completion_probabilities"][0]
 lp = {p["id"]: p["logprob"] for p in cp["top_logprobs"]}
 ids = sorted(lp, key=lambda i: -lp[i])

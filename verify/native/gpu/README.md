@@ -1887,3 +1887,33 @@ the Q8_0 file's, so the x rel column — not the ids — is what shows the Q4_K 
 (≤ 1.4e-5) is wider than Q8_0's (≤ 1.9e-6) — the Q4_K / Q6_K super-block paths accumulate in f32 over 256-value blocks;
 same class as the Nex K-quant kdots (Q5_K 6.1e-6). Not done: Q4_K_M on B70 / Xavier (the anv / nvgpu kernels have no Q5_0 /
 Q4_K arms — a Q4_K_M model would need the f32 layout there), the h2 distribution check, SentencePiece, gemma / mistral.
+
+## Tick 58 (2026-09-20, HF coverage 5): the h2 dense path measured on its distribution — and replaced by the exact table
+
+Tick 56 left the nvgpu (h2, f16-activation) dense result as "argmax-exact, distribution-approximate". `parity_check.py` now
+runs without the llama-server json (oracle-only; exit 1 when the top-1 differs) and slices dense rows out of the 2048-wide
+buffer. Qwen2.5-0.5B Q8_0, 24 L, fn guests, prompt 785,6722,315,9625,374, 14 steps, Xavier (head co-resident):
+
+| layout | x rel per step | last-step logits max\|diff\| | KL(oracle‖gpu) | ms/step |
+|---|---|---|---|---|
+| `nvgpu` (h2 / h2q6) | 2.3e-3 … 6.9e-3 | 9.4e-3 | **1.06e-7** nats | 15.7–16.0 |
+| `nvgpu-exact` (s4) | 3.3e-6 … 2.4e-5 | 1.8e-5 | **9.2e-13** nats | 14.6–14.8 |
+
+Both 14/14 argmax, top-1 323 = oracle. The h2 KL of 1e-7 is four orders below llama.cpp's own deviation from the f64 oracle on
+this file (KL 1.5e-3, dense-oracle section) — the f16 activation path is not a quality problem here. But it is also **not a
+speed win on a dense 896-wide model**: the s4 kernels are faster at every B once the exact table also reads the lm_head once
+(`:lm-once`, added to `nvgpu-exact`): adaptive guests `prefill:8 batch:1,2,4`, four oracle rows —
+
+| Xavier, Qwen 24 L | B=1 | B=2 | B=4 | rows |
+|---|---|---|---|---|
+| h2 (tick 56) | 15.72 | 19.17 | 29.84 | 4/4 |
+| s4 exact, no lm-once | 14.69 | — | 35.61 (lm_head read 4×) | 4/4 |
+| **s4 exact + lm-once** | **14.83** | **19.15** | **29.60** | 4/4 |
+
+The h2 table was tuned on Nex (iteration 21: 2048-wide, bandwidth-bound tensors, where halving the activation bytes paid); a
+0.5B dense layer is launch-bound and the f16 conversions are pure overhead. The generator's dense rule now sends `nvgpu` to
+the exact table (`(and dense? (= backend "nvgpu")) → (layout-table "nvgpu-exact")`); the Nex nvgpu guest regenerates
+byte-identical and the dense nvgpu guest is byte-identical to the `nvgpu-exact` guest measured above. Three boxes, dense
+Qwen B=1, all oracle-exact in distribution too: B70 4.28 / K16 16.0 / Xavier 14.8 ms/token. Not done: the same distribution
+check for the anv int8 path on B70 (its lm_head is f32 x8r4 for dense, so the logits are exact by construction — the
+activation quantisation sits in Nex's `:wide-i8` class, unused by the dense recipe), SentencePiece, gemma / mistral.
