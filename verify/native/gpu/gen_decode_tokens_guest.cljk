@@ -115,7 +115,7 @@
   ;; B70 40 layers KL(oracle||gpu) 3.4e-3 nats, KL(llama.cpp||gpu) 0.0054 (exact kernels: 0.0143), 4L token 2.83 -> 2.55 ms.
   ;; "anv-exact" keeps the f32 activations. Experts on int8 gained nothing (2.58) and stay f32 r8.
   {"anv"   {:wide "kdot_x8r4.spv" :narrow "kdot_f32_r1.spv" :lm "kdot_x8r4.spv" :expert "kdot_f32_r8.spv" :out "kdot_f32_r1.spv"
-            :wide-i8 "kdot_i8_x8r4.spv" :lm-i8 "kdot_i8_x8r4.spv"}
+            :wide-i8 "kdot_i8_x8r4.spv" :lm-i8 "kdot_i8_x8r4.spv" :batch-layout-upto 2}   ;; batch: int8 decode form up to B = 2 (iteration 58: 8.65 vs 8.95 ms), positions form above
    "anv-exact" {:wide "kdot_x8r4.spv" :narrow "kdot_f32_r1.spv" :lm "kdot_x8r4.spv" :expert "kdot_f32_r8.spv" :out "kdot_f32_r1.spv"}   ;; wide / lm -> x8r4 (iteration 33: 2.97 -> 2.82 ms; experts on x8r8 lose, 3.27), experts r8 (iteration 27), out r1 (iteration 28)
    "anv-dual" {:wide "kdot_f32_r8.spv" :narrow "kdot_f32_r1.spv" :lm "kdot_f32_r8.spv" :expert "kdot_f32_r8.spv" :expert-dual "kdot_f32_r8_dual.spv"}   ;; experiment: gate + up + silu in one dispatch (iteration 28)
    "radv"  {:wide "kdot_f32_r8.spv" :narrow "kdot_f32_r1.spv" :lm "kdot_f32_r1.spv" :lm-once true}   ;; batch: lm_head read once via the positions kernel (iteration 52: B=2 49.2 -> 36.9 ms)
@@ -312,11 +312,12 @@
 (defn with-phase [ph f]
   (with-bindings (merge (into {} (map (fn [[v k]] [v (get ph k)]) phase-vars))
                         {#'PF (:pf ph) #'prefill? (:pre? ph) #'batch? (:batch? ph) #'bp? (boolean (:bp? ph))
-                         ;; int8 / dual forms: the decode phase, and a B = 1 batch step in the decode-layout form (it is the decode step)
-                         #'i8-wide (when (or (not (:pre? ph)) (and (:batch? ph) (= 1 (:pf ph)) (<= 1 batch-layout-upto))) i8-wide*)
-                         #'i8-lm (when (or (not (:pre? ph)) (and (:batch? ph) (= 1 (:pf ph)) (<= 1 batch-layout-upto))) i8-lm*)
-                         #'i8-expert (when (or (not (:pre? ph)) (and (:batch? ph) (= 1 (:pf ph)) (<= 1 batch-layout-upto))) i8-expert*)
-                         #'kdot-expert-dual (when (or (not (:pre? ph)) (and (:batch? ph) (= 1 (:pf ph)) (<= 1 batch-layout-upto))) kdot-expert-dual*)})
+                         ;; int8 / dual forms: the decode phase, and batch steps in the decode-layout form (B <= :batch-layout-upto; the
+                         ;; activations of B rows quantize as one vector, iteration 58)
+                         #'i8-wide (when (or (not (:pre? ph)) (and (:batch? ph) (<= (:pf ph) batch-layout-upto))) i8-wide*)
+                         #'i8-lm (when (or (not (:pre? ph)) (and (:batch? ph) (<= (:pf ph) batch-layout-upto))) i8-lm*)
+                         #'i8-expert (when (or (not (:pre? ph)) (and (:batch? ph) (<= (:pf ph) batch-layout-upto))) i8-expert*)
+                         #'kdot-expert-dual (when (or (not (:pre? ph)) (and (:batch? ph) (<= (:pf ph) batch-layout-upto))) kdot-expert-dual*)})
     (f))) (def m-gd (ops-meta! 32 32 32 0 0 0)) (def m-gd0 (ops-meta! 32 32 0 0 0 0)) (def m-conv (ops-meta! 8192 1 0 0 0 0))
 (def m-l2q (ops-meta! 128 16 0 0 eps (/ 1.0 (js/Math.sqrt 128)))) (def m-l2k (ops-meta! 128 16 0 2048 eps 0))
 (def m-dn (let [m (alloc! 32)] (write! m (str (le32 32) (le32 128) (le32 128) (le32 16) (le32 4096) (le32 0) (le32 0) (le32 0))) m))
@@ -330,8 +331,8 @@
 (def hN (alloc! (* PMAX 8192))) (def logits (alloc! (* NSEQ 248320 4))) (def amax-s (alloc! (* NSEQ 256))) (def amax-ids (alloc! (* NSEQ 256)))   ;; batch: one row of 64 slots per sequence
 (def m-am1 (ops-meta! 248320 1 61 0 0 0)) (def m-am2 (ops-meta! 248320 1 61 0 0 0))
 ;; int8 twins of the activations the i8 kdots read: [xq xs] per buffer, and one quant meta per value count
-(def q-metas (when quant {2048 (ops-meta! 2048 1 0 0 0 0) 4096 (ops-meta! 4096 1 0 0 0 0)}))
-(defn i8-pair! [n] (when quant [(alloc! n) (alloc! (* 4 (quot n 32)))]))
+(def q-metas (when quant (into {} (for [n [2048 4096] b (range 1 (inc PMAX))] [(* n b) (ops-meta! (* n b) 1 0 0 0 0)]))))   ;; iteration 58: B rows quantized as one vector
+(defn i8-pair! [n] (when quant [(alloc! (* PMAX n)) (alloc! (* PMAX 4 (quot n 32)))]))   ;; PMAX rows (the scale index is element / 32, so rows quantize contiguously)
 (def h-i8 (i8-pair! 2048)) (def h2-i8 (i8-pair! 2048)) (def hN-i8 (i8-pair! 2048)) (def actE-i8 (i8-pair! 4096))
 ;; emit the quant dispatch for activation x (n values) into its pair; returns the pair
 (defn quant! [x n pair] (dispatch! quant (quot (+ (quot n 32) 255) 256) 1 1 (q-metas n) x zeros16 zeros16 (second pair) zeros16 (first pair)) pair)
@@ -404,7 +405,7 @@
         (if (= 1 (recurrent il))
           (do
             (if i8-wide
-              (let [[xq xs] (quant! h 2048 h-i8)]
+              (let [[xq xs] (quant! h (* PF 2048) h-i8)]
                 (dispatch! i8-wide (wg-of (:wide-i8 layouts) 8192) PF 1 m-qkv (:qkv w) xq qkv zerosP xs)
                 (dispatchc! i8-wide (wg-of (:wide-i8 layouts) 4096) PF 1 m-gate (:gate w) xq z zerosP xs))
               (do
@@ -432,7 +433,7 @@
             (pkdot! kdot-out out-spv 2048 m-out (:out w) gnorm attn-out zerosP))
           (do
             (if i8-wide
-              (let [[xq xs] (quant! h 2048 h-i8)] (dispatch! i8-wide (wg-of (:wide-i8 layouts) 8192) PF 1 m-q (:q w) xq qfull zerosP xs))
+              (let [[xq xs] (quant! h (* PF 2048) h-i8)] (dispatch! i8-wide (wg-of (:wide-i8 layouts) 8192) PF 1 m-q (:q w) xq qfull zerosP xs))
               (pkdot! kdot-wide (:wide layouts) 8192 m-q (:q w) h qfull zerosP))
             (pkdotc! kdot-narrow (:narrow layouts) 512 m-k (:k w) h kproj zerosP)
             (pkdotc! kdot-narrow (:narrow layouts) 512 m-v (:v w) h vproj zerosP)
@@ -459,7 +460,7 @@
           (do (dispatch! kdot-expert-dual (quot (+ 512 7) 8) 8 1 m-gate-exps (:gate-exps w) (:up-exps w) h2 actE ids)
               (pkdotc! kdot-narrow (:narrow layouts) 2048 m-down-sh (:down-sh w) sact shdown zerosP))
           (if i8-expert
-            (let [[xq xs] (quant! h2 2048 h2-i8)]
+            (let [[xq xs] (quant! h2 (* PF 2048) h2-i8)]
               (dispatch! i8-expert (wg-of (:expert-i8 layouts) 512) (* 8 PF) 1 m-gate-exps (:gate-exps w) xq gateE ids xs)
               (dispatchc! i8-expert (wg-of (:expert-i8 layouts) 512) (* 8 PF) 1 m-gate-exps (:up-exps w) xq upE ids xs)
               (pkdotc! kdot-narrow (:narrow layouts) 2048 m-down-sh (:down-sh w) sact shdown zerosP)
@@ -469,7 +470,7 @@
                 (pkdotc! kdot-narrow (:narrow layouts) 2048 m-down-sh (:down-sh w) sact shdown zerosP)
                 (dispatch! (ops "silu_mul") (* 16 PF) 1 1 m-silu8 gateE upE zeros16 actE zeros16 zeros16))))
         (if i8-expert
-          (let [[xq xs] (quant! actE 4096 actE-i8)] (dispatch! i8-expert (wg-of (:expert-i8 layouts) 2048) (* 8 PF) 1 m-down-exps (:down-exps w) xq downE ids xs))
+          (let [[xq xs] (quant! actE (* PF 4096) actE-i8)] (dispatch! i8-expert (wg-of (:expert-i8 layouts) 2048) (* 8 PF) 1 m-down-exps (:down-exps w) xq downE ids xs))
           (dispatch! kdot-expert (wg-of expert-spv 2048) (* 8 PF) 1 m-down-exps (:down-exps w) actE downE ids))
         (dispatch! (ops "weighted_sum") 8 PF 1 m-wsum downE topw shdown ffn shlogit zeros16)
         (dispatch! (ops "add") (* 8 PF) 1 1 m-add resid ffn zeros16 xout zeros16 zeros16))
@@ -479,7 +480,7 @@
   (let [x-final (if (odd? (dec layers)) xb xa)]
     (dispatch! (ops "rmsnorm") PF 1 1 m-norm x-final w-out-norm zeros16 hN zeros16 zeros16)
     (if i8-lm
-      (let [[xq xs] (quant! hN 2048 hN-i8)] (dispatch! i8-lm (wg-of (:lm-i8 layouts) 248320) 1 1 m-lm w-lm xq logits zeros16 xs))
+      (let [[xq xs] (quant! hN (* PF 2048) hN-i8)] (dispatch! i8-lm (wg-of (:lm-i8 layouts) 248320) 1 1 m-lm w-lm xq logits zeros16 xs))
       (dispatch! kdot-lm (wg-of (:lm layouts) 248320) 1 1 m-lm w-lm hN logits zeros16))
     (dispatch! (ops "argmax_partial") 61 1 1 m-am1 logits zeros16 zeros16 zeros16 amax-s amax-ids)
     (dispatch! (ops "argmax_final") 1 1 1 m-am2 amax-s zeros16 zeros16 amax-s amax-s amax-ids)
@@ -598,7 +599,7 @@
     (step! (str "(" layers-name " 0 " layers ")"))
     (dispatch! (ops "rmsnorm") PF 1 1 m-norm x-final w-out-norm zeros16 hN zeros16 zeros16)
     (if i8-lm
-      (let [[xq xs] (quant! hN 2048 hN-i8)] (dispatch! i8-lm (wg-of (:lm-i8 layouts) 248320) 1 1 m-lm w-lm xq logits zeros16 xs))
+      (let [[xq xs] (quant! hN (* PF 2048) hN-i8)] (dispatch! i8-lm (wg-of (:lm-i8 layouts) 248320) (if batch? PF 1) 1 m-lm w-lm xq logits zerosP xs))   ;; batch: B rows of int8 logits
       (cond
         ;; batch: every row's logits. :lm-once backends read the 425 MB lm_head ONCE through the positions kernel (radv,
         ;; nvgpu: bandwidth / issue bound on it); anv's x8r4 with the positions dispatch beats the f32 kernel even read B times
