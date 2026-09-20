@@ -1321,3 +1321,26 @@ one concurrently in 1.04 s, identical ids.
 tokens → `"Paris"` in **1.70–1.74 s** (serial 1.65–1.70), the seeded haiku (T 0.7 / top_p 0.9 / seed 7) → the
 **same three lines** in 22 tokens / 3.05 s (serial 2.9 s), load N=4 15.8 and N=8 **17.2 seq-tokens/s** (serial
 11.5). No feature is lost: greedy, sampling with seed, streaming, chunked prefill, and now batching (1.5× at N=8).
+
+## Tick 53 (2026-09-20, C-4): int8 in the batch step on anv; the pipeline table
+
+The batch steps' int8 forms (anv's `kdot_i8_x8r4` for the wide kdots and the lm_head) now work for B rows: the
+B rows' activations are quantized as ONE vector (`quant_q8` over `B·n` elements; the int8 kernels index the
+per-32 scale by element, so contiguous rows need nothing else), the int8 lm_head dispatches `positions = B`,
+and the int8 / dual forms are enabled for batch steps up to `:batch-layout-upto`. B70, 12 layers, adaptive
+guests (`prefill:8 batch:1,2,4`), GPU ms/step, rows oracle-exact:
+
+| `:batch-layout-upto` | B=1 | B=2 | B=4 |
+|---|---|---|---|
+| 1 (int8 only at B=1) | 5.21 | 8.95 | 13.32 |
+| **2** (anv default now) | 5.21 | **8.65** | **13.24** |
+| 4 (int8 layout everywhere) | 5.21 | 8.66 | 15.57 |
+
+So anv takes the int8 decode form up to B = 2 and the positions form above; seq-tokens/s 200 (single) → 231
+(B=2) → **302 (B=4, 1.51×)**. The 425 MB lm_head read twice at B = 2 in int8 beats the f32 positions kernel
+reading it once — the item tick 47 left open closes as a measurement, not a new kernel.
+
+The adaptive anv guest hit the loader's `pipeline table full` (64): 23 ops + 13 batch twins + 5 batch-prefill
+twins + the kdot layouts with their int8 forms + a positions kernel per phase + three embed / delta-net variants
++ the quantizer ≈ 70. amu #1039 raises `KGPU_MAX_PIPELINES` to 128; built on the three boxes as `kexe-loader-gpu7`
+(promoted to `kexe-loader-gpu` when the PR lands). K16 and Xavier were under the old limit by a few entries.
