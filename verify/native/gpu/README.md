@@ -37,6 +37,40 @@ why the serving path records one command buffer per token (ADR-2609182100 D1).
 
 ## The Nex K-quant kernels on the same path (2026-09-19)
 
+### Prism Ternary Bonsai 2 codecs and activation basis (2026-09-20)
+
+`kdot_f32_r1.comp` and the positions kernel now decode Prism's group-128
+`PQ2_0` (GGML type 142) and `PTQ1_0` (143), plus the BF16 projections used by
+Qwen3.5 gated delta net. PTQ1_0's physical block order is `qs[24], qh[2], d`;
+it intentionally does not share PQ2_0's `d, qs[32]` offsets.
+`embed_iq4xs.comp -DPTQ1` supplies the corresponding token-row lookup.
+
+Folded Bonsai weights require an activation basis change before every folded
+matmul. `hadamard_signed.comp` implements the checkpoint contract: normalized
+1024-wide Sylvester Hadamard blocks, explicit signs, inverse-after-embedding,
+and the Qwen3.5 recurrent `ssm_out` reorder from tiled `[hd,nk,rep]` to grouped
+`[hd,rep,nk]` before the transform. It handles independent rows, so the same
+kernel is usable by the resident adaptive batch scheduler.
+
+The gates execute the production GLSL after `naga` translation rather than a
+test-only GPU implementation:
+
+```
+deno run --unstable-webgpu --allow-read --allow-write --allow-run \
+  verify/ternary_kdot_parity.js 37 5120 /path/to/Ternary-Bonsai-2-27B-PTQ1_0.gguf
+deno run --unstable-webgpu --allow-read --allow-write --allow-run \
+  verify/hadamard_signed_parity.js
+```
+
+Measured on Apple M1 Max: synthetic PQ2_0/PTQ1_0 and BF16 dots agree with the
+CPU codec to at most `1.526e-5`; 37 real rows of
+`blk.0.attn_gate.weight` agree to `1.192e-7`; forward, inverse, and grouped-GDN
+Hadamard cases at widths 5120, 6144, and 17408 agree to `2.384e-7` absolute.
+This evidence covers tensor execution and the activation transform. It does
+not claim a complete 64-layer token, HTTP throughput, or fleet concurrency;
+those require wiring these operations into the Qwen3.5 dense-hybrid layer
+recipe and measuring the resident guest on the target GPU.
+
 `kdot_f32_r8.comp` / `kdot_f32_r1.comp` are the GLSL twins of
 `shaders/ggml_kdot_f32_r8.wgsl` / `ggml_kdot_f32.wgsl` (Q4_K 12 / Q5_K 13 /
 Q6_K 14 / IQ4_XS 23, f32 activations, five storage bindings). `gen_kdot_guest.cljk`

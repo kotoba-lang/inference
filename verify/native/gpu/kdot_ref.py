@@ -1,6 +1,7 @@
 # CPU dequant oracle for the :gpu/compute K-quant dot guests (verify/native/gpu). Python because it is a
 # TEST ORACLE beside numpy, not operations tooling (CLAUDE.md kbb-first is for tooling); a .cljk twin is debt.
-# GGUF tensor directory + CPU dequant reference for Q5_K / Q6_K / IQ4_XS / Q8_0 / Q4_0 / F16 / Q4_1 / Q5_0 / Q5_1 rows.
+# GGUF tensor directory + CPU dequant reference for the native kdot types,
+# including Prism PQ2_0/PTQ1_0 and Qwen3.5 BF16 projections.
 # Prints "name type offset(bytes, absolute in file) dims" and writes a reference dot.
 import struct, sys, numpy as np, json
 def read_gguf_dir(path):
@@ -82,6 +83,20 @@ def deq_q4_0_32(b):
     d=f16(b[0:2]); qs=np.frombuffer(b[2:18],dtype=np.uint8)
     return np.concatenate([d*((qs&0xf).astype(np.float32)-8), d*((qs>>4).astype(np.float32)-8)]).astype(np.float32)
 def deq_f16_32(b): return np.frombuffer(b[0:64],dtype=np.float16).astype(np.float32)
+def deq_bf16_32(b): return (np.frombuffer(b[0:64],dtype='<u2').astype(np.uint32)<<16).view(np.float32)
+def deq_pq2_0_128(b):
+    d=f16(b[0:2]); q=np.frombuffer(b[2:34],dtype=np.uint8); out=np.empty(128,np.float32)
+    for i in range(4): out[i::4]=d*(((q>>(2*i))&3).astype(np.float32)-1)
+    return out
+def deq_ptq1_0_128(b):
+    out=np.empty(128,np.float32); d=f16(b[26:28]); qs=np.frombuffer(b[:24],dtype=np.uint8); qh=np.frombuffer(b[24:26],dtype=np.uint8)
+    for e in range(128):
+        if e<80: v=int(qs[e&15]); n=e>>4
+        elif e<120: t=e-80; v=int(qs[16+(t&7)]); n=t>>3
+        else: t=e-120; v=int(qh[t&1]); n=t>>1
+        for _ in range(n): v=(v*3)&255
+        out[e]=d*(((v*3)>>8)-1)
+    return out
 # Q4_1 (3) / Q5_0 (6) / Q5_1 (7), iteration 53b: 20 / 22 / 24 B per 32 values (ggml-common.h block_q4_1 / block_q5_0 /
 # block_q5_1). Nibble order as Q4_0 (low nibbles = values 0..15, high nibbles = 16..31); the 5th bit of value j is bit j
 # of the little-endian u32 qh (dequantize_row_q5_0: xh_0 = (qh >> j) << 4, xh_1 = (qh >> (j + 12)) & 0x10). Q4_1 / Q5_1
@@ -123,13 +138,13 @@ def check_q5x_against_dense_ref(raw_by_type):
 def deq_q8_0(blk): return np.concatenate([deq_q8_0_32(blk[34*i:34*i+34]) for i in range(8)])
 def deq_q4_0(blk): return np.concatenate([deq_q4_0_32(blk[18*i:18*i+18]) for i in range(8)])
 def deq_f16(blk): return np.frombuffer(blk[0:512],dtype=np.float16).astype(np.float32)
-BLOCK={1:(512,deq_f16),2:(144,deq_q4_0),8:(272,deq_q8_0),13:(176,deq_q5k),14:(210,deq_q6k),23:(136,deq_iq4xs),3:(160,deq_q4_1),6:(176,deq_q5_0),7:(192,deq_q5_1)}
-BLOCK32={1:(64,deq_f16_32),2:(18,deq_q4_0_32),8:(34,deq_q8_0_32),3:(20,deq_q4_1_32),6:(22,deq_q5_0_32),7:(24,deq_q5_1_32)}
+BLOCK={1:(512,deq_f16),2:(144,deq_q4_0),8:(272,deq_q8_0),13:(176,deq_q5k),14:(210,deq_q6k),23:(136,deq_iq4xs),3:(160,deq_q4_1),6:(176,deq_q5_0),7:(192,deq_q5_1),142:(34,deq_pq2_0_128),143:(28,deq_ptq1_0_128)}
+BLOCK32={1:(64,deq_f16_32),2:(18,deq_q4_0_32),8:(34,deq_q8_0_32),3:(20,deq_q4_1_32),6:(22,deq_q5_0_32),7:(24,deq_q5_1_32),30:(64,deq_bf16_32)}
 def row_geometry(typ,cols):
     """(block bytes, dequant, blocks per row): the native unit -- 32-value blocks for BLOCK32 types, else 256."""
     if typ in BLOCK32:
         bb,deq=BLOCK32[typ]; assert cols%32==0,(typ,cols); return bb,deq,cols//32
-    bb,deq=BLOCK[typ]; assert cols%256==0,(typ,cols); return bb,deq,cols//256
+    bb,deq=BLOCK[typ]; unit=128 if typ in (142,143) else 256; assert cols%unit==0,(typ,cols); return bb,deq,cols//unit
 if __name__=='__main__':
     path=sys.argv[1]; names=sys.argv[2:]
     kv,tensors,ds=read_gguf_dir(path)

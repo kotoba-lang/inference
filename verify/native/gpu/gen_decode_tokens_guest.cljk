@@ -170,7 +170,7 @@
 (def NPARTS (quot (+ NV 4095) 4096))            ;; argmax partials (61 for 248320, 38 for 151936); the pick lands at slot NPARTS
 (def PICK-OFF (* 4 NPARTS))                     ;; byte offset of the pick in a row of the ids buffer
 (when (> NPARTS 63) (println "REFUSE vocab" NV "-- more than 63 argmax partials, the row stride is 64 slots") (js/process.exit 2))
-(def block-bytes {12 144 13 176 14 210 23 136 0 nil})
+(def block-bytes {12 144 13 176 14 210 23 136 142 68 143 56 0 nil})
 (defn tensor-bytes [{:keys [dims type]}]
   ;; iteration 59: F32 (0) / F16 (1) per value; Q8_0 (8) 34 B and Q4_0 (2) 18 B per 32 values; K-quants per 256.
   ;; 53b: Q4_1 (3) 20 B, Q5_0 (6) 22 B, Q5_1 (7) 24 B per 32 values (the kdot_f32_* arms of the same tick).
@@ -178,6 +178,7 @@
     (case type
       0 (* rows cols 4)
       1 (* rows cols 2)
+      30 (* rows cols 2)
       8 (* rows (quot (+ cols 31) 32) 34)
       2 (* rows (quot (+ cols 31) 32) 18)
       3 (* rows (quot (+ cols 31) 32) 20)
@@ -287,8 +288,8 @@
 (def expert-spv (or (:expert layouts) (:narrow layouts)))
 (def deltanet (pipeline! "deltanet_step.spv" 8))
 (def deltanet-fused (when fused? (pipeline! "deltanet_fused.spv" 13)))
-(def EMB (:type (get tensors "token_embd.weight")))   ;; 23 IQ4_XS (Nex) or 8 Q8_0 (Qwen2.5 Q8_0)
-(def embed-spv (case EMB 23 "embed_iq4xs" 8 "embed_q8" (do (println "REFUSE token_embd.weight type" EMB "-- embed kernels: 23 IQ4_XS, 8 Q8_0") (js/process.exit 2))))
+(def EMB (:type (get tensors "token_embd.weight")))   ;; 23 IQ4_XS (Nex), 8 Q8_0 (Qwen2.5), or 143 PTQ1_0 (Prism Bonsai)
+(def embed-spv (case EMB 23 "embed_iq4xs" 8 "embed_q8" 143 "embed_ptq1" (do (println "REFUSE token_embd.weight type" EMB "-- embed kernels: 23 IQ4_XS, 8 Q8_0, 143 PTQ1_0") (js/process.exit 2))))
 (def embed (pipeline! (str embed-spv ".spv") 5))
 (def deltanet-fused-b (when BB (pipeline! "deltanet_fused_b.spv" 13)))
 (def embed-b (when BB (pipeline! (str embed-spv "_b.spv") 5)))
