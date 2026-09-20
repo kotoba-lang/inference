@@ -109,3 +109,13 @@ if __name__=='__main__':
                 row=np.concatenate([deq(raw[r*rowbytes+b*bb:r*rowbytes+(b+1)*bb]) for b in range(nb)])
                 ref[r]=np.dot(row.astype(np.float64),x.astype(np.float64))
             np.save(name.replace('.','_')+'.ref.npy',ref)
+            # the same dot against the activation nex_ops.comp's quant_q8 hands the int8 kdots (per 32 values:
+            # scale = max|x| / 127, q = round(x / scale)) -- what an int8 kernel should reproduce to f32 accumulation
+            # error; the gap between .ref and .refq is the activation quantization itself, not the kernel (tick 55).
+            xb=x.reshape(-1,32); sc=np.abs(xb).max(axis=1,keepdims=True)/np.float32(127)
+            xq=(np.where(sc>0,np.rint(xb/np.where(sc>0,sc,1)),0)*sc).astype(np.float32).reshape(-1)
+            refq=np.zeros(nref,np.float64)
+            for r in range(nref):
+                row=np.concatenate([deq(raw[r*rowbytes+b*bb:r*rowbytes+(b+1)*bb]) for b in range(nb)])
+                refq[r]=np.dot(row.astype(np.float64),xq.astype(np.float64))
+            np.save(name.replace('.','_')+'.refq.npy',refq)
