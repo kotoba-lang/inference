@@ -1846,3 +1846,44 @@ moves (30.4 → 29.8): on Xavier the batch step is issue-bound in the positions 
 Head note: the production head restarted at 12:46:25 JST from the pre-q80 spv (the swap was mid-flight); the new
 `kdot_{h2,h2q6,s4}_r1.spv` were installed at 12:47 and the K-quant outputs are bit-identical between the two, so the
 running head is correct and will pick the new files up at its next restart — no restart forced for that.
+
+## Tick 57 (2026-09-20, HF coverage 4): a Q4_K_M file end to end — mixed types per layer
+
+Qwen2.5-0.5B-Instruct **Q4_K_M** (llama.cpp's default download quant) is a mix: `token_embd` Q5_0, `output` Q8_0, attention
+and gate/up Q5_0, `attn_v` **Q8_0 in layers 0–1 and Q5_0 from layer 2**, `ffn_down` **Q6_K in 12 layers and Q4_K in 12**
+(types `{8: 13, 6: 133, 0: 121, 14: 12, 12: 12}`). Two things stood between the generator and this file:
+
+1. **The embedding kernel** had IQ4_XS / Q8_0 / PTQ1 arms only. `embed_iq4xs.comp -DB32=<type>` now dequantises the four
+   legacy 32-value block types (2 Q4_0, 3 Q4_1, 6 Q5_0, 7 Q5_1) as `ggml-quants.c` does (5th bit of value j = bit j of the LE
+   u32 `qh`, `-8` / `-16` offsets, `m` for the `_1` types), `embed_q40|q41|q50|q51{,_b,_bp}.spv` built on K16 (glslang,
+   vulkan1.1). First build wrote only blocks 0–23 of a 28-block row: the IQ4_XS early return `t >= blocks*8` (blocks = cols/256
+   = 3) was still in front of the new arm — found because the debug `x` matched the oracle's row for the first 768 values and
+   was 0 after (`NEX_DEBUG_BUFS=x`, oracle `dense_ref.rows_of`). The installed Q8 / IQ4_XS spv were rebuilt and disassembled
+   against the installed ones: identical past debug names / the target-env `Block` decoration.
+2. **The dense kdot metas were typed from layer 0** (`(:type (T* "blk.0.attn_v.weight"))` for every layer): every layer
+   read `attn_v` as Q8_0 and `ffn_down` as Q6_K → NaN from layer 2 on (found by a 3-layer debug guest: `dv` had 55 NaN of 128
+   while a standalone `kdot_f32_r1` guest on the same `blk.2.attn_v.weight` was exact at 2.6e-6 — the tensor and kernel were
+   fine, the meta was not). A uniform file (the Q8_0 Qwen / Llama runs of ticks 54–56) never showed it.
+
+   Fix: one meta buffer per `[phase shape [pf ipe], role, distinct type]` (`dense-metas`), a per-layer **type signature**
+   (`dense-sigs`, distinct type vectors over the 6 kdot roles; 2 for this file), and the shared layer function derives its
+   layer's signature from its weight base — `(let [sig (sig-of (quot (- w0 W0) 12))] …)`, `sig-of` an if-chain over layers
+   — and a role whose type varies picks its meta with `(if (= sig k) …)` (8 such sites in the adaptive guest; a uniform file
+   emits none and its guests differ from before only in meta handle numbers). Two roads not taken: per-layer meta buffers
+   (720 WRITE lines, 150 KB source, over the literal budget) and a 6th function parameter (`:kotoba.error/max-parameters`:
+   the native ABI carries 5).
+
+Measured on K16 (RADV, f32 kernels), oracle = `dense_ref.py` on the Q4_K_M file (its continuations for these prompts equal
+the Q8_0 file's, so the x rel column — not the ids — is what shows the Q4_K / Q5_0 / Q6_K weights were read):
+
+| guest | result |
+|---|---|
+| fn, 24 L, prompt 785,6722,315,9625,374, 13 steps | **13/13 argmax, x rel 3.2e-6 … 1.4e-5**, 17.2 ms/token |
+| adaptive `prefill:8 batch:1,2,4`, 4 oracle rows (one 12-token) | **4/4**, B=1 16.24 ms/step, B=4 19.25 |
+| control: Q8_0 file, same generator, B=4 | 4/4, 18.56 ms/step |
+| control: Nex anv adaptive 4 L guest | byte-identical to the tick-55 generator's |
+
+`decode_tokens_check.py` slices the 2048-wide shared row buffer to the model's width (dense rows are 896). The x rel band
+(≤ 1.4e-5) is wider than Q8_0's (≤ 1.9e-6) — the Q4_K / Q6_K super-block paths accumulate in f32 over 256-value blocks;
+same class as the Nex K-quant kdots (Q5_K 6.1e-6). Not done: Q4_K_M on B70 / Xavier (the anv / nvgpu kernels have no Q5_0 /
+Q4_K arms — a Q4_K_M model would need the f32 layout there), the h2 distribution check, SentencePiece, gemma / mistral.
