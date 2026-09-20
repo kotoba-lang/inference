@@ -1,6 +1,6 @@
 # CPU dequant oracle for the :gpu/compute K-quant dot guests (verify/native/gpu). Python because it is a
 # TEST ORACLE beside numpy, not operations tooling (CLAUDE.md kbb-first is for tooling); a .cljk twin is debt.
-# GGUF tensor directory + CPU dequant reference for Q5_K / Q6_K / IQ4_XS / Q8_0 / Q4_0 / F16 rows.
+# GGUF tensor directory + CPU dequant reference for Q5_K / Q6_K / IQ4_XS / Q8_0 / Q4_0 / F16 / Q4_1 / Q5_0 / Q5_1 rows.
 # Prints "name type offset(bytes, absolute in file) dims" and writes a reference dot.
 import struct, sys, numpy as np, json
 def read_gguf_dir(path):
@@ -82,11 +82,49 @@ def deq_q4_0_32(b):
     d=f16(b[0:2]); qs=np.frombuffer(b[2:18],dtype=np.uint8)
     return np.concatenate([d*((qs&0xf).astype(np.float32)-8), d*((qs>>4).astype(np.float32)-8)]).astype(np.float32)
 def deq_f16_32(b): return np.frombuffer(b[0:64],dtype=np.float16).astype(np.float32)
+# Q4_1 (3) / Q5_0 (6) / Q5_1 (7), iteration 53b: 20 / 22 / 24 B per 32 values (ggml-common.h block_q4_1 / block_q5_0 /
+# block_q5_1). Nibble order as Q4_0 (low nibbles = values 0..15, high nibbles = 16..31); the 5th bit of value j is bit j
+# of the little-endian u32 qh (dequantize_row_q5_0: xh_0 = (qh >> j) << 4, xh_1 = (qh >> (j + 12)) & 0x10). Q4_1 / Q5_1
+# are d*q + m, Q5_0 is d*(q - 16). `check_q5x_against_dense_ref()` asserts these agree bit for bit with dense_ref.py's.
+def _q5_nibbles_32(qh,qs):
+    j=np.arange(16); lo=(qs&0xf)|(((qh>>j)&1)<<4); hi=(qs>>4)|(((qh>>(j+16))&1)<<4)
+    return np.concatenate([lo,hi]).astype(np.float32)
+def deq_q4_1_32(b):
+    d=f16(b[0:2]); m=f16(b[2:4]); qs=np.frombuffer(b[4:20],dtype=np.uint8)
+    return (d*np.concatenate([(qs&0xf).astype(np.float32),(qs>>4).astype(np.float32)])+m).astype(np.float32)
+def deq_q5_0_32(b):
+    d=f16(b[0:2]); qh=int(struct.unpack('<I',b[2:6])[0]); qs=np.frombuffer(b[6:22],dtype=np.uint8).astype(np.int64)
+    return (d*(_q5_nibbles_32(qh,qs)-16)).astype(np.float32)
+def deq_q5_1_32(b):
+    d=f16(b[0:2]); m=f16(b[2:4]); qh=int(struct.unpack('<I',b[4:8])[0]); qs=np.frombuffer(b[8:24],dtype=np.uint8).astype(np.int64)
+    return (d*_q5_nibbles_32(qh,qs)+m).astype(np.float32)
+def deq_q4_1(blk): return np.concatenate([deq_q4_1_32(blk[20*i:20*i+20]) for i in range(8)])
+def deq_q5_0(blk): return np.concatenate([deq_q5_0_32(blk[22*i:22*i+22]) for i in range(8)])
+def deq_q5_1(blk): return np.concatenate([deq_q5_1_32(blk[24*i:24*i+24]) for i in range(8)])
+def check_q5x_against_dense_ref(raw_by_type):
+    """raw_by_type: {3|6|7: bytes of >= 1 block}. Returns the number of blocks compared (0 = nothing compared, not a pass);
+    raises AssertionError when kdot_ref's 32-value dequant and dense_ref.py's (the llama-server-matched oracle) differ in
+    any value (both compared as f32 -- dense_ref returns f64 of the same f16 * int arithmetic)."""
+    import importlib.util, os
+    spec=importlib.util.spec_from_file_location('dense_ref_mod',os.path.join(os.path.dirname(os.path.abspath(__file__)),'dense_ref.py'))
+    src=open(spec.origin).read(); ns={}
+    # dense_ref.py runs its CLI at import; pull only the dequant definitions (everything before the BLOCK table).
+    head=src[:src.index('BLOCK = {')]; head=head[head.index('# ---- dequant'):]
+    exec("import numpy as np\nimport kdot_ref as g\n"+head,ns)
+    n=0
+    for typ,raw in raw_by_type.items():
+        bb,mine=BLOCK32[typ]; theirs={3:ns['deq_q4_1'],6:ns['deq_q5_0'],7:ns['deq_q5_1']}[typ]
+        nb=len(raw)//bb; assert nb>=1,(typ,len(raw))
+        a=np.stack([mine(raw[i*bb:(i+1)*bb]) for i in range(nb)])
+        b=theirs(np.frombuffer(raw[:nb*bb],dtype=np.uint8).reshape(nb,bb)).astype(np.float32)
+        assert a.shape==b.shape and np.array_equal(a.view(np.uint32),b.view(np.uint32)),("kdot_ref vs dense_ref differ for type",typ,np.max(np.abs(a-b)))
+        n+=nb
+    return n
 def deq_q8_0(blk): return np.concatenate([deq_q8_0_32(blk[34*i:34*i+34]) for i in range(8)])
 def deq_q4_0(blk): return np.concatenate([deq_q4_0_32(blk[18*i:18*i+18]) for i in range(8)])
 def deq_f16(blk): return np.frombuffer(blk[0:512],dtype=np.float16).astype(np.float32)
-BLOCK={1:(512,deq_f16),2:(144,deq_q4_0),8:(272,deq_q8_0),13:(176,deq_q5k),14:(210,deq_q6k),23:(136,deq_iq4xs)}
-BLOCK32={1:(64,deq_f16_32),2:(18,deq_q4_0_32),8:(34,deq_q8_0_32)}
+BLOCK={1:(512,deq_f16),2:(144,deq_q4_0),8:(272,deq_q8_0),13:(176,deq_q5k),14:(210,deq_q6k),23:(136,deq_iq4xs),3:(160,deq_q4_1),6:(176,deq_q5_0),7:(192,deq_q5_1)}
+BLOCK32={1:(64,deq_f16_32),2:(18,deq_q4_0_32),8:(34,deq_q8_0_32),3:(20,deq_q4_1_32),6:(22,deq_q5_0_32),7:(24,deq_q5_1_32)}
 def row_geometry(typ,cols):
     """(block bytes, dequant, blocks per row): the native unit -- 32-value blocks for BLOCK32 types, else 256."""
     if typ in BLOCK32:
@@ -97,10 +135,15 @@ if __name__=='__main__':
     kv,tensors,ds=read_gguf_dir(path)
     print("data_start",ds)
     f=open(path,'rb')
+    if not names:   # directory listing: name type dims (types per the ggml enum: 0 F32 1 F16 2 Q4_0 3 Q4_1 6 Q5_0 7 Q5_1 8 Q8_0 12..14 Q4_K..Q6_K 23 IQ4_XS)
+        for name,typ,off,dims in tensors: print(name,typ,dims)
+        from collections import Counter; print("types",dict(Counter(t[1] for t in tensors)))
     for name,typ,off,dims in tensors:
         if name in names:
             cols,rows=dims[0],dims[1]; bb,deq,nb=row_geometry(typ,cols); rowbytes=nb*bb
             print(name,typ,ds+off,dims,"bytes",rows*rowbytes)
+            if typ in (3,6,7):   # the new dequants must agree with dense_ref.py's on this tensor's first row (all its blocks)
+                f.seek(ds+off); print(name,"q5x-check blocks agreeing with dense_ref.py:",check_q5x_against_dense_ref({typ:f.read(rowbytes)}))
             rng=np.random.default_rng(11); x=rng.standard_normal(cols).astype(np.float32); x.tofile(name.replace('.','_')+'.x.f32')
             f.seek(ds+off); raw=f.read(rows*rowbytes)
             nref=min(rows,64)  # reference for the first 64 rows (CPU dequant is slow)
@@ -109,3 +152,13 @@ if __name__=='__main__':
                 row=np.concatenate([deq(raw[r*rowbytes+b*bb:r*rowbytes+(b+1)*bb]) for b in range(nb)])
                 ref[r]=np.dot(row.astype(np.float64),x.astype(np.float64))
             np.save(name.replace('.','_')+'.ref.npy',ref)
+            # the same dot against the activation nex_ops.comp's quant_q8 hands the int8 kdots (per 32 values:
+            # scale = max|x| / 127, q = round(x / scale)) -- what an int8 kernel should reproduce to f32 accumulation
+            # error; the gap between .ref and .refq is the activation quantization itself, not the kernel (tick 55).
+            xb=x.reshape(-1,32); sc=np.abs(xb).max(axis=1,keepdims=True)/np.float32(127)
+            xq=(np.where(sc>0,np.rint(xb/np.where(sc>0,sc,1)),0)*sc).astype(np.float32).reshape(-1)
+            refq=np.zeros(nref,np.float64)
+            for r in range(nref):
+                row=np.concatenate([deq(raw[r*rowbytes+b*bb:r*rowbytes+(b+1)*bb]) for b in range(nb)])
+                refq[r]=np.dot(row.astype(np.float64),xq.astype(np.float64))
+            np.save(name.replace('.','_')+'.refq.npy',refq)

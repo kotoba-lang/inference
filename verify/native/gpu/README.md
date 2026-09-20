@@ -1523,6 +1523,190 @@ Answer in one word." → `"Paris"` (llama-server on the same GGUF: `"Paris"`), c
 `" Paris. It is the largest city in"` = llama-server, 215 ms; Llama-3.2 → `"Paris"` / `" Paris. The Eiffel Tower is"`
 = llama-server. The K16 shells stay up on :8100 (Qwen) and :8101 (Llama) beside the Nex one on :8099.
 
-Not done: B70 / Xavier runs of the dense guests (anv int8 / nvgpu h2 layouts have no Q8_0 arm yet — `kdot_i8_x8r4`,
-`kdot_h2_r1`; on those boxes a dense model would fall to the f32 kernels), Q4_K_M mixes with Q5_0 (type 6: kdot arm
-missing), SentencePiece models (refused by name), the Xavier head shell not yet updated to the new tokenizer core.
+Not done: B70 / Xavier runs of the dense guests (the anv kernels took the Q8_0 / Q4_0 / F16 arms in tick 55 below;
+the nvgpu h2 layout `kdot_h2_r1` still has none, so on Xavier a dense model would fall to the f32 kernels), Q4_K_M
+mixes with Q5_0 (type 6: kdot arm missing), SentencePiece models (refused by name), the Xavier head shell not yet
+updated to the new tokenizer core.
+
+## Tick 55 (2026-09-20): Q8_0 / Q4_0 / F16 in the anv kernels — `kdot_x8r8.comp` and `kdot_i8_x8r4.comp`, measured on B70
+
+The two Intel Arc (ANV) kernels take the three non-K-quant types the way tick 53 gave them to `kdot_f32_*`: `block_bytes_of()`
+answers 272 / 144 / 512 per 256 values, `blocks = ceil(cols / 256)` and `row_bytes = ceil(cols / 32) * 34` (18 / 64) for
+these types, the tail group is masked, codes go through `weight_u32_at` (block starts are 2-byte aligned). On the x8 lane
+mapping a lane's eight values never straddle a 32-value block (index is a multiple of 8), so one `d`, one block and — in the
+int8 kernel — one activation scale serve both words. `kdot_x8r8.comp` (`-DROWS=4` → `kdot_x8r4.spv`, the anv `:wide` / `:lm`
+f32 layout) has `q8_0_word_values` / `q4_0_word_values` / `f16_values`. `kdot_i8_x8r4.comp` (glslang 16.6,
+`--target-env vulkan1.3`) has **Q8_0 = the signed int8 code word straight into `dotPacked4x8EXT`** (no offset, no mins),
+**Q4_0 = the nibble word dotted and the −8 folded as `8 * ysum`** (Q6_K's −32 pattern), and **F16 = an f32 fallback inside
+the kernel**: the halves are dotted against the dequantized int8 activation `xq * sx` (`i8_values`), so type 1 is answered
+(not NaN) and carries the activation's quantization error and nothing else. `gen_kdot_guest.cljk` gained the `x8r4` /
+`x8r8` layouts (box files `kdot_x8r4.spv` / `kdot_x8r8.spv`). Two oracle additions: `kdot_ref.py` also writes
+`<tensor>.refq.npy`, the same f64 dot against the activation `quant_q8` produces (per 32: scale = max|x| / 127, q =
+round(x / scale)), and `kdot_check.py` prints the error against it when present — the column that tells an int8 kernel's own
+error (f32 accumulation, ~1e-5) from the activation quantization (~1e-1 under the 1e-2-floored max-rel metric).
+
+**The `continue` cliff.** The first build masked the tail with `continue` inside the block loop, as `kdot_f32_*` do. On anv that
+cost the f32 x8r4 kernel **35% on Q5_K (190 → 123 GB/s)** with bit-identical outputs; a per-lane loop bound was the same
+(121). Bisected at the pinned clock on `blk.0.attn_qkv` Q5_K, 3 runs each: each arm alone 182–186, all three arms with a
+uniform loop and no mask 182, no arms with the per-lane bound 185 — so neither the arms nor the mask alone, but divergent
+control flow around the full body. Written as an `if` around the body (`maskC`) it measures 183 and is what landed; the
+branch-free form (masked lanes read block 0 with y = 0) was 181 and not needed. The int8 kernel barely moved on any form
+(206–211 vs 213). For ROWS = 8 the loss is the arms themselves (no-mask all-arms 136, any single arm 145–148, none 148,
+old 152) and stays; `x8r8` is not in the anv layout set.
+
+B70 (Arc, ANV, `kexe-loader-gpu`), `min_freq` pinned to 2800 for the GB/s column (the box idled at 400 and a ten-dispatch
+bench does not ramp it — tick 20; restored to 400 afterwards; a vLLM engine was resident on the GPU throughout), first 64
+rows, 10 dispatches in one buffer. `f64` = `max |gpu − f64| / max(|f64|, 1e-2)`; `q8act` = the same against the
+`quant_q8`-activation oracle. Qwen2.5-0.5B-Instruct GGUFs copied from K16 (sha256 = the HF etags `ca59ca7f…` /
+`7671c0c3…` / `8e0ae260…`, `/root/kgpu/models/`):
+
+| type | tensor (rows × cols) | x8r4 f64 | x8r4 GB/s | x8r8 f64 | x8r8 GB/s | i8x8r4 q8act | i8x8r4 f64 | i8 GB/s |
+|---|---|---|---|---|---|---|---|---|
+| Q8_0 | `blk.0.attn_q` (896 × 896) | 5.42e-6 | 47.7 | 5.42e-6 | 39.2 | **4.77e-6** | 2.10e-1 | 48.9 |
+| Q8_0 | `blk.0.attn_k` (128 × 896) | 3.74e-6 | 7.4 | 3.74e-6 | 5.9 | 1.50e-6 | 2.23e-1 | 7.5 |
+| Q8_0 | `blk.0.ffn_down` (896 × 4864) | **1.18e-6** | **207.3** | 1.18e-6 | 155.6 | 1.21e-6 | 7.33e-1 | **217.9** |
+| Q4_0 | `blk.0.attn_q` (896 × 896) | 2.62e-6 | 24.1 | 2.62e-6 | 20.0 | 4.45e-6 | 1.72e-1 | 25.2 |
+| Q4_0 | `blk.0.ffn_down` (896 × 4864) | **8.34e-6** | 101.5 | 8.34e-6 | 70.7 | **1.31e-5** | 7.38e-1 | 112.6 |
+| F16 | `blk.0.attn_q` (896 × 896) | 6.11e-6 | 87.9 | 6.11e-6 | 72.6 | 2.60e-6 | 2.09e-1 | 92.0 |
+| F16 | `blk.0.attn_k` (128 × 896) | 5.48e-6 | 13.2 | 5.48e-6 | 10.2 | 1.06e-6 | 3.36e-1 | 14.0 |
+| Q5_K control | Nex `blk.0.attn_qkv` (8192 × 2048) | 6.64e-6 | 182.8 | 6.64e-6 | 135.6 | 1.38e-5 | 2.04e-1 | 207.3 |
+
+Every f32 cell ≤ 8.34e-6; every int8 cell ≤ 1.31e-5 against the quantized-activation oracle, the same class as the Q5_K
+control's 1.38e-5 (its `f64` column, 2.04e-1, is the int8 kernel's pre-existing gap — the same value from the pre-q80 spv).
+The `f64` column of the int8 rows is the activation quantization: ffn_down's 7.3e-1 is a 4864-term dot on rows whose true
+value sits near the metric's 1e-2 floor, not a kernel defect (its `q8act` is 1.2e-6). Small tensors (attn_k, 122 KB) are
+launch-bound at ~0.16 ms per 10 dispatches. **The K-quant path is unchanged**: the Nex Q5_K guest's 64 output floats are
+byte-identical between the `.pre-q80` spv and the landed spv on all three kernels, and the pinned A/B is old / new x8r4
+189.6 / 182.5, x8r8 152.5 / 136.3, i8x8r4 210.9 / 207.5 GB/s (means of 3 runs each). B70's `kdot_x8r4.spv` / `kdot_x8r8.spv` /
+`kdot_i8_x8r4.spv` are the landed sources (previous three kept as `*.spv.pre-q80`, sources as `*.comp.pre-q80`); no other
+spv on the box was touched. Not measured: a row with an odd block count (the 2 B straddle at the tensor's last row; Qwen's
+28 / 152 blocks are even), Q4_K (12), the dense Qwen / Llama guests end to end on B70 (they need `gen_decode_tokens_guest`'s
+anv layouts to be exercised with Q8_0 — the next tick), and whether the 4% x8r4 residual is code size or the tail `if`.
+
+
+## Tick 53b (2026-09-20): Q4_1 / Q5_0 / Q5_1 in the K-quant kdots — measured on K16 against the f64 oracle
+
+The same three kernels (`kdot_f32_r1.comp` / `kdot_f32_r8.comp` / `kdot_f32_p.comp`) take **Q4_1 (3)**, **Q5_0 (6)**
+and **Q5_1 (7)**, in tick 53's style: 32-value blocks of 20 / 22 / 24 B (ggml-common.h `block_q4_1` = f16 d, f16 m,
+16 nibble bytes, value d·q + m; `block_q5_0` = f16 d, u32 qh, 16 nibble bytes, value d·(q − 16); `block_q5_1` = f16 d,
+f16 m, u32 qh, 16 nibble bytes, value d·q + m), `block_bytes_of()` answering 160 / 176 / 192 per 256 values, group
+count `ceil(cols / 256)` with the tail mask, `row_bytes = ceil(cols / 32) × 20 (22 / 24)`, codes through
+`weight_u32_at` (Q5_0 blocks are only 2-aligned; Q4_1 / Q5_1 are 4-aligned and go through the same read). Nibble
+order is Q4_0's (value j < 16 the low nibble of byte j, j + 16 the high nibble of byte j − 16); the 5th bit of value j
+is bit j of the little-endian u32 qh (`dequantize_row_q5_0`: `xh_0 = (qh >> j) << 4`, `xh_1 = (qh >> (j + 12)) & 0x10`),
+so a thread's four values take bits `within .. within + 3` in one shift. The m term is `m · Σy` per block, carried on the
+K-quant `mins` path with the sign flipped (`mins -= m · Σy`; the p kernel sets `wm = −m`). `kdot_ref.py` has
+`deq_q4_1_32` / `deq_q5_0_32` / `deq_q5_1_32` in `BLOCK32` (and the 8-block wrappers in `BLOCK`), and
+`check_q5x_against_dense_ref()` asserts they agree **bit for bit** with `dense_ref.py`'s `deq_q4_1` / `deq_q5_0` /
+`deq_q5_1` (the oracle that matched llama-server's greedy continuation and full distribution on the q4_k_m file, which
+is mostly Q5_0) — `kdot_ref.py <gguf> <tensor>` runs it on the tensor's first row and prints the block count compared
+(28 / 152 blocks on the tensors below; 0 is not a pass). Negative control on the oracle: swapping the qh bit halves
+(bit j + 16 for the low nibbles) makes the check raise for type 6 with max |Δ| 14288. `kdot_ref.py <gguf>` with no
+tensor now lists the directory and the type histogram. `gen_kdot_guest.cljk` knows the three types;
+`gen_decode_tokens_guest.cljk`'s `tensor-bytes` has the 20 / 22 / 24 B cases (evaluated on the real definition text:
+501760 / 551936 / 602112 B for the three 896 × 896 attn_q tensors and 3268608 for the Q5_1 ffn_down = `kdot_ref.py`'s
+byte counts; the generator itself still `REFUSE`s the q4_k_m file earlier, at the Q5_0 `token_embd.weight` — embed
+kernels are IQ4_XS / Q8_0 only — so that branch is verified by evaluation, not by a decode run).
+
+Files on K16: `/root/kgpu/models/qwen2.5-0.5b-instruct-q4_k_m.gguf` (sha256 `74a4da8c…`; types {Q5_0: 133, F32: 121,
+Q8_0: 13, Q6_K: 12, Q4_K: 12} — there is **no Q5_0 tensor with 4864 columns** in it, every `ffn_down` is Q6_K, so the
+large Q5_0 tensor below is `ffn_gate` with 4864 *rows* × 896 cols), and `qwen2.5-0.5b-instruct-q4_1.gguf` /
+`-q5_1.gguf` (sha256 `585c212d…` / `a7e67b71…`) produced on the box with `build-vulkan/llama-b10883/llama-quantize <fp16> <out> Q4_1|Q5_1` (2.1 s / 1.9 s;
+169 tensors of type 3 / 7 each, `output.weight` stays Q8_0 — "1 of 291 tensor(s) required fallback quantization").
+The byte rule reproduces every type-3/6/7 tensor's gap to the next directory entry (133 / 169 / 169, 0 mismatches).
+Dequantized attn_q rows against the fp16 file's: Q4_1 within 0.067 × block-max (corr 0.9951), Q5_0 within 0.0625
+(= 1/16, the +max side clamped to 15 by llama.cpp's quantizer; corr 0.9980), Q5_1 within 0.033 (corr 0.9989).
+
+K16 (RADV, `kexe-loader-gpu`), first 64 rows, `max |gpu − f64| / max(|f64|, 1e-2)`, GB/s from 10 dispatches in one
+buffer (small tensors are launch-bound, GB/s omitted):
+
+| type | tensor (rows × cols, bytes) | r1 | r8 | p (PFIX=1) |
+|---|---|---|---|---|
+| Q5_0 | `blk.0.attn_q` (896 × 896, 552 KB) | 5.80e-6 9.3 | 5.80e-6 13.8 | 5.80e-6 15.1 |
+| Q5_0 | `blk.0.attn_k` (128 × 896, 79 KB) | 8.71e-7 | 8.71e-7 | 8.71e-7 |
+| Q5_0 | `blk.0.ffn_gate` (4864 × 896, 3.0 MB) | 5.68e-6 4.8 | 5.68e-6 13.3 | 5.68e-6 **22.6** |
+| Q4_1 | `blk.0.attn_q` (896 × 896, 502 KB) | 5.20e-6 8.9 | 5.20e-6 17.7 | 5.20e-6 11.1 |
+| Q4_1 | `blk.0.ffn_down` (896 × 4864, 2.7 MB) | 6.06e-6 16.5 | 6.06e-6 **20.0** | 6.06e-6 11.0 |
+| Q5_1 | `blk.0.attn_q` (896 × 896, 602 KB) | 3.84e-6 16.6 | 3.84e-6 9.0 | 3.84e-6 9.5 |
+| Q5_1 | `blk.0.ffn_down` (896 × 4864, 3.3 MB) | **2.55e-5** 12.2 | 2.55e-5 16.8 | 2.55e-5 17.4 |
+
+Every cell ≤ 6.06e-6 except Q5_1 `ffn_down`, 2.55e-5: that is row 3, whose true dot is −0.023186 (near the metric's
+1e-2 floor); the absolute error there is 5.91e-7 and the max absolute error over the 64 rows is 7.95e-7. numpy's f32
+`dot` of the same dequantized row is 9.0e-8 off the f64 value, so the kernel is ~6× worse than a plain f32 dot on
+this row — the m · Σy path: for that row the 152 per-block terms sum to |18.04| in magnitude and cancel to −0.264, and
+they are accumulated in f32 separately from d · q · y (`mins`), an absolute floor of order 18 × 2⁻²⁴ ≈ 1e-6. Not a
+layout error (the three layouts agree to the last printed digit on every tensor, and Q5_1 `attn_q` is 3.84e-6); a
+fused single accumulator would trade it for one more multiply per block and was not done. GB/s on a 0.5 MB tensor
+varies run to run by 2× (launch-bound); the ffn cells are the only ones worth reading. Negative control at the GPU
+level: the Q5_0 attn_q r1 guest run against the **pre-q5x** `kdot_f32_r1.spv` (no type-6 arm, `block_bytes_of` = 0)
+returns NaN for every row — `kdot_check.py` prints `max rel err nan` (it does not exit red on NaN; a known gap, the
+number is still unmistakable). Unchanged-numerics controls with the rebuilt shaders (`kdot_f32_r1 / r8 / p / p1 / p2
+/ p4 / p5 / p8 / p16.spv`, previous ones kept as `*.spv.pre-q5x`): Q8_0 `blk.0.attn_q` of the q8_0 file **9.40e-6** on
+r1 / r8 / p (= tick 53), Nex Q5_K `blk.0.attn_qkv` **6.10e-6** on r1 / r8 / p (= tick 53, 21.5 / 18.0 / 22.3 GB/s).
+
+Not measured: a Q5_0 row with 4864 columns (none exists in the file; the 19-group loop was exercised by Q4_1 / Q5_1
+`ffn_down` instead), the odd-block-count straddle of tick 53 (28 / 152 blocks per row are even here too), Q4_K
+(type 12, 12 tensors of the q4_k_m file — no arm, no oracle), a Q5_0 embedding (`embed_iq4xs.comp` has no arm), the p kernel at PFIX > 1 (only the
+`-DPFIX=1` binary ran; the others were rebuilt from the same source and compile), and the B70 / Xavier boxes.
+
+
+## Tick 55 (2026-09-20, HF coverage 2, coordinator): the dense guests on B70 and Xavier; the Xavier head on the new tokenizer core
+
+The f32 kdot layout (the RADV table: `kdot_f32_r8` / `_r1`, positions kernel `kdot_f32_p<P>`) is portable — the same
+generator arguments with `nvgpu`'s loader and `aarch64-linux` target run Qwen2.5-0.5B-Instruct Q8_0 on every box,
+because the Q8_0 arms landed in the f32 kernels (tick 53) and the dense recipe (tick 54) never touches the
+int8 / h2 tables when the layout says f32. Adaptive guests `prefill:8 batch:1,2,4`, `NEX_BOX_GGUF=models/…`, oracle
+= `dense_ref.py`, `batch_drive.py --parts 38`:
+
+| box | guest | rows | B=1 ms/step | B=4 ms/step |
+|---|---|---|---|---|
+| B70 (anv, x86_64) | `qw24-f32b70.bin` @27185 | 4/4 oracle-exact | 5.37 | 4.04 (per step of 4 rows) |
+| Xavier (nvgpu, aarch64) | `qw24-f32xv.bin` @29360 | 4/4 oracle-exact | 18.0 | 30.4 |
+| K16 (radv, tick 54) | `qw24.bin` | 4/4 | 16.0 | 17.8 |
+
+B70's f32 path is already 3× K16 and 3.4× Xavier at B=1 — the tuned int8 / h2 layouts on these boxes need Q8_0 arms in
+`kdot_i8_x8r4` / `kdot_x8r8` (anv) and `kdot_h2_r1` / `kdot_s4_r1` (nvgpu) before a dense model gets their speed; those
+arms are the three subagent sections that follow (anv, nvgpu, and Q4_1 / Q5_0 / Q5_1 in the f32 kernels for Q4_K_M mixes).
+
+**Xavier head on the new shell** (`serve_http.cljk` + `tokenizer_core.cljk` + `chat_templates.cljk` + `gguf_tokenizer.cljk`,
+old files kept in `/root/kgpu/shell.pre55/`): `systemctl restart murakumo-xavier-nex-native` → active; log
+`TEMPLATE chatml-think pre qwen35 add_bos false eog [248044 248046]`; chat "What is the capital of France? Answer in one
+word." → `"Paris"`, prompt_tokens 21, 1957 ms wall (1.70 s in tick 52 on the old shell; the two prompts and their token
+counts were not the same, so the 250 ms is not yet attributed — measure the same request on both shells before
+calling it the tokenizer core); seeded haiku (T 0.7 / top_p
+0.9 / seed 7) → `"Autumn rain falls softly / Leaves drift down in crimson rivers / Earth breathes before sleep"`, 22
+tokens — the same text the serial and the adaptive shells produced in ticks 50–52, so the token ids the new core feeds the
+guest are the ids the old core fed it for this prompt. K16 :8099 (the 12-layer Nex prefix guest, same new core): greedy
+and seeded completions oracle-exact (`128186,116769,…` / `80072,…`), chat text meaningless as it was under the old core
+in tick 37 — a 12-layer prefix of a 40-layer model is not the model; the shell is judged on the ids.
+
+### Tick 55, after the anv arms landed: the dense guests on the anv layout (B70)
+
+With `kdot_x8r4` / `kdot_i8_x8r4` reading Q8_0 (section above), the generator's `anv` layout runs the dense recipe end
+to end. Oracle = `dense_ref.py` 9-token continuations (the same four Qwen prompts and two Llama prompts as below; a
+12-token prompt exercises the prefill-8 chunk), `batch_drive.py --prefill 8 --parts 38|32`, GPU frequency not pinned:
+
+| model, box | layout | B=1 ms/step | B=2 | B=4 | rows |
+|---|---|---|---|---|---|
+| Qwen2.5-0.5B Q8_0 24 L, B70 | f32 (radv table) | 5.37 | 4.62 | 4.08 | 4/4 |
+| same | anv as tuned for Nex (int8 lm B times, decode form to B=2) | **4.28** | 6.81 | 6.56 | 4/4 |
+| same | anv + `:lm-once` + `:batch-layout-upto 1` (now the dense rule) | **4.28** | **4.64** | **4.06** | 4/4 |
+| Llama-3.2-1B Q8_0 16 L, B70 | anv (dense rule) | **6.08** | 7.77 | 5.78 | 1/1, 2/2, 4/4 |
+
+Two of the anv table's Nex-tuned choices reverse on a dense model, and the reason is the lm_head: Qwen's 151936 × 896
+Q8_0 is 145 MB against 24 layers of 12 small tensors, so the B-times int8 lm_head read (`:lm-i8`) is the batch step's
+largest term — B=4 6.56 → 4.06 ms/step once the positions kernel reads it once — and the int8 decode form at B=2 pays
+the same weights twice (6.18 → 4.64 with `kdot_f32_p2`). Layer kdots keep `x8r4` (B=1 4.28 vs the f32 kernels' 5.37,
+−20%); the int8 `:wide-i8` class is not used by the dense recipe (it names Nex's qkv / gate / q). The rule lives in the
+generator as `(if (and dense? (= backend "anv")) (assoc layouts* :lm-once true :batch-layout-upto 1) layouts*)`; the
+Nex anv guest regenerates byte-identical (4 L control), and the dense anv guest with the rule is byte-identical to the
+hand-made `anv-lmonce` + `NEX_BATCH_LAYOUT_UPTO=1` guest it was measured with.
+
+Per token, B70 now runs Qwen2.5-0.5B at 4.3 ms and Llama-3.2-1B at 6.1 ms natively (K16: 16.0 / 34.5). Qwen rows:
+prompts `785,6722,315,9625,374` → `12095,13,1084,374,279,7772,3283,304,4505`; `9707,11,847,829,374` →
+`8515,323,358,1079,264,3162,15754,13,358`; `16,17,18,19` → `20,21,22,23,24,15,16,17,18`;
+`785,3974,13876,38835,34208,916,279,15678,5562,13,576,6722` → `315,9625,374,12095,13,3555,374,279,6722`. Llama rows:
+`128000,791,6864,315,9822,374` → `12366,13,578,469,3168,301,22703,374,7559`; `128000,9906,11,856,836,374` →
+`35266,323,358,2846,264,6908,8571,315,701`. `kdot_check.py` now exits 1 on a non-finite row or rel > 1e-3 (the
+quantized-activation oracle's error when `.refq.npy` exists) — the Q5_0-vs-old-shader NaN control had printed `nan`
+and exited 0; verified on synthetic ok / NaN / 1 % inputs (0 / 1 / 1).
