@@ -1772,3 +1772,24 @@ head's 12:46:25 restart loaded the **pre-q80** spv (in place at that moment for 
 spv were re-installed after it, so the running head keeps pre-q80 pipelines until its next restart. Not measured:
 the new binaries under the production head, Q4_0 / F16 attn_k, an odd-block-count row (as in tick 53), B70 / K16
 (these kernels are nvgpu-only). Scratch on the box: `/root/kgpu/q80wip/` (sources, spv variants, guests, outputs).
+
+## Tick 56 (2026-09-20, HF coverage 3): the dense guests on the nvgpu (h2) layout — Xavier
+
+With `kdot_h2_r1` / `kdot_h2q6_r1` reading Q8_0 (section above), the generator's `nvgpu` table (`:wide` / `:narrow`
+h2, `:lm` h2q6, `:lm-once`) runs the dense recipe on Xavier. Same four Qwen oracle rows as tick 55, `batch_drive.py
+--prefill 8 --parts 38`, 24-layer guest beside the resident 40-layer head (20 GB of 31 in use), clocks not pinned:
+
+| Qwen2.5-0.5B Q8_0 24 L, Xavier | B=1 ms/step | B=4 | rows |
+|---|---|---|---|
+| f32 layout (tick 55) | 18.0 | 30.4 | 4/4 |
+| nvgpu h2 layout | **15.97** | 29.84 | 4/4 |
+
+Every generated token equals the f64 oracle's although the h2 kernels round the activation to f16 (rel-RMS ~2e-4 per
+kdot, see the nvgpu section) — for these 36 argmax decisions the margin was larger than the error; this is the same
+"argmax-exact, distribution-approximate" status the Nex h2 path has had since iteration 21 and it should be read that
+way (a distribution comparison against `dense_ref.npz` logits is the check that would say more). The B=4 step barely
+moves (30.4 → 29.8): on Xavier the batch step is issue-bound in the positions kernel, which is f32 and unchanged.
+
+Head note: the production head restarted at 12:46:25 JST from the pre-q80 spv (the swap was mid-flight); the new
+`kdot_{h2,h2q6,s4}_r1.spv` were installed at 12:47 and the K-quant outputs are bit-identical between the two, so the
+running head is correct and will pick the new files up at its next restart — no restart forced for that.
