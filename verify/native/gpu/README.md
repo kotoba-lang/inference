@@ -1390,3 +1390,57 @@ Q5_K attn_qkv 6.10e-6, IQ4_XS attn_gate 9.98e-6, Q6_K lm_head 1.55e-6 on r1 / r8
 arms were not touched). Small-tensor GB/s (attn_k) is launch-bound and not listed. Not measured: a row whose
 block count is odd (the last block's unaligned word read straddles the row end by 2 B — inside the buffer except
 at the tensor's last row), Q4_K (12, no Nex tensor and no oracle), and the other two boxes.
+## Dense oracle (2026-09-20): `dense_ref.py` — an architecture-generic f64 reference for GGUF dense decoders
+
+`decode_tokens_ref.py` is the f64 oracle of one model (Nex-N2.5-mini, shapes hardcoded). The next models are dense
+decoder-only transformers, so **`dense_ref.py`** reads everything from the GGUF: `general.architecture` (`qwen2` |
+`llama`, anything else is `REFUSE`, exit 2), `<arch>.block_count / embedding_length / attention.head_count /
+head_count_kv / feed_forward_length / rope.freq_base / attention.layer_norm_rms_epsilon`, head dim from
+`attention.key_length` / `value_length` when present else `embedding_length / head_count`, `rope.dimension_count`
+(default head dim). Per block: RMSNorm → Q/K/V (+ qwen2's `attn_{q,k,v}.bias` when the tensors exist) → RoPE →
+causal softmax GQA over a growing KV cache → `attn_output` → RMSNorm → SwiGLU (`ffn_down(silu(gate)·up)`); final
+norm; lm_head = `output.weight`, or `token_embd.weight` when it is absent (tied, as in Llama-3.2-1B). RoPE follows
+llama.cpp's `llama_rope_type`: **LLAMA → NORM** (interleaved pairs), **QWEN2 → NEOX** (half-split pairs);
+`rope_freqs.weight` (the llama3 scaling factors convert_hf_to_gguf precomputes, 32 values for head dim 64) divides
+θ per pair when present, as ggml's `freq_factors` do. CLI is `decode_tokens_ref.py`'s:
+`python3 dense_ref.py <gguf> <prompt-ids> <layers> <steps>` → per-step argmax, `dense_ref.npz`
+(`tokens / xs / argmaxes / logits / prompt`); generated tokens = steps − (prompt − 1). Dequant is vectorised and
+local: F32, F16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_XS (the three K-quants and IQ4_XS follow
+`kdot_ref.py`'s layouts). Weights are cached in f64 when the whole file fits `--cache-gb` (default 6), else
+dequantised per use. `--rope norm|neox` overrides the arch's type — a negative control, see below.
+
+**`dense_check.py <server-url> <npz>`** compares against a CPU-only llama-server: (a) the greedy continuation
+(`POST /completion`, prompt as the oracle's id list so no BOS is added twice, `temperature 0`, `return_tokens`),
+(b) the full distribution at the last prompt position (`n_probs = vocab` — llama-server b10883 returns all 151,936 /
+128,256 entries, 14 MB of JSON). llama-server's f32 logprobs sum to 1 + 3…6e-4, which made KL(oracle‖llama) come
+out negative on the first run; the check renormalises them and prints the raw mass. Exit 0 match / 1 mismatch /
+2 could not compare (says why).
+
+Measured on K16 (`/root/kgpu/dense`, python3 + numpy 1.26, 16 cores; llama-server = the Vulkan build
+`build-vulkan/llama-b10883/llama-server` run with `--device none -ngl 0 -t 8` on port 8098 — zero "Vulkan" lines in
+its logs; stopped after each model, none left). Prompt `"The capital of France is"` via `POST /tokenize`
+(`add_special: true`); files in `/root/kgpu/models/`, sha256 of each in this commit's message.
+
+| model (GGUF) | tensor types | prompt ids | oracle argmax per step | continuation (oracle = llama.cpp) | last-prompt top-1 | KL(llama‖oracle) / KL(oracle‖llama) | oracle wall |
+|---|---|---|---|---|---|---|---|
+| Qwen2.5-0.5B-Instruct q8_0 (24 layers) | F32, Q8_0 | 785,6722,315,9625,374 | 2701, 315, 279, 374, **12095, 13, 1084, 374** | `12095 13 1084 374` = `" Paris. It is"` MATCH | 12095 = 12095 MATCH | 1.56e-3 / 1.54e-3 nats | 5.0 s (weights cached, 4.7 GiB f64) |
+| Qwen2.5-0.5B-Instruct q4_k_m | F32, Q4_K, **Q5_0**, Q6_K, Q8_0 | same | 2701, 315, 279, 374, **12095, 13, 1084, 374** | same, MATCH | MATCH | 2.84e-3 / 2.85e-3 | 9.6 s |
+| Qwen2.5-0.5B-Instruct q4_0 | F32, Q4_0, Q8_0 | same | 220, 315, 279, 374, **12095, 11, 323, 432** | `" Paris, and it"` MATCH | MATCH | 1.08e-3 / 1.09e-3 | 7.2 s |
+| Qwen2.5-0.5B-Instruct fp16 | F16, F32 | same | 2701, 315, 279, 374, **12095, 13, 1084, 374** | `" Paris. It is"` MATCH | MATCH | **1.19e-5 / 1.19e-5** | 4.9 s |
+| Llama-3.2-1B-Instruct Q8_0 (16 layers, tied lm_head, `rope_freqs.weight` 1…32) | F32, Q8_0 | 128000,791,6864,315,9822,374 | 16309, 2768, 315, 9822, 374, **12366, 13, 578, 469** | `12366 13 578 469` = `" Paris. The E"` MATCH | 12366 = 12366 MATCH | 4.21e-4 / 4.33e-4 | 57 s (1.24 B params = 9.2 GiB f64 > budget → dequant per step; peak RSS 4.5 GB) |
+
+Two things the table taught: the "q4_k_m" file of a model whose n_embd (896) is not a multiple of 256 is mostly
+**Q5_0**, not Q4_K — the first run refused on ggml type 6 and Q5_0/Q5_1/Q4_1 were added; and the residual KL on
+every quantised file (1…3e-3 nats, max |Δlogprob| ≈ 0.5 in the tail) drops **two orders of magnitude on the fp16
+file** (1.2e-5), which is consistent with llama.cpp's CPU kernels quantising the activations for Q8_0/Q4_0/Q4_K
+dots while the oracle dequantises the same weights exactly — a plausible reading, not a measurement of those
+kernels (their source is not on the box). Greedy ids and top-1 agree on all five files.
+
+Negative controls (the check must fail for the reason it names): the Qwen npz against the Llama server →
+`REFUSE llama-server returned 128256 logprobs, vocab is 151936` (exit 2, continuation MISMATCH at step 0); the Llama
+oracle with `--rope neox` (wrong type) → continuation `12366 11 279 3363` vs `12366 13 578 469`, MISMATCH at step 1,
+KL 0.97 / 1.27 nats (the top-1 at position 5 still matched — the position is too early for RoPE to move it, which is
+why the check compares the continuation and the whole distribution, not top-1 alone).
+
+Not done: no GPU guest consumes `dense_ref.npz` yet (the oracle lands ahead of the dense guests, as
+`decode_tokens_ref.py` did for Nex); `.cljk` twins of the two Python oracles remain debt, as for `kdot_ref.py`.
