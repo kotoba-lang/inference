@@ -1548,8 +1548,9 @@ arms are the three subagent sections that follow (anv, nvgpu, and Q4_1 / Q5_0 / 
 **Xavier head on the new shell** (`serve_http.cljk` + `tokenizer_core.cljk` + `chat_templates.cljk` + `gguf_tokenizer.cljk`,
 old files kept in `/root/kgpu/shell.pre55/`): `systemctl restart murakumo-xavier-nex-native` → active; log
 `TEMPLATE chatml-think pre qwen35 add_bos false eog [248044 248046]`; chat "What is the capital of France? Answer in one
-word." → `"Paris"`, prompt_tokens 21, 1957 ms wall (1.70 s before — the tokenizer core now walks the pre-tokenizer
-regex per family, the difference is the 40-layer prefill of 21 vs 12 tokens, not the shell); seeded haiku (T 0.7 / top_p
+word." → `"Paris"`, prompt_tokens 21, 1957 ms wall (1.70 s in tick 52 on the old shell; the two prompts and their token
+counts were not the same, so the 250 ms is not yet attributed — measure the same request on both shells before
+calling it the tokenizer core); seeded haiku (T 0.7 / top_p
 0.9 / seed 7) → `"Autumn rain falls softly / Leaves drift down in crimson rivers / Earth breathes before sleep"`, 22
 tokens — the same text the serial and the adaptive shells produced in ticks 50–52, so the token ids the new core feeds the
 guest are the ids the old core fed it for this prompt. K16 :8099 (the 12-layer Nex prefix guest, same new core): greedy
