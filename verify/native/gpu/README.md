@@ -1249,3 +1249,25 @@ N=2 is 1.5×, N=4–8 1.6–1.9×; ids unchanged. The N=8 spread is the K16 iGPU
 not the scheduler. Not measured on Xavier this tick (the head would have to stop again; its B=4 figures are
 tick 48's). What batch mode still lacks against the serial head: prefill chunks per row and sampling — both
 are per-row variants of steps that exist; the batch step's message would carry them per row.
+
+## Tick 50 (2026-09-20, C-4): per-row sampling in the batch step
+
+The batch step now ends with the `nex_sample_*` chain over B rows (`-DBATCH`: row = workgroup y, per-row T /
+top_p / seed from a params buffer, position from `rowpos`, logits / p_i at `row·n`, scratch at `row·256`, the
+pick at slot 61 of the row) after the argmax; a row with **T = 0 keeps its argmax pick** (every sampler op
+returns early for it), so greedy and sampled rows share one step. The batch message is 5B words — tokens,
+flags, then (T, top_p, seed) per row — written by a batch `params` op into the params buffer; 2B-word messages
+still route (no sampler words = all greedy). The adaptive guest holds the three steps as before.
+
+K16 12 L, `ra12s.bin` (`batch:1,2,4`), over HTTP through the scheduler: T 0 → the greedy oracle ids; T 0.7 /
+top_p 0.9 / seed 42 → `80072, 80072, 35222, 35533, 143898, 131822, 194349, 157676` = the sampled f64 oracle, twice;
+**four concurrent requests mixing two greedy and two seeded-42 rows in one step: all four rows exact**
+(0.76 s for the four). The sampler adds ~1 ms to a 12-layer step.
+
+Xavier 40 L, `ra40-nv.bin` on :8090 with the head stopped for the run (restored after; "Paris" 1.68 s): greedy
+France 7 tokens in 0.81 s (B=1 step ≈ 118 ms — the f32 positions kdot is 1.37× the h2 decode step on Xavier),
+N=4 15.7 and N=8 16.3 seq-tokens/s vs the serial head's 11.5 single stream (1.4×); the seeded haiku (T 0.7,
+seed 7) came back in 21 tokens / 4.3 s. **The serial guest stays the Xavier head**: on this box the batch
+guest's single-request path is 1.4× slower (kernel, not protocol) and lacks prefill chunks; the adaptive guest
+is ready for a bandwidth-bound box (K16) where its B=1 step equals a decode step. The two items that remain
+for the head switch on Xavier: an h2 batch kdot (positions inner loop on the h2 layout) and per-row prefill.

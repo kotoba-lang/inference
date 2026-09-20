@@ -35,8 +35,9 @@
 ;; batch rows B of a `… batch:<B>` guest (iteration 53, C-4): the shell becomes a SCHEDULER -- B rows are slots, a
 ;; request takes a free row and leaves it on stop / length, and every step is one 2B-word message (B tokens, B flags)
 ;; that advances every occupied row at once (an empty row is fed 0 with flag 1). The batch step is greedy and one
-;; token per row per step, so in batch mode prefill chunks and sampling are not used (the single-row steps share
-;; row 0's state with the batch step and cannot be mixed in). 0 = the serial shell as before.
+;; token per row per step, so in batch mode prefill chunks are not used (the single-row steps share row 0's state with
+;; the batch step and cannot be mixed in); sampling is per row (iteration 55: the message carries T / top_p / seed per
+;; row, T = 0 rows take the argmax). 0 = the serial shell as before.
 ;; iteration 54: "1,2,4" names an ADAPTIVE guest (`batch:1,2,4`) -- one kept step per B; each tick uses the smallest B that
 ;; covers the highest occupied row, so a lone request in row 0 pays a one-row step.
 (def batch-sizes (vec (sort (map js/parseInt (str/split (or (get args 8) "0") #",")))))
@@ -75,13 +76,14 @@
                  (.write (.-stdin (:proc g)) (str (if (vector? tok) (str/join "," tok) tok) "," (if reset? 1 0)
                                                   (when sample (str "," (f32-bits (:T sample)) "," (f32-bits (:top-p sample)) "," (:seed sample))))))))
 (defn batch-step!
-  "One batch message: TOKS and FLAGS (B each, B = the step size). Resolves to [ns [pick-per-row]] or nil if the guest died."
-  [g toks flags]
+  "One batch message: TOKS, FLAGS and per-row (T, top_p, seed) -- 5B words (T = 0 rows take the argmax). Resolves to
+   [ns [pick-per-row]] or nil if the guest died."
+  [g toks flags samples]
   (js/Promise. (fn [resolve _]
                  (reset! (:waiter g) (fn [line] (swap! (:steps g) inc)
                                        (resolve (when line (let [[ns idhex] (str/split line #"\|") buf (js/Buffer.from idhex "hex")]
                                                              [(js/parseInt ns) (mapv #(.readUInt32LE buf (+ (* % 256) 244)) (range (count toks)))])))))
-                 (.write (.-stdin (:proc g)) (str/join "," (concat toks flags))))))
+                 (.write (.-stdin (:proc g)) (str/join "," (concat toks flags (mapcat (fn [sm] (if sm [(f32-bits (:T sm)) (f32-bits (:top-p sm)) (:seed sm)] [0 0 0])) samples)))))))
 (defn ensure-guest! []
   (let [g @guest]
     (if (and g (< @(:steps g) steps-per-life)) g
@@ -150,8 +152,10 @@
           top (inc (apply max (keep-indexed (fn [i r] (when r i)) rs)))   ;; rows 0..top-1 must be in the step
           B (or (first (filter #(>= % top) batch-sizes)) batch-rows)   ;; the smallest step that covers them
           rs (subvec rs 0 B)
-          toks (mapv #(if % (:next %) 0) rs) flags (mapv #(if (and % (:reset? %)) 1 (if % 0 1)) rs)]
-      (.then (batch-step! g toks flags)
+          toks (mapv #(if % (:next %) 0) rs) flags (mapv #(if (and % (:reset? %)) 1 (if % 0 1)) rs)
+          ;; a row samples only where its reply is kept: the last prompt token and every generated token
+          samples (mapv #(when (and % (:sample %) (>= (inc (:i %)) (count (:ids %)))) (:sample %)) rs)]
+      (.then (batch-step! g toks flags samples)
              (fn [r]
                (if-not r
                  (do (doseq [row rs :when row] ((:resolve row) {:error "guest died"})) (reset! rows (vec (repeat batch-rows nil))) (reset! ticking false))
@@ -173,15 +177,15 @@
                    (tick!))))))))
 (defn run-batched
   "Prompt ids -> promise; the request joins the batch step at the next tick."
-  [ids max-tokens & [on-token]]
+  [ids max-tokens & [on-token sample]]
   (js/Promise. (fn [resolve _]
-                 (swap! pending conj {:ids ids :i 0 :out [] :ns [] :next (ids 0) :max-tokens max-tokens :on-token on-token :resolve resolve})
+                 (swap! pending conj {:ids ids :i 0 :out [] :ns [] :next (ids 0) :max-tokens max-tokens :on-token on-token :resolve resolve :sample sample})
                  (when-not @ticking (reset! ticking true) (tick!)))))
 (defn submit
   "The request path: the batch scheduler when batch-rows > 0 (greedy, no prefill chunks), else the serial shell."
   [ids max-tokens on-token sample]
   (if (pos? batch-rows)
-    (run-batched ids max-tokens on-token)
+    (run-batched ids max-tokens on-token sample)
     (enqueue #(run-request ids max-tokens on-token sample))))
 (defn sample-of
   "The request's sampler parameters, or nil for greedy (temperature 0)."
