@@ -90,6 +90,16 @@ The 2026-09-20 M1 Max measurements and their scope are recorded in
 there are real kernel timings accumulated over the model's tensor inventory,
 not a completed token or HTTP measurement.
 
+Co-scientist iteration 63 removed PTQ1's four variable-trip radix loops per
+four weights. Because a shader invocation always asks for four consecutive
+trits, it now loads their packed word once and applies one fixed `3^n` vector
+operation. `blk.0.ffn_gate.weight` improved by **1.84–2.42x** across Metal,
+Intel ANV, AMD RADV, and NVIDIA nvgpu while producing the same output bits as
+the old shader on each backend. The three Vulkan measurements used the native
+`.kotoba` → amu kexe → `:gpu/compute` path; Metal used the existing WebGPU
+gate because the native loader has no Metal arm. Full measurements and scope:
+`verify/evidence/ternary-bonsai-ptq1-radix-decode-20260920.json`.
+
 `kdot_f32_r8.comp` / `kdot_f32_r1.comp` are the GLSL twins of
 `shaders/ggml_kdot_f32_r8.wgsl` / `ggml_kdot_f32.wgsl` (Q4_K 12 / Q5_K 13 /
 Q6_K 14 / IQ4_XS 23, f32 activations, five storage bindings). `gen_kdot_guest.cljk`
