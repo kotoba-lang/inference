@@ -135,6 +135,35 @@ vec4 f16_values(uint base, uint index) {   // four halves = two words; aligned b
   uint w = (base + index * 2u) >> 2u;
   return vec4(unpackHalf2x16(weights[w]), unpackHalf2x16(weights[w + 1u]));
 }
+// Prism Bonsai 2 private group-128 ternary packs (GGML types 142/143).
+ivec4 pq2_0_word_values(uint base, uint index) {
+  uint e = index & 127u;
+  uint w = weight_u32_at(base + 2u + e / 4u);
+  uint s = (e & 3u) * 2u;
+  return ivec4(int((w >> s) & 3u) - 1,
+               int((w >> (s + 2u)) & 3u) - 1,
+               int((w >> (s + 4u)) & 3u) - 1,
+               int((w >> (s + 6u)) & 3u) - 1);
+}
+int ptq1_0_trit(uint base, uint e) {
+  uint b; uint n;
+  if (e < 80u) { b = weight_byte(base + (e & 15u)); n = e >> 4u; }
+  else if (e < 120u) { uint q = e - 80u; b = weight_byte(base + 16u + (q & 7u)); n = q >> 3u; }
+  else { uint q = e - 120u; b = weight_byte(base + 24u + (q & 1u)); n = q >> 1u; }
+  for (uint i = 0u; i < n; i++) b = (b * 3u) & 255u;
+  return int((b * 3u) >> 8u) - 1;
+}
+ivec4 ptq1_0_word_values(uint base, uint index) {
+  uint e = index & 127u;
+  return ivec4(ptq1_0_trit(base, e), ptq1_0_trit(base, e + 1u),
+               ptq1_0_trit(base, e + 2u), ptq1_0_trit(base, e + 3u));
+}
+vec4 bf16_values(uint base, uint index) {
+  uint w = (base + index * 2u) >> 2u;
+  uint a = weights[w], b = weights[w + 1u];
+  return vec4(uintBitsToFloat((a & 0xffffu) << 16u), uintBitsToFloat(a & 0xffff0000u),
+              uintBitsToFloat((b & 0xffffu) << 16u), uintBitsToFloat(b & 0xffff0000u));
+}
 // Q4_1 (type 3, 20 B = f16 d, f16 m, 16 nibble bytes; value d*q + m), Q5_0 (type 6, 22 B = f16 d, 4 B qh, 16 nibble
 // bytes; value d*(q - 16)), Q5_1 (type 7, 24 B = f16 d, f16 m, 4 B qh, 16 nibble bytes; value d*q + m) -- iteration
 // 53b, ggml-common.h block_q4_1 / block_q5_0 / block_q5_1. Nibble order is Q4_0's (value j < 16 the low nibble of
@@ -160,10 +189,11 @@ ivec4 q5x_word_values(uint base, uint index, uint bb, uint qh_off) {   // Q5_0: 
 uint block_bytes_of(uint t) {
   if (t == 12u) return 144u; if (t == 13u) return 176u; if (t == 14u) return 210u; if (t == 23u) return 136u;
   if (t == 8u) return 272u; if (t == 2u) return 144u; if (t == 1u) return 512u;
+  if (t == 30u) return 512u; if (t == 142u) return 68u; if (t == 143u) return 56u;
   if (t == 3u) return 160u; if (t == 6u) return 176u; if (t == 7u) return 192u;   // eight 20 / 22 / 24 B blocks
   return 0u;
 }
-bool is_block32(uint t) { return t == 8u || t == 2u || t == 1u || t == 3u || t == 6u || t == 7u; }   // 32-value blocks / no blocks: rows need not be 256-multiples
+bool is_block32(uint t) { return t == 8u || t == 2u || t == 1u || t == 30u || t == 3u || t == 6u || t == 7u; }   // 32-value blocks / no blocks: rows need not be 256-multiples
 
 void main() {
   uint row0 = gl_WorkGroupID.x * uint(ROWS);
@@ -203,6 +233,12 @@ void main() {
         qf = vec4(q4_0_word_values(wb, index)); ws = weight_half(wb + (index / 32u) * 18u);
       } else if (tt == 1u) {
         qf = f16_values(wb, index); ws = 1.0;
+      } else if (tt == 30u) {
+        qf = bf16_values(wb, index); ws = 1.0;
+      } else if (tt == 142u || tt == 143u) {
+        uint qb = wb + (index / 128u) * ((tt == 142u) ? 34u : 28u);
+        qf = vec4((tt == 142u) ? pq2_0_word_values(qb, index) : ptq1_0_word_values(qb, index));
+        ws = weight_half(qb + ((tt == 142u) ? 0u : 26u));
       } else if (tt == 3u) {
         uint b = wb + (index / 32u) * 20u;
         qf = vec4(q4_1_word_values(wb, index)); ws = weight_half(b); wm = -weight_half(b + 2u);   // result = acc - mins, so -m adds m * sum(y)
