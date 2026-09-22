@@ -56,6 +56,13 @@ shaders/     WGSL kernels
 docs/        ADRs
 ```
 
+The PTQ1_0 production kernel sources are also library resources under
+`resources/kotodama/inference/kernels/native/`.  Consumers resolve them through
+`kotodama.inference.ptq1`; parity and benchmark gates load those exact resource
+bytes rather than a second copy under `verify/`.  The same catalog records host
+runtime qualification separately, so the K16 production Vulkan runtime cannot
+silently qualify the Metal row-tile candidate.
+
 ## Verify
 
 ```sh

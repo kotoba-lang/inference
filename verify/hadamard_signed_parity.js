@@ -1,9 +1,17 @@
 // Exact-source WebGPU parity for Prism's signed block-Hadamard transform.
 // deno run --unstable-webgpu --allow-read --allow-write --allow-run verify/hadamard_signed_parity.js
 
-const source = new URL("native/gpu/hadamard_signed.comp", new URL("./", import.meta.url));
+const source = new URL("../resources/kotodama/inference/kernels/native/hadamard_signed.comp", new URL("./", import.meta.url));
+const translatedSource = await Deno.makeTempFile({suffix: ".comp"});
 const tmp = await Deno.makeTempFile({suffix: ".wgsl"});
-const p = await new Deno.Command("naga", {args: ["--input-kind", "glsl", "--shader-stage", "compute", source.pathname, tmp], stdout: "piped", stderr: "piped"}).output();
+// naga's GLSL frontend does not accept memoryBarrierShared.  The immediately
+// following barrier() already becomes a WGSL workgroupBarrier, whose memory
+// semantics cover workgroup storage.  Remove only the redundant spelling in
+// the translation copy; the shipped Vulkan source remains byte-for-byte the
+// production kernel.
+await Deno.writeTextFile(translatedSource,
+  (await Deno.readTextFile(source)).replaceAll("memoryBarrierShared();", ""));
+const p = await new Deno.Command("naga", {args: ["--input-kind", "glsl", "--shader-stage", "compute", translatedSource, tmp], stdout: "piped", stderr: "piped"}).output();
 if (!p.success) throw new Error(new TextDecoder().decode(p.stderr));
 const code = (await Deno.readTextFile(tmp)).replaceAll("subgroupBarrier();", "workgroupBarrier();");
 const adapter = await navigator.gpu.requestAdapter();
@@ -40,4 +48,4 @@ function error(a,b){let maxAbs=0,maxRel=0;for(let i=0;i<a.length;i++){const d=Ma
 const cases=[{name:"forward-5120",width:5120,rows:3,hd:5120,nk:1,rep:1,after:false},{name:"inverse-5120",width:5120,rows:2,hd:5120,nk:1,rep:1,after:true},{name:"gdn-grouped-6144",width:6144,rows:2,hd:128,nk:16,rep:3,after:false},{name:"ffn-17408",width:17408,rows:1,hd:17408,nk:1,rep:1,after:false}];
 const report={gpu:adapter.info?.description??"unknown",cases:{}};let failed=false;
 for(const c of cases){const x=Float32Array.from({length:c.width*c.rows},rand), signs=Float32Array.from({length:c.width},()=>rand()<0?-1:1), ref=oracle(x,signs,c.width,c.rows,c.hd,c.nk,c.rep,c.after), got=await run(x,signs,c.width,c.rows,c.hd,c.nk,c.rep,c.after), e=error(ref,got);report.cases[c.name]=e;if(e.maxAbs>2e-5)failed=true;}
-const validation=await device.popErrorScope();if(validation){report.validation=validation.message;failed=true;}report["kotodama/hadamard-signed-parity"]=failed?"FAIL":"ok";console.log(JSON.stringify(report));await Deno.remove(tmp);if(failed)Deno.exit(1);
+const validation=await device.popErrorScope();if(validation){report.validation=validation.message;failed=true;}report["kotodama/hadamard-signed-parity"]=failed?"FAIL":"ok";console.log(JSON.stringify(report));await Deno.remove(translatedSource);await Deno.remove(tmp);if(failed)Deno.exit(1);
