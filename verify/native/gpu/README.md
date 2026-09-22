@@ -35,6 +35,29 @@ the f64 twin; the f32 tree in the shader is the order). Single small dispatch
 (16 MiB): B70 0.68 ms, K16 0.80 ms, Xavier 2.47 ms — launch-bound, which is
 why the serving path records one command buffer per token (ADR-2609182100 D1).
 
+**A fourth backend, 2026-09-22: Apple GPUs through MoltenVK** (amu PR #1046;
+`verify/evidence/gpu-compute-moltenvk-m1max-20260922.json`). Until then
+`vkCreateInstance` answered `VK_ERROR_INCOMPATIBLE_DRIVER` on every Mac — a
+portability driver is hidden from the loader unless the instance asks for
+`VK_KHR_portability_enumeration` by name — so the whole wire-42 path was
+unreachable there, which reads as "no GPU here" rather than as a missing
+line. The same guests, on an M1 Max (loader 1.4.357, MoltenVK 1.4.2):
+
+| box | GPU / driver | kexe ISA | 40 × 64 MiB | GB/s |
+|---|---|---|---|---|
+| this Mac | Apple M1 Max, MoltenVK 1.4.2 | aarch64 | 16.5–18.4 ms (3 runs) | **146–163** |
+
+`INFO` answers `Apple M1 Max|1.3.357|1024|1`; `dot.kotoba` (4096×1024) is
+2.043 ms with max rel err 3.1e-4 against an f64 twin, the same class as the
+other three. Two things the run found: the gate
+(`amu scripts/test-gpu-compute.cljk`) built its child environment with
+`(merge (js->clj (.-env js/process)) env)` and died on the kbb engine before
+reaching a GPU on ANY host; and a guest whose answer is a 16 KiB buffer read
+back as hex needs `KEXE_STRING_POOL` above the 65,536-byte default (the dot
+guest traps at 32,939 bytes used). **No weights were mapped** — synthetic f32
+only; the K-quant / PTQ1_0 / delta-net kernels are not compiled for this
+backend, and nothing was served.
+
 ## The Nex K-quant kernels on the same path (2026-09-19)
 
 ### Prism Ternary Bonsai 2 codecs and activation basis (2026-09-20)
