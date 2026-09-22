@@ -13,7 +13,7 @@ const rowLimit = Number(Deno.args[3] ?? 0);
 if (batches.some((b) => !Number.isInteger(b) || b < 1 || b > 16)) throw new Error("batch must be 1..16");
 
 const here = new URL("./", import.meta.url);
-const gpuDir = new URL("native/gpu/", here);
+const gpuDir = new URL("../resources/kotodama/inference/kernels/native/", here);
 const tmp = await Deno.makeTempDir({prefix: "murakumo-ptq-bench-"});
 async function translate(source, output, defines = []) {
   const args = ["--input-kind", "glsl", "--shader-stage", "compute"];

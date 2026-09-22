@@ -39,7 +39,11 @@ why the serving path records one command buffer per token (ADR-2609182100 D1).
 
 ### Prism Ternary Bonsai 2 codecs and activation basis (2026-09-20)
 
-`kdot_f32_r1.comp` and the positions kernel now decode Prism's group-128
+The canonical sources for `kdot_f32_r1.comp`, the positions kernel,
+`kdot_ptq1_dual_r1.comp`, `embed_iq4xs.comp`, and `hadamard_signed.comp` are
+shipped by the library from `resources/kotodama/inference/kernels/native/`.
+The verification programs in this directory execute those exact resource
+bytes. `kdot_f32_r1.comp` and the positions kernel decode Prism's group-128
 `PQ2_0` (GGML type 142) and `PTQ1_0` (143), plus the BF16 projections used by
 the Qwen3.8-27B gated delta net. Its GGUF architecture identifier is `qwen35`;
 that implementation identifier does not make the checkpoint a Qwen3.5 model.

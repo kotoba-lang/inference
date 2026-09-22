@@ -6,7 +6,7 @@
 //   verify/ternary_kdot_parity.js [rows] [cols]
 
 const here = new URL("./", import.meta.url);
-const gpuDir = new URL("native/gpu/", here);
+const gpuDir = new URL("../resources/kotodama/inference/kernels/native/", here);
 const rows = Number(Deno.args[0] ?? 37);
 const cols = Number(Deno.args[1] ?? 1024);
 const gguf = Deno.args[2];
