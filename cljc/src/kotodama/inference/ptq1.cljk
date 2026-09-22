@@ -49,12 +49,18 @@
     :runtime/revision "3ae4f51087d8d9292eda16ee00cec54e798ea576"
     :runtime/backends #{:vulkan}
     :runtime/qualification :production-k16
-    :runtime/production? true}
+   :runtime/production? true}
    :prism-metal-row5
    {:runtime/repository "PrismML-Eng/llama.cpp"
     :runtime/revision "239413b3ec1f4e99309780ae20bd7024e1e3d361"
     :runtime/backends #{:metal}
     :runtime/qualification :kernel-parity-m1-max
+    :runtime/production? false}
+   :prism-metal-graph-fusions
+   {:runtime/repository "PrismML-Eng/llama.cpp"
+    :runtime/revision "bdc23b56b4458b9f1655aec5287f3ab56ee8daaa"
+    :runtime/backends #{:metal}
+    :runtime/qualification :kernel-parity-m1-m4-speed-rejected
     :runtime/production? false}})
 
 (defn kernel-artifact
