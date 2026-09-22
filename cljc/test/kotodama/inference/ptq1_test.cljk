@@ -28,6 +28,13 @@
     (is (= "PTQ1 host runtime is not production-qualified" (ex-message error)))
     (is (= :kernel-parity-m1-max
            (:runtime/qualification (ex-data error)))))
+  (is (= "bdc23b56b4458b9f1655aec5287f3ab56ee8daaa"
+         (:runtime/revision (ptq1/host-runtime :prism-metal-graph-fusions))))
+  (let [error (try (ptq1/host-runtime :prism-metal-graph-fusions true) nil
+                   (catch #?(:clj Exception :cljs :default) e e))]
+    (is (= "PTQ1 host runtime is not production-qualified" (ex-message error)))
+    (is (= :kernel-parity-m1-m4-speed-rejected
+           (:runtime/qualification (ex-data error)))))
   (is (thrown-with-msg? #?(:clj Exception :cljs js/Error)
                         #"unknown PTQ1 kernel artifact"
                         (ptq1/kernel-artifact :missing))))
