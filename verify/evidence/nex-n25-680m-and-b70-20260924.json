@@ -7,7 +7,7 @@
     "supported_runtime_in_model_card": ["vLLM", "SGLang"]
   },
   "b70_attempt": {
-    "host": {"tailscale_name": "aiueos-6600hs", "tailscale_ip": "100.98.24.37", "gpu": "Intel Arc Pro B70"},
+    "host": {"gpu": "Intel Arc Pro B70", "private host identifier omitted": true},
     "runtime": "vLLM 0.29.0 XPU, AutoGPTQ XPU WNA16",
     "model_loaded": true,
     "model_weight_memory_gib": 19.18,
@@ -19,7 +19,7 @@
     "reported_speed_limit": "The 10-token response is too short to serve as a representative tok/s benchmark."
   },
   "6600hs2_g0_proxy_run": {
-    "host": {"tailscale_name": "aiueos-6600hs-2", "tailscale_ip": "100.84.134.120", "cpu": "AMD Ryzen 7 7735HS", "gpu": "AMD Radeon 680M (1002:1681)", "ram_gib": 22, "ttm_pages_limit": 5505024},
+    "host": {"asset_class": "6600HS-2 class system; private host identifier omitted", "cpu": "AMD Ryzen 7 7735HS", "gpu": "AMD Radeon 680M (1002:1681)", "ram_gib": 22, "ttm_pages_limit": 5505024},
     "requested_autoround_checkpoint_measured": false,
     "measured_artifact": {
       "repository": "https://huggingface.co/vikrant1123/Nex-N2.5-mini-Uncensored-APEX-GGUF",
