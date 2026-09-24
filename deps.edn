@@ -3,6 +3,9 @@
  ;; resolvable as a git dep — monorepo-layout-only). Workspace-offline dev
  ;; against sibling checkouts: use the :dev alias.
  :deps {
+        ;; kotoba.ffi replaced java.lang.foreign here (2026-09-25). An explicit
+        ;; floor: tools.deps takes the NEWEST sha it is shown.
+        io.github.kotoba-lang/ffi {:git/sha "604f212c190d5d97420a2f3a0e1ae6411e04cc8e"}
         ;; kotoba.bytes replaced UTF-8 .getBytes / String. here (2026-09-24). An explicit
         ;; floor: tools.deps takes the NEWEST sha it is shown.
         io.github.kotoba-lang/bytes {:git/sha "d5259f35ab7c4f5a66e63ca29ed4dcf7ba3f1ac5"}
