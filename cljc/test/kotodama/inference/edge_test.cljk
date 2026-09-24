@@ -1,5 +1,5 @@
 (ns kotodama.inference.edge-test
-  (:require [clojure.test :refer [deftest is]]
+  (:require [kotoba.test :refer [deftest is]]
             [kotodama.inference.edge :as edge]))
 
 (deftest preserves-multimodal-and-tools

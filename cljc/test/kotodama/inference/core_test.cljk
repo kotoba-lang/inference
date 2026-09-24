@@ -4,7 +4,7 @@
             [kotodama.inference.ports :as ports]
             [kotodama.inference.runtime :as rt]
             [kotodama.inference.validate :as validate]
-            #?(:clj [clojure.test :refer [deftest is testing]]
+            #?(:clj [kotoba.test :refer [deftest is testing]]
                :cljs [cljs.test :refer-macros [deftest is testing]])))
 
 (defn mock-runtime []

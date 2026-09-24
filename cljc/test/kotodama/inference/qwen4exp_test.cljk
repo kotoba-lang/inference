@@ -1,5 +1,5 @@
 (ns kotodama.inference.qwen4exp-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [kotodama.inference.qwen4exp :as qwen4exp]))
 
 (def config

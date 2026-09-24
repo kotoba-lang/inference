@@ -1,5 +1,5 @@
 (ns kotodama.inference.mtp-test
-  (:require [clojure.test :refer [deftest is]]
+  (:require [kotoba.test :refer [deftest is]]
             [kotodama.inference.mtp :as mtp]
             [torch.speculative :as speculative]))
 

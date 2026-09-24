@@ -1,5 +1,5 @@
 (ns kotodama.inference.vllm-cli-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [kotodama.inference.cli.vllm :as cli]
             [kotodama.inference.host.oracle :as oracle]))
 

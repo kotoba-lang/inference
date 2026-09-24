@@ -1,7 +1,7 @@
 (ns kotodama.inference.ptq1-test
   (:require [kotodama.inference.ptq1 :as ptq1]
             #?(:clj [clojure.java.io :as io])
-            #?(:clj [clojure.test :refer [deftest is testing]]
+            #?(:clj [kotoba.test :refer [deftest is testing]]
                :cljs [cljs.test :refer-macros [deftest is testing]])))
 
 (defn resource-present? [path]
