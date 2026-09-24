@@ -11,8 +11,8 @@
 ;; repo (see kotodama.inference.host.oracle).
 
 (ns kotodama.inference.kotoba-oracle-gen
-  (:require [clojure.java.io :as io]
-            [clojure.pprint :as pp]
+  (:require [kotoba.io :as io]
+            [kotoba.pprint :as pp]
             [kotoba.lang.text :as str]
             [kotoba.compiler.core :as compiler])
   (:gen-class))
@@ -23,12 +23,12 @@
 (defn discover-artifacts
   "Every kotoba/*_core.kotoba paired with its artifact path."
   []
-  (->> (file-seq (io/file source-dir))
-       (filter #(and (.isFile %) (str/ends-with? (.getName %) "_core.kotoba")))
-       (sort-by #(.getName %))
+  (->> (io/file-seq (io/file source-dir))
+       (filter #(and (io/file? %) (str/ends-with? (io/file-name %) "_core.kotoba")))
+       (sort-by #(io/file-name %))
        (mapv (fn [f]
-               (let [base (str/replace (.getName f) #"\.kotoba$" "")]
-                 {:source (.getPath f)
+               (let [base (str/replace (io/file-name f) #"\.kotoba$" "")]
+                 {:source (io/path f)
                   :out (str out-dir "/" base ".kir.edn")})))))
 
 (defn compile-kir

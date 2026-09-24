@@ -1,10 +1,11 @@
 (ns kotodama.inference.host.native-kdot
   "JDK 24 FFM bridge to the mmap-friendly native K-quant matvec kernel."
-  (:import (java.io File)
+  (:import
            (java.lang.foreign Arena FunctionDescriptor Linker Linker$Option MemoryLayout MemorySegment SymbolLookup ValueLayout)
            (java.nio.channels FileChannel FileChannel$MapMode)
            (java.nio.file Path StandardOpenOption)
-           (java.util List)))
+           (java.util List))
+  (:require [kotoba.io :as kio]))
 
 (defn platform-library-name []
   (case (System/getProperty "os.name")
@@ -14,7 +15,7 @@
                     {:os (System/getProperty "os.name")}))))
 
 (defn default-library-path []
-  (.getAbsolutePath (File. (str "target/native/" (platform-library-name)))))
+  (kio/absolute-path (kio/file (str "target/native/" (platform-library-name)))))
 
 (defonce ^:private loaded-path (atom nil))
 (defonce ^:private matvec-handle (atom nil))
@@ -22,7 +23,7 @@
 (defn load-library!
   ([] (load-library! (default-library-path)))
   ([path]
-   (let [absolute (.getAbsolutePath (File. path))]
+   (let [absolute (kio/absolute-path (kio/file path))]
      (when-not (= absolute @loaded-path)
        (System/load absolute)
        (let [symbol (-> (SymbolLookup/loaderLookup)
