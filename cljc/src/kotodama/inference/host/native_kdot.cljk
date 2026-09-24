@@ -1,11 +1,10 @@
 (ns kotodama.inference.host.native-kdot
   "JDK 24 FFM bridge to the mmap-friendly native K-quant matvec kernel."
   (:import
-           (java.lang.foreign Arena FunctionDescriptor Linker Linker$Option MemoryLayout MemorySegment SymbolLookup ValueLayout)
            (java.nio.channels FileChannel FileChannel$MapMode)
            (java.nio.file Path StandardOpenOption)
            (java.util List))
-  (:require [kotoba.io :as kio]))
+  (:require [kotoba.ffi :as ffi] [kotoba.io :as kio]))
 
 (defn platform-library-name []
   (case (System/getProperty "os.name")
@@ -26,42 +25,40 @@
    (let [absolute (kio/absolute-path (kio/file path))]
      (when-not (= absolute @loaded-path)
        (System/load absolute)
-       (let [symbol (-> (SymbolLookup/loaderLookup)
-                        (.find "kotodama_kdot_matvec")
-                        (.orElseThrow))
-             descriptor (FunctionDescriptor/of
-                         ValueLayout/JAVA_INT
-                         (into-array MemoryLayout
-                                     [ValueLayout/JAVA_INT
-                                      ValueLayout/ADDRESS
-                                      ValueLayout/JAVA_LONG
-                                      ValueLayout/JAVA_LONG
-                                      ValueLayout/ADDRESS
-                                      ValueLayout/JAVA_LONG
-                                      ValueLayout/ADDRESS]))
-             handle (.downcallHandle (Linker/nativeLinker) symbol descriptor
-                                     (make-array Linker$Option 0))]
+       (let [symbol (-> (ffi/loader-lookup)
+                        (ffi/find-symbol "kotodama_kdot_matvec")
+                        (or (throw (java.util.NoSuchElementException. "No value present"))))
+             descriptor (ffi/signature
+                         :i32
+                         [:i32
+                                      :ptr
+                                      :i64
+                                      :i64
+                                      :ptr
+                                      :i64
+                                      :ptr])
+             handle (ffi/downcall (ffi/native-linker) symbol descriptor)]
          (reset! matvec-handle handle)
          (reset! loaded-path absolute)))
      absolute)))
 
 (defn- invoke-matvec!
-  [tensor-type ^MemorySegment weights rows cols ^floats input-flat positions ^floats output-flat]
+  [tensor-type weights rows cols ^floats input-flat positions ^floats output-flat]
   (when-not @matvec-handle (load-library!))
-  (with-open [arena (Arena/ofConfined)]
-    (let [input-heap (MemorySegment/ofArray input-flat)
-          output-heap (MemorySegment/ofArray output-flat)
-          input-segment (.allocate arena (.byteSize input-heap) 4)
-          output-segment (.allocate arena (.byteSize output-heap) 4)
-          _ (.copyFrom input-segment input-heap)
-          status (.invokeWithArguments
-                  ^java.lang.invoke.MethodHandle @matvec-handle
-                  (List/of (object-array [(int tensor-type) weights (long rows) (long cols)
-                                          input-segment (long positions) output-segment])))]
+  (with-open [arena (ffi/confined-arena)]
+    (let [input-heap (ffi/of-array input-flat)
+          output-heap (ffi/of-array output-flat)
+          input-segment (ffi/alloc-bytes arena (ffi/byte-size input-heap) 4)
+          output-segment (ffi/alloc-bytes arena (ffi/byte-size output-heap) 4)
+          _ (ffi/copy-from! input-segment input-heap)
+          status (ffi/invoke-list
+                  @matvec-handle
+                  [(int tensor-type) weights (long rows) (long cols)
+                                          input-segment (long positions) output-segment])]
       (when-not (zero? (long status))
         (throw (ex-info "native kdot matvec failed" {:status status :type tensor-type
                                                      :rows rows :cols cols :positions positions})))
-      (.copyFrom output-heap output-segment)
+      (ffi/copy-from! output-heap output-segment)
       output-flat)))
 
 (defn matvec-bytes
@@ -70,10 +67,10 @@
   (let [positions (count inputs)
         input-flat (float-array (mapcat identity inputs))
         output-flat (float-array (* positions rows))]
-    (with-open [arena (Arena/ofConfined)]
-      (let [heap (MemorySegment/ofArray weights)
-            native-weights (.allocate arena (.byteSize heap) 1)]
-        (.copyFrom native-weights heap)
+    (with-open [arena (ffi/confined-arena)]
+      (let [heap (ffi/of-array weights)
+            native-weights (ffi/alloc-bytes arena (ffi/byte-size heap) 1)]
+        (ffi/copy-from! native-weights heap)
         (invoke-matvec! tensor-type native-weights rows cols input-flat positions output-flat)))
     (mapv (fn [p]
             (mapv #(double (aget output-flat (+ (* p rows) %))) (range rows)))
@@ -86,7 +83,7 @@
   (let [positions (count inputs)
         input-flat (float-array (mapcat identity inputs))
         output-flat (float-array (* positions rows))]
-    (with-open [arena (Arena/ofConfined)
+    (with-open [arena (ffi/confined-arena)
                 channel (FileChannel/open (Path/of model-path (make-array String 0))
                                           (into-array StandardOpenOption [StandardOpenOption/READ]))]
       (let [weights (.map channel FileChannel$MapMode/READ_ONLY
