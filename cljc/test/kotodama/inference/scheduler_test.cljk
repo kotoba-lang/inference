@@ -6,7 +6,7 @@
   well as either side: without one, flipping `>` to `>=` leaves both suites
   green. Measured on the Kotoba side -- that mutation fails
   `test-spec-worth-it` on all three targets."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [kotodama.inference.scheduler :as s]))
 
 (deftest kv-blocks-needed

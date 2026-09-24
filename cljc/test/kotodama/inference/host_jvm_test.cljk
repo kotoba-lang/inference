@@ -1,5 +1,5 @@
 (ns kotodama.inference.host-jvm-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [kotodama.inference.host.jvm :as host]))
 
 (deftest vector-summary-is-a-stable-cross-runtime-fingerprint

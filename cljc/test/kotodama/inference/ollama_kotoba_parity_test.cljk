@@ -21,7 +21,7 @@
 (ns kotodama.inference.ollama-kotoba-parity-test
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
-            [clojure.test :refer [deftest is testing]]
+            [kotoba.test :refer [deftest is testing]]
             [kotoba.compiler.core :as compiler]
             [kotoba.kir :as ir]
             [kotodama.inference.host.oracle :as oracle]

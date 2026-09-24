@@ -6,7 +6,7 @@
   (:require [kotodama.inference.tokenizer :as tokenizer]
             [kotodama.inference.sample :as sample]
             [kotodama.inference.decode :as decode]
-            #?(:clj [clojure.test :refer [deftest is testing]]
+            #?(:clj [kotoba.test :refer [deftest is testing]]
                :cljs [cljs.test :refer-macros [deftest is testing]])))
 
 (def fixture-vocab

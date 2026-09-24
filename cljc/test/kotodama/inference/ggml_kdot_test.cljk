@@ -1,5 +1,5 @@
 (ns kotodama.inference.ggml-kdot-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [kotodama.inference.ggml-kdot :as kdot]))
 
 (defn- hex->bytes [s]

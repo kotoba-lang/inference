@@ -2,7 +2,7 @@
   "Executable proof that layer-sharded execution over murakumo-plan boundaries
   is EXACTLY the unsharded computation — same doubles, same op order, with the
   activation crossing a printed-EDN handoff at every rank boundary."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [kotodama.inference.ops :as ops]
             [kotodama.inference.shard :as shard]))
 

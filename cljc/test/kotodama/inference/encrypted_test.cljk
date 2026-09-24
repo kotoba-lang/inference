@@ -1,5 +1,5 @@
 (ns kotodama.inference.encrypted-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [kotodama.inference.encrypted :as encrypted]
             [paillier.core :as phe]))
 
