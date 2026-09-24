@@ -41,9 +41,9 @@
   One documented rollback command: delete scripts/kotodama/oracle_gen.cljk and
   nbb.edn (`git rm nbb.edn scripts/kotodama/oracle_gen.cljk`). Nothing else in
   the repository depends on either file."
-  (:require [clojure.pprint :as pp]
+  (:require [kotoba.pprint :as pp]
             [kotoba.lang.text :as str]
-            [clojure.walk :as walk]
+            [kotoba.lang.coll :as walk]
             [kotoba.kir :as ir]
             [kotoba.kir.admission :as admission]
             [kotoba.sema :as sema]))

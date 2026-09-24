@@ -20,7 +20,7 @@
 
 (ns kotodama.inference.ollama-kotoba-parity-test
   (:require [clojure.edn :as edn]
-            [clojure.java.io :as io]
+            [kotoba.io :as io]
             [kotoba.test :refer [deftest is testing]]
             [kotoba.compiler.core :as compiler]
             [kotoba.kir :as ir]
@@ -58,14 +58,14 @@
         "expected six decision cores, kernel-math and the scheduler; adjust deliberately")
     (doseq [{:keys [source out]} artifacts]
       (testing (str out " is a current compile of " source)
-        (is (.exists (io/file out))
+        (is (io/exists? (io/file out))
             "artifact missing — run `kbb -M:test:gen`")
         (is (= (edn/read-string (slurp out)) (:kir (compiled source)))
             "artifact is stale — run `kbb -M:test:gen`")))))
 
 (deftest every-core-is-catalogued-and-loadable
-  (is (= (set (map #(.getName (io/file (:out %))) (gen/discover-artifacts)))
-         (set (map #(.getName (io/file %)) (vals oracle/catalog))))
+  (is (= (set (map #(io/file-name (io/file (:out %))) (gen/discover-artifacts)))
+         (set (map #(io/file-name (io/file %)) (vals oracle/catalog))))
       "a core with no catalog entry is shipped but unreachable")
   ;; `preload!` sorts, so this list is the catalog in key order. `:scheduler`
   ;; joined it 2026-09-09: the artifact had been shipped since the P3-P5 cores

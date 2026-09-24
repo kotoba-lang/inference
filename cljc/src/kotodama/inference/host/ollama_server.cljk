@@ -10,7 +10,7 @@
   `kotoba/*_core.kotoba` and are executed through
   `kotodama.inference.host.oracle` (ADR-2608138800). What is here is transport:
   sockets, JSON, threads, locks, and the clock."
-  (:require [json.data-json :as json]
+  (:require [kotoba.bytes :as kbytes] [json.data-json :as json]
             [kotoba.lang.text :as str]
             [kotodama.inference.host.jvm :as host]
             [kotodama.inference.host.oracle :as oracle])
@@ -42,7 +42,7 @@
 (defn- openai* [export & args] (oracle/call :openai-chat export args))
 
 (defn- json-bytes [value]
-  (.getBytes (json/write-str value) StandardCharsets/UTF_8))
+  (kbytes/utf8-bytes (json/write-str value)))
 
 (defn- read-json [^HttpExchange exchange]
   (with-open [body (.getRequestBody exchange)
@@ -350,7 +350,7 @@
   (.sendResponseHeaders exchange 200 0)
   (with-open [out (.getResponseBody exchange)]
     (letfn [(write! [value]
-              (let [bytes (.getBytes (str (json/write-str value) "\n") StandardCharsets/UTF_8)]
+              (let [bytes (kbytes/utf8-bytes (str (json/write-str value) "\n"))]
                 (.write out bytes)
                 (.flush out)))]
       (try
@@ -456,7 +456,7 @@
     (.sendResponseHeaders exchange 200 0)
     (with-open [out (.getResponseBody exchange)]
       (letfn [(write! [value]
-                (let [bytes (.getBytes (str (json/write-str value) "\n") StandardCharsets/UTF_8)]
+                (let [bytes (kbytes/utf8-bytes (str (json/write-str value) "\n"))]
                   (.write out bytes)
                   (.flush out)))]
         (try
@@ -534,7 +534,7 @@
     (.sendResponseHeaders exchange 200 0)
     (with-open [out (.getResponseBody exchange)]
       (letfn [(frame! [text]
-                (.write out (.getBytes ^String text StandardCharsets/UTF_8))
+                (.write out (kbytes/utf8-bytes ^String text))
                 (.flush out))
               (event! [value]
                 (frame! (str (openai* :sse-data-prefix)

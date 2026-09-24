@@ -5,7 +5,7 @@
   to also run gemma4:e4b through the local Ollama adapter."
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
-            [clojure.pprint :as pprint]
+            [kotoba.pprint :as pprint]
             [kotoba.lang.text :as str]
             [kotodama.verify.maturity :as maturity]))
 
