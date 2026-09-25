@@ -10,7 +10,7 @@
   `kotoba/*_core.kotoba` and are executed through
   `kotodama.inference.host.oracle` (ADR-2608138800). What is here is transport:
   sockets, JSON, threads, locks, and the clock."
-  (:require [kotoba.bytes :as kbytes] [json.data-json :as json]
+  (:require [kotoba.lang.error :as kerror] [kotoba.bytes :as kbytes] [json.data-json :as json]
             [kotoba.lang.text :as str]
             [kotodama.inference.host.jvm :as host]
             [kotodama.inference.host.oracle :as oracle])
@@ -639,7 +639,7 @@
         (send-json! exchange 200 (openai-models-response service))
 
         (error-kind! exchange (protocol* :error-not-found) "not found")))
-    (catch clojure.lang.ExceptionInfo e
+    (catch kerror/ExceptionInfo e
       (error! exchange
               (protocol* :error-status
                          (or (:kind (ex-data e)) (protocol* :error-internal)))

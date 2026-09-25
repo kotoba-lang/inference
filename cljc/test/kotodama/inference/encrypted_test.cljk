@@ -1,5 +1,5 @@
 (ns kotodama.inference.encrypted-test
-  (:require [kotoba.test :refer [deftest is testing]]
+  (:require [kotoba.lang.error :as kerror] [kotoba.test :refer [deftest is testing]]
             [kotodama.inference.encrypted :as encrypted]
             [paillier.core :as phe]))
 
@@ -64,7 +64,7 @@
   (let [{:keys [public-key private-key]} @keypair]
     (testing "the client enforces its declared public range"
       (is (thrown-with-msg?
-           clojure.lang.ExceptionInfo #"exceeds"
+           kerror/ExceptionInfo #"exceeds"
            (encrypted/prepare-lm-head-request
             public-key [2.0] {:activation-scale 1000 :hidden-bound 1.0}))))
     (testing "the server checks model/request dimensions"
@@ -72,7 +72,7 @@
                      public-key [0.5]
                      {:activation-scale 1000 :hidden-bound 1.0})]
         (is (thrown-with-msg?
-             clojure.lang.ExceptionInfo #"dimensions"
+             kerror/ExceptionInfo #"dimensions"
              (encrypted/evaluate-lm-head
               request [[1.0 2.0]] [0.0]
               {:weight-scale 1000 :token-ids [1]})))))
@@ -80,5 +80,5 @@
       (let [{:keys [response]} (encrypted-roundtrip)
             tampered (assoc response :kotodama.encrypted/key-id "another-key")]
         (is (thrown-with-msg?
-             clojure.lang.ExceptionInfo #"another key"
+             kerror/ExceptionInfo #"another key"
              (encrypted/decrypt-lm-head-response private-key tampered)))))))

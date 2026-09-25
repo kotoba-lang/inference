@@ -1,6 +1,6 @@
 (ns kotodama.inference.ptq1-test
   (:require [kotodama.inference.ptq1 :as ptq1]
-            #?(:clj [clojure.java.io :as io])
+            #?(:clj [kotoba.io :as io])
             #?(:clj [kotoba.test :refer [deftest is testing]]
                :cljs [cljs.test :refer-macros [deftest is testing]])))
 

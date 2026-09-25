@@ -15,7 +15,7 @@
   ASCII prompts through the real Gemma4 GGUF vocab (SentencePiece-style `▁`
   word-boundary marker + GPT2-style rank-ordered merges), which is the stated
   v1 bar."
-  (:require [kotoba.lang.text :as str]))
+  (:require [kotoba.bytes :as kbytes] [kotoba.lang.text :as str]))
 
 (def space-marker "▁")
 
@@ -121,7 +121,7 @@
   [{:kotodama.tokenizer/keys [token->id byte-fallback unknown-token-id]} symbol]
   (if-let [id (get token->id symbol)]
     [id]
-    #?(:clj (let [bytes (.getBytes ^String symbol "UTF-8")]
+    #?(:clj (let [bytes (kbytes/utf8-bytes ^String symbol)]
               (mapv (fn [b] (get byte-fallback (bit-and 0xff b) unknown-token-id)) bytes))
        :cljs [unknown-token-id])))
 
@@ -150,7 +150,7 @@
          (let [s (token-str tokenizer id)]
            (if-let [hex (byte-fallback-token s)]
              (.write buf (int hex))
-             (.write buf (.getBytes ^String s "UTF-8")))))
+             (.write buf (kbytes/utf8-bytes ^String s)))))
        (-> (.toString buf "UTF-8")
            (str/replace space-marker " ")))
      :cljs
