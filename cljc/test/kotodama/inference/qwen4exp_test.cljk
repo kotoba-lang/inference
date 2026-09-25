@@ -31,7 +31,7 @@
                                       "model.safetensors"}})]
     (is (false? (:kotodama/mtp-admitted? audit)))
     (is (= 31 (count (:kotodama/mtp-missing audit))))
-    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+    (is (thrown-with-msg? js/Error
                           #"not MTP-complete"
                           (qwen4exp/runtime-spec "missing-mtp" config
                                                 {"weight_map" {}})))))
@@ -105,7 +105,7 @@
                (qwen4exp/expert-stream-audit
                 (assoc-in flash-next-config ["text_config" "num_experts"] 256)
                 complete-expert-index))))
-  (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+  (is (thrown-with-msg? js/Error
                         #"not expert-stream complete"
                         (qwen4exp/expert-stream-spec
                          "missing" flash-next-config {"weight_map" {}} {}))))

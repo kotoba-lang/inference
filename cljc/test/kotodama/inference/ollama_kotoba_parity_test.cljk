@@ -19,7 +19,7 @@
 ;; Requires the compiler, which is :test-only. Production never compiles.
 
 (ns kotodama.inference.ollama-kotoba-parity-test
-  (:require [clojure.edn :as edn]
+  (:require [kotoba.lang.error :as kerror] [clojure.edn :as edn]
             [kotoba.io :as io]
             [kotoba.test :refer [deftest is testing]]
             [kotoba.compiler.core :as compiler]
@@ -80,7 +80,7 @@
 (deftest a-missing-artifact-fails-closed
   ;; There is no Clojure fallback, on purpose: a fallback answers with an
   ;; unreviewed second copy of the policy and looks identical to success.
-  (is (thrown? clojure.lang.ExceptionInfo (oracle/call :no-such-oracle :x []))))
+  (is (thrown? kerror/ExceptionInfo (oracle/call :no-such-oracle :x []))))
 
 ;; ── 2. semantics ─────────────────────────────────────────────────────
 

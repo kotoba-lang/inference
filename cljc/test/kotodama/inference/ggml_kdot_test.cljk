@@ -1,5 +1,5 @@
 (ns kotodama.inference.ggml-kdot-test
-  (:require [kotoba.test :refer [deftest is testing]]
+  (:require [kotoba.lang.error :as kerror] [kotoba.test :refer [deftest is testing]]
             [kotodama.inference.ggml-kdot :as kdot]))
 
 (defn- hex->bytes [s]
@@ -36,7 +36,7 @@
               (float (kdot/dot-q6-k-q8-k (hex->bytes q6-golden) [q8]))))))))
 
 (deftest q8-k-rejects-partial-blocks
-  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"requires 256"
+  (is (thrown-with-msg? kerror/ExceptionInfo #"requires 256"
                         (kdot/quantize-q8-k-block [1 2])))
-  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"divisible by 256"
+  (is (thrown-with-msg? kerror/ExceptionInfo #"divisible by 256"
                         (kdot/quantize-q8-k (repeat 257 0.0)))))

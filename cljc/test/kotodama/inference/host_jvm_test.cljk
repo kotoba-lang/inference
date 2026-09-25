@@ -1,5 +1,5 @@
 (ns kotodama.inference.host-jvm-test
-  (:require [kotoba.test :refer [deftest is testing]]
+  (:require [kotoba.lang.error :as kerror] [kotoba.test :refer [deftest is testing]]
             [kotodama.inference.host.jvm :as host]))
 
 (deftest vector-summary-is-a-stable-cross-runtime-fingerprint
@@ -19,6 +19,6 @@
 (deftest dot-f32-has-an-explicit-float-accumulation-contract
   (is (= 0.0 (host/dot-f32 [1.0e8 1.0 -1.0e8] [1.0 1.0 1.0])))
   (is (= 1.0 (+ (* 1.0e8 1.0) (* 1.0 1.0) (* -1.0e8 1.0))))
-  (is (thrown-with-msg? clojure.lang.ExceptionInfo
+  (is (thrown-with-msg? kerror/ExceptionInfo
                         #"dot input lengths differ"
                         (host/dot-f32 [1] [1 2]))))

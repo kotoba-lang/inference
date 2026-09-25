@@ -76,7 +76,7 @@
   (let [e (try (edge/plan-for-model "murakumo-70b" {:home "/Users/a"
                                                     :llama-server "/x"
                                                     :memory-bytes 100})
-               (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e e))]
+               (catch :default e e))]
     (is (= "no such edge model artifact" (ex-message e)))
     (is (= ["murakumo-27b" "murakumo-edge" "murakumo-edge-mtp-canary"]
            (:registered (ex-data e))))))
