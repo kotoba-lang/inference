@@ -14,7 +14,7 @@
   Fail-closed: a missing or unreadable artifact throws. There is deliberately
   no Clojure fallback — a fallback would let the server keep answering with a
   second, unreviewed copy of the policy, which is the failure this arrangement
-  exists to prevent (CLAUDE.md: a check that could not run must not return the
+  exists to prevent (AGENTS.md: a check that could not run must not return the
   value of a check that passed).
 
   This is not `murakumo.kotoba.oracle`. That one is `.cljc`, carries a
