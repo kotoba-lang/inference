@@ -49,7 +49,7 @@
 (deftest shipped-artifacts-match-their-source
   (let [artifacts (gen/discover-artifacts)]
     ;; Evidence floor: discovery returning nothing must not read as "every
-    ;; artifact is current" (CLAUDE.md, ADR-2608136000 Q1).
+    ;; artifact is current" (AGENTS.md, ADR-2608136000 Q1).
     ;; EIGHT: six surface cores, kernel-math, and the scheduler. The count is
     ;; asserted rather than the presence, and "adjust deliberately" is the
     ;; instruction it carries -- a core arriving without this number moving is

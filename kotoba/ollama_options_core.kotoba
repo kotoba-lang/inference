@@ -64,7 +64,7 @@
 ;;
 ;; Duration strings ("5m", "1h") are NOT parsed here — the host normalises them
 ;; to seconds first. Character-level parsing in a decision core would be the
-;; regex-scanning-for-structure antipattern CLAUDE.md names.
+;; regex-scanning-for-structure antipattern AGENTS.md names.
 
 (defn forever [] :i64 -1)
 

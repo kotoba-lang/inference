@@ -1,4 +1,4 @@
-# f64 CPU reference (numpy) -- a TEST ORACLE, not tooling (CLAUDE.md kbb-first is for tooling); imports kdot_ref for the GGUF directory and codebook.
+# f64 CPU reference (numpy) -- a TEST ORACLE, not tooling (AGENTS.md kbb-first is for tooling); imports kdot_ref for the GGUF directory and codebook.
 # f64 CPU reference of ONE recurrent (gated delta-net) layer of Nex-N2.5-mini for
 # one token at position 0 -- the numpy port of verify/nex_layer0_reference.js
 # (Deno, retired). Writes x.f32 (the token's embedding row, MAPped by the guest)
