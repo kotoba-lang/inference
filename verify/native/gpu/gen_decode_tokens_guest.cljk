@@ -419,6 +419,12 @@
                   [:gate NFF NE "ffn_gate.weight"] [:down NE NFF "ffn_down.weight"]])
 (defn dense-layer-types [il] (vec (for [[_ _ _ nm] dense-roles] (:type (T* (str "blk." il "." nm))))))
 (def dense-sigs (when dense? (vec (distinct (map dense-layer-types (range layers))))))   ;; distinct type signatures over the layers
+;; P1 review fix: the fused qkv / qkvr kernels are Q8_0 ONLY (their dot is the
+;; term32 tt==8 path and the qkv meta hard-codes type 8). Enable them only when
+;; EVERY layer's q, k and v tensors are Q8_0; anything else (Q4_0, K-quants)
+;; keeps the per-type kdot_h2_r1 path. Model-level gate because fn mode emits
+;; one body for all layers.
+(def dense-q8? (when dense? (every? (fn [il] (let [ts (dense-layer-types il)] (and (= 8 (nth ts 0)) (= 8 (nth ts 1)) (= 8 (nth ts 2))))) (range layers))))
 (def layer-sig (when dense? (vec (for [il (range layers)] (.indexOf dense-sigs (dense-layer-types il))))))
 (def dense-metas (when dense? (into {} (for [[si [pf ipe]] (map-indexed vector phase-shapes) [ri [role rows cols _]] (map-indexed vector dense-roles)
                                             t (distinct (map #(nth % ri) dense-sigs))]
@@ -601,7 +607,7 @@
    -> o kdot -> residual + rmsnorm -> SwiGLU FFN -> residual. PF rows; the batch / prefill twins come through op* and the metas."
   [w xin xout kc vc pb]
   (dispatch! (ops "rmsnorm") PF 1 1 m-dnorm xin (:norm w) zeros16 h zeros16 zeros16)
-  (if (and dense-qkvr (not batch?) (not prefill?) (not bp?))
+  (if (and dense-qkvr dense-q8? (not batch?) (not prefill?) (not bp?))
     ;; Fusion iteration 11 (decode only): the q, k and v matvecs with their
     ;; bias AND NeoX rope folded in — one dispatch writes dqr/dkr/dv directly
     ;; (dq/dk intermediates unused). Arithmetic identical: per pair,
@@ -609,7 +615,7 @@
     ;; The v pair runs with cs = 1, sn = 0 (identity = the old add_bias).
     (dispatch! dense-qkvr (* (quot HD 2) (+ NH (* 2 NKV))) PF 1 m-qkvf (:q w) h dqr (:k w) dkr (:v w) dv (:qb w) (:kb w) (:vb w) m-dropeq (or rope-freqs zeros16) pb)
     (do
-  (if (and dense-qkv (not batch?) (not prefill?) (not bp?))
+  (if (and dense-qkv dense-q8? (not batch?) (not prefill?) (not bp?))
     ;; Fusion iteration 9 (decode only): q, k and v matvecs in ONE dispatch.
     ;; The three dots are arithmetic-identical (verbatim kdot_h2_r1 Q8_0 path);
     ;; grid = one workgroup per output row over the three matvecs.

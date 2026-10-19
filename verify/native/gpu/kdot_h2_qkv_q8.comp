@@ -35,12 +35,19 @@ shared float partial[2];
 
 // sel: 0 = q, 1 = k, 2 = v (uniform per workgroup)
 uint w_u32_at_sel(uint sel, uint offset) {
-  uint w0, w1;
-  if (sel == 0u) { w0 = wq[offset >> 2u]; w1 = wq[(offset >> 2u) + 1u]; }
-  else if (sel == 1u) { w0 = wk[offset >> 2u]; w1 = wk[(offset >> 2u) + 1u]; }
-  else { w0 = wv[offset >> 2u]; w1 = wv[(offset >> 2u) + 1u]; }
+  // P2 review fix: load the second word ONLY when the shift needs it — for an
+  // aligned offset it is unused and on the tensor's last row it addresses bytes
+  // past the buffer (undefined in Vulkan).
+  uint w0;
+  if (sel == 0u) w0 = wq[offset >> 2u];
+  else if (sel == 1u) w0 = wk[offset >> 2u];
+  else w0 = wv[offset >> 2u];
   uint shift = (offset & 3u) * 8u;
   if (shift == 0u) return w0;
+  uint w1;
+  if (sel == 0u) w1 = wq[(offset >> 2u) + 1u];
+  else if (sel == 1u) w1 = wk[(offset >> 2u) + 1u];
+  else w1 = wv[(offset >> 2u) + 1u];
   return (w0 >> shift) | (w1 << (32u - shift));
 }
 float weight_half_sel(uint sel, uint offset) {
