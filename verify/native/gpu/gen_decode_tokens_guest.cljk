@@ -124,7 +124,10 @@
    ;; as the exact kernel's 0.0167 -- llama.cpp itself is ~0.015 from the f64 oracle.
    ;; 12L x 3T 48.5 -> 39.3 ms/token. "nvgpu-exact" keeps the f32 path (s4).
    "nvgpu"       {:wide "kdot_h2_r1.spv" :narrow "kdot_h2_r1.spv" :lm "kdot_h2q6_r1.spv" :lm-once true}   ;; lm_head on the Q6_K half path (separate binary) since iteration 21; batch: read once (iteration 52: B=2 77.4 -> 60.8 ms)
-   "nvgpu-exact" {:wide "kdot_s4_r1.spv" :narrow "kdot_s4_r1.spv" :lm "kdot_s4_r1.spv" :lm-once true}})   ;; :lm-once (tick 58): batch reads the lm_head once, as the h2 table does
+   "nvgpu-exact" {:wide "kdot_s4_r1.spv" :narrow "kdot_s4_r1.spv" :lm "kdot_s4_r1.spv" :lm-once true}   ;; :lm-once (tick 58): batch reads the lm_head once, as the h2 table does
+   ;; "nvgpu-h2" (co-scientist iteration 1, 2026-10-19): the h2 table reachable for DENSE models too --
+   ;; the dense rule below redirects plain "nvgpu" to the exact table (tick 58), so h2 had no name.
+   "nvgpu-h2" {:wide "kdot_h2_r1.spv" :narrow "kdot_h2_r1.spv" :lm "kdot_h2q6_r1.spv" :lm-once true}})
 (def layouts* (or (layout-table backend) (do (println "REFUSE unknown backend" backend) (js/process.exit 2))))
 ;; --- GGUF directory (header only) ---
 (def fd (fs/openSync gguf "r"))
