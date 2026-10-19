@@ -129,7 +129,9 @@
    ;; the dense rule below redirects plain "nvgpu" to the exact table (tick 58), so h2 had no name.
    "nvgpu-h2" {:wide "kdot_h2_r1.spv" :narrow "kdot_h2_r1.spv" :lm "kdot_h2q6_r1.spv" :lm-once true
                :dense-qkv "kdot_h2_qkv_q8.spv"
-               :dense-qkvr "kdot_h2_qkvr_q8.spv"}})
+               :dense-qkvr "kdot_h2_qkvr_q8.spv"
+               :lm-r4 "kdot_h2q8_r4.spv"
+               :o-r4 "kdot_h2q8_r4.spv"}})
 (def layouts* (or (layout-table backend) (do (println "REFUSE unknown backend" backend) (js/process.exit 2))))
 ;; --- GGUF directory (header only) ---
 (def fd (fs/openSync gguf "r"))
@@ -314,6 +316,11 @@
 (def kdot-wide (pipeline! (:wide layouts) 5))
 (def kdot-narrow (pipeline! (:narrow layouts) 5))
 (def kdot-lm (pipeline! (:lm layouts) 5))
+;; kdot_h2_r4_q8 (fusion iteration 14): 4 rows per workgroup for the Q8_0
+;; kdot — the small-matvec class (one row/workgroup ramp-dominated; the
+;; lm-head at 151936 rows measured ~2.1 ms/step). rows-of-spv reads the r4
+;; from the filename, so wg-of computes ceil(rows / 4) automatically.
+(def kdot-lm-r4 (when (and (:lm-r4 layouts) (= 8 LMT)) (pipeline! (:lm-r4 layouts) 5)))
 (def kdot-expert (if (:expert layouts) (pipeline! (:expert layouts) 5) kdot-narrow))   ;; the three 8-position expert kdots (iteration 27)
 (def kdot-expert-dual (when (:expert-dual layouts) (pipeline! (:expert-dual layouts) 6)))   ;; gate + up + silu in one dispatch (iteration 28)
 (def kdot-dense-dual (when (:dense-dual layouts) (pipeline! (:dense-dual layouts) 6)))
@@ -424,6 +431,11 @@
                   [:gate NFF NE "ffn_gate.weight"] [:down NE NFF "ffn_down.weight"]])
 (defn dense-layer-types [il] (vec (for [[_ _ _ nm] dense-roles] (:type (T* (str "blk." il "." nm))))))
 (def dense-sigs (when dense? (vec (distinct (map dense-layer-types (range layers))))))   ;; distinct type signatures over the layers
+;; iteration 15: the same 4-row kernel for the attention output kdot (the
+;; small class: 896 rows, one row/workgroup ramp-dominated). Gates on every
+;; layer's o tensor being Q8_0 (the kernel is Q8_0-only).
+(def dense-q8o? (when dense? (every? (fn [il] (= 8 (nth (dense-layer-types il) 3))) (range layers))))
+(def kdot-o-r4 (when (and (:o-r4 layouts) dense-q8o?) (pipeline! (:o-r4 layouts) 5)))
 ;; P1 review fix: the fused qkv / qkvr kernels are Q8_0 ONLY (their dot is the
 ;; term32 tt==8 path and the qkv meta hard-codes type 8). Enable them only when
 ;; EVERY layer's q, k and v tensors are Q8_0; anything else (Q4_0, K-quants)
@@ -666,7 +678,10 @@
     ;; Arithmetic identical: the attention math is op_attn_decode's verbatim.
     (dispatch! attn-copy NH PF 1 m-dattn dqr kc vc dattn dv dkr pb)
     (dispatch! (op* "attn_decode") NH PF 1 m-dattn dqr kc vc dattn zeros16 pb))
-  (pkdot! kdot-out out-spv NE (dense-meta w :o) (:o w) dattn attn-out zerosP)
+  (if (and kdot-o-r4 (not batch?) (not prefill?) (not bp?))
+    ;; Iteration 15 (decode only): 4 o-kdot rows per workgroup
+    (pkdot! kdot-o-r4 (:o-r4 layouts) NE (dense-meta w :o) (:o w) dattn attn-out zerosP)
+    (pkdot! kdot-out out-spv NE (dense-meta w :o) (:o w) dattn attn-out zerosP))
   (dispatch! (ops "add_rmsnorm") PF 1 1 m-daddn xin attn-out (:fnorm w) resid h2 zeros16)
   (pkdot! kdot-wide (:wide layouts) NFF (dense-meta w :gate) (:gate w) h2 dg zerosP)
   (pkdotc! kdot-wide (:wide layouts) NFF (dense-meta w :gate) (:up w) h2 du zerosP)
@@ -782,7 +797,10 @@
     (when bonsai? (hdispatch! m-h-ne-fwd NE hN hrot))
     (if i8-lm
       (let [[xq xs] (quant! hN (* PF 2048) hN-i8)] (dispatch! i8-lm (wg-of (:lm-i8 layouts) NV) 1 1 m-lm w-lm xq logits zeros16 xs))
-      (dispatch! kdot-lm (wg-of (:lm layouts) NV) 1 1 m-lm w-lm (if bonsai? hrot hN) logits zeros16))
+      (if (and kdot-lm-r4 (not batch?) (not prefill?) (not bp?))
+        ;; Fusion iteration 14 (decode only): 4 lm-head rows per workgroup
+        (dispatch! kdot-lm-r4 (wg-of (:lm-r4 layouts) NV) 1 1 m-lm w-lm (if bonsai? hrot hN) logits zeros16)
+        (dispatch! kdot-lm (wg-of (:lm layouts) NV) 1 1 m-lm w-lm (if bonsai? hrot hN) logits zeros16)))
     (dispatch! (ops "argmax_partial") NPARTS 1 1 m-am1 logits zeros16 zeros16 zeros16 amax-s amax-ids)
     (dispatch! (ops "argmax_final") 1 1 1 m-am2 amax-s zeros16 zeros16 amax-s amax-s amax-ids)
     ;; SUBMIT and the read-backs are bound so their answers survive to the end
