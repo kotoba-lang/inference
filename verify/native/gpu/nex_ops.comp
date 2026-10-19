@@ -149,7 +149,14 @@ void op_rope_neox() {   // workgroup x = head row over all batch rows; P.rows = 
   uint h = gl_WorkGroupID.x, t = gl_LocalInvocationID.x, n = P.n, nrot = P.aux, hlf = nrot / 2u, base = h * n;
   uint tokrow = (P.rows > 0u) ? h / P.rows : 0u;
   for (uint i = t; i < n; i += 256u) {
-    if (i >= nrot) { o[base + i] = a[base + i]; continue; }
+    if (i >= nrot) {
+#ifdef BIAS
+      o[base + i] = a[base + i] + c[base + i];
+#else
+      o[base + i] = a[base + i];
+#endif
+      continue;
+    }
     // p0 != 0 (iteration 59, llama): the NORMAL rope pairs adjacent dims (2p, 2p+1) instead of (p, p + nrot/2)
     bool norm_ = P.p0 != 0.0;
     uint pair = norm_ ? (i >> 1u) : ((i >= hlf) ? i - hlf : i);
@@ -161,6 +168,15 @@ void op_rope_neox() {   // workgroup x = head row over all batch rows; P.rows = 
     if (P.eps != 0.0) theta /= b[pair];   // iteration 59, llama3 rope scaling: b = rope_freqs.weight, one divisor per frequency (eps != 0 says it is bound)
     float cs = cos(theta), sn = sin(theta);
     float x0 = norm_ ? a[base + 2u * pair] : a[base + pair], x1 = norm_ ? a[base + 2u * pair + 1u] : a[base + pair + hlf];
+#ifdef BIAS
+    // fused add_bias (rope_neox -DBIAS, fusion iteration 6): x = a + c before
+    // the rope, where c is the per-column bias (binding 3, the zeros16 slot in
+    // the plain rope call). Removes the add_bias dispatch; decode semantics
+    // only (bias index = base + i, PF = 1). The `i >= nrot` tail below carries
+    // the same add.
+    x0 += (norm_ ? c[base + 2u * pair] : c[base + pair]);
+    x1 += (norm_ ? c[base + 2u * pair + 1u] : c[base + pair + hlf]);
+#endif
     bool second = norm_ ? ((i & 1u) == 1u) : (i >= hlf);
     o[base + i] = second ? (x0 * sn + x1 * cs) : (x0 * cs - x1 * sn);
   }
