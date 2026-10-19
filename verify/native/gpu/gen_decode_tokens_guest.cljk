@@ -131,7 +131,8 @@
                :dense-qkv "kdot_h2_qkv_q8.spv"
                :dense-qkvr "kdot_h2_qkvr_q8.spv"
                :lm-r4 "kdot_h2q8_r4.spv"
-               :o-r4 "kdot_h2q8_r4.spv"}})
+               :o-r4 "kdot_h2q8_r4.spv"
+               :lm-r8 "kdot_h2q8_r8.spv"}})
 (def layouts* (or (layout-table backend) (do (println "REFUSE unknown backend" backend) (js/process.exit 2))))
 ;; --- GGUF directory (header only) ---
 (def fd (fs/openSync gguf "r"))
@@ -321,6 +322,8 @@
 ;; lm-head at 151936 rows measured ~2.1 ms/step). rows-of-spv reads the r4
 ;; from the filename, so wg-of computes ceil(rows / 4) automatically.
 (def kdot-lm-r4 (when (and (:lm-r4 layouts) (= 8 LMT)) (pipeline! (:lm-r4 layouts) 5)))
+;; iterations 14/18: 8 rows per workgroup for the lm-head (the tail's main cost)
+(def kdot-lm-r8 (when (and (:lm-r8 layouts) (= 8 LMT)) (pipeline! (:lm-r8 layouts) 5)))
 (def kdot-expert (if (:expert layouts) (pipeline! (:expert layouts) 5) kdot-narrow))   ;; the three 8-position expert kdots (iteration 27)
 (def kdot-expert-dual (when (:expert-dual layouts) (pipeline! (:expert-dual layouts) 6)))   ;; gate + up + silu in one dispatch (iteration 28)
 (def kdot-dense-dual (when (:dense-dual layouts) (pipeline! (:dense-dual layouts) 6)))
@@ -394,7 +397,11 @@
 (def qfull (alloc! (* PMAX 4 ATTN-Q))) (def kproj (alloc! (* PMAX 4 KVROW))) (def vproj (alloc! (* PMAX 4 KVROW))) (def qnorm (alloc! (* PMAX 4 ATTN-O))) (def knorm (alloc! (* PMAX 4 KVROW))) (def qrope (alloc! (* PMAX 4 ATTN-O))) (def krope (alloc! (* PMAX 4 KVROW))) (def attno (alloc! (* PMAX 4 ATTN-O)))
 (def resid (alloc! (* PMAX 4 NE))) (def h2 (alloc! (* PMAX 4 NE))) (def router (alloc! (* PMAX 1024))) (def ids (alloc! (* PMAX 64))) (def topw (alloc! (* PMAX 64)))
 (def gateE (alloc! (* PMAX 16384))) (def upE (alloc! (* PMAX 16384))) (def actE (alloc! (* PMAX 16384))) (def downE (alloc! (* PMAX 65536)))
-(def sg (alloc! (* PMAX 2048))) (def su (alloc! (* PMAX 2048))) (def sact (alloc! (* PMAX 2048))) (def shdown (alloc! (* PMAX 4 NE))) (def shlogit (alloc! (max 16 (* PMAX 4)))) (def ffn (alloc! (* PMAX 4 NE)))   ;; shlogit: the shared-expert gate logit per row (the P=8 bug of iteration 49: 16 bytes for 8 rows)
+(def sg (alloc! (* PMAX 2048))) (def su (alloc! (* PMAX 2048))) (def sact (alloc! (* PMAX 2048))) (def shdown (alloc! (* PMAX 4 NE))) (def shlogit (alloc! (max 16 (* PMAX 4)))) ;; Iteration 19 gate: the boundary fusion (add_rmsnorm replaces the layer-end
+;; add + the next rmsnorm) for the dense decode paths.
+(def boundary-fuse? (and dense? (not batch?) (not prefill?) (not bp?)))
+(def zrow (when boundary-fuse? (let [b (alloc! (* 4 NE))] (zero! b) b)))   ;; a zeroed NE row for the per-step ffn fill
+(def ffn (alloc! (* PMAX 4 NE)))   ;; shlogit: the shared-expert gate logit per row (the P=8 bug of iteration 49: 16 bytes for 8 rows)
 (def xa (alloc! (* PMAX 4 NE))) (def xb (alloc! (* PMAX 4 NE)))
 (def embed-raw (when bonsai? (alloc! (* PMAX 4 NE))))
 (def hrot (when bonsai? (alloc! (* PMAX 4 (apply max sign-widths)))))
@@ -622,8 +629,16 @@
 (defn emit-dense-layer!
   "One dense decoder block (qwen2 / llama, iteration 59): rmsnorm -> q/k/v kdots (+ bias) -> rope -> KV copy -> attention (no gate)
    -> o kdot -> residual + rmsnorm -> SwiGLU FFN -> residual. PF rows; the batch / prefill twins come through op* and the metas."
-  [w xin xout kc vc pb]
-  (dispatch! (ops "rmsnorm") PF 1 1 m-dnorm xin (:norm w) zeros16 h zeros16 zeros16)
+  [w xin xout kc vc pb & [head-mode tail-mode]]
+  ;; Iteration 19 (boundary fusion): one nex add_rmsnorm op replaces the
+  ;; residual add and the following rmsnorm - arithmetic-identical (the same
+  ;; kernel; the f32 store is exact so the norm reads the same values).
+  ;;   head-mode :plain | :skip | :fused (add_rmsnorm(resid, ffn, norm) -> xin, h)
+  ;;   tail-mode nil (plain add) | :none | a handle (fused tail)
+  (case head-mode
+    :skip nil
+    :fused (dispatch! (ops "add_rmsnorm") PF 1 1 m-daddn resid ffn (:norm w) xin h zeros16)
+    (dispatch! (ops "rmsnorm") PF 1 1 m-dnorm xin (:norm w) zeros16 h zeros16 zeros16))
   (if (and dense-qkvr dense-q8? (not batch?) (not prefill?) (not bp?))
     ;; Fusion iteration 11 (decode only): the q, k and v matvecs with their
     ;; bias AND NeoX rope folded in — one dispatch writes dqr/dkr/dv directly
@@ -699,10 +714,14 @@
         (dispatch! (ops "add") (quot (+ (* PF NE) 255) 256) 1 1 m-dadd resid dact zeros16 xout zeros16 zeros16))
     (do (dispatch! (ops "silu_mul") (quot (+ (* PF NFF) 255) 256) 1 1 m-dsilu dg du zeros16 dact zeros16 zeros16)
         (pkdot! kdot-out out-spv NE (dense-meta w :down) (:down w) dact ffn zerosP)
-        (dispatch! (ops "add") (quot (+ (* PF NE) 255) 256) 1 1 m-dadd resid ffn zeros16 xout zeros16 zeros16))))
-(defn emit-layer! [il w xin xout ring S kc vc mrq mrk mattn mcopy pb & [sb]]
+        (case tail-mode
+          :none nil
+          (if (string? tail-mode)
+            (dispatch! (ops "add_rmsnorm") PF 1 1 m-daddn resid ffn tail-mode xout h zeros16)
+            (dispatch! (ops "add") (quot (+ (* PF NE) 255) 256) 1 1 m-dadd resid ffn zeros16 xout zeros16 zeros16))))))
+(defn emit-layer! [il w xin xout ring S kc vc mrq mrk mattn mcopy pb & [sb head-mode tail-mode]]
   (if dense?
-    (emit-dense-layer! w xin xout kc vc pb)
+    (emit-dense-layer! w xin xout kc vc pb head-mode tail-mode)
     (do
         (when (and prefill? sb fn-mode? (not batch?)) (dispatch! (op* "pos_seed") 1 1 1 m-incr pb zeros16 zeros16 zeros16 zeros16 sb))   ;; stepbuf = [base position, row 0(, seq)]
         (dispatch! (ops "rmsnorm") PF 1 1 m-norm xin (:norm w) zeros16 h zeros16 zeros16)
@@ -791,9 +810,12 @@
         (dispatch! (ops "add") (* 8 PF) 1 1 m-add resid ffn zeros16 xout zeros16 zeros16))))))
 
 ;; the token's tail: final norm, lm_head, argmax, SUBMIT (bound) and the read-backs
-(defn emit-lm-head! [pos]
+(defn emit-lm-head! [pos & [skip-norm?]]
   (let [x-final (if (odd? (dec layers)) xb xa)]
-    (dispatch! (ops "rmsnorm") PF 1 1 (if dense? m-dnorm m-norm) x-final w-out-norm zeros16 hN zeros16 zeros16)   ;; dense: rows of NE (iteration 59: with n = 2048 the norm of a 896-wide row diluted the rms by sqrt(2048/896) -- argmax-invariant, distribution-wrong, and rows >= 1 read the wrong offset)
+    (when-not skip-norm?
+      (if boundary-fuse?
+        (dispatch! (ops "add_rmsnorm") PF 1 1 m-daddn resid ffn w-out-norm x-final hN zeros16)
+        (dispatch! (ops "rmsnorm") PF 1 1 (if dense? m-dnorm m-norm) x-final w-out-norm zeros16 hN zeros16 zeros16)))   ;; dense: rows of NE (iteration 59: with n = 2048 the norm of a 896-wide row diluted the rms by sqrt(2048/896) -- argmax-invariant, distribution-wrong, and rows >= 1 read the wrong offset)
     (when bonsai? (hdispatch! m-h-ne-fwd NE hN hrot))
     (if i8-lm
       (let [[xq xs] (quant! hN (* PF 2048) hN-i8)] (dispatch! i8-lm (wg-of (:lm-i8 layouts) NV) 1 1 m-lm w-lm xq logits zeros16 xs))
@@ -821,8 +843,11 @@
               ring (when rec? (rings @rec-index)) S (when rec? (states @rec-index))
               kc (when-not rec? (kcaches @att-index)) vc (when-not rec? (vcaches @att-index))]
           (if rec? (swap! rec-index inc) (swap! att-index inc))
-          (emit-layer! il w xin xout ring S kc vc (m-ropeq pos) (m-ropek pos) (m-attn pos) (m-copy pos) posbuf))))
-    (emit-lm-head! pos)))
+          (emit-layer! il w xin xout ring S kc vc (m-ropeq pos) (m-ropek pos) (m-attn pos) (m-copy pos) posbuf nil
+                       (when (and boundary-fuse? (pos? il)) :skip)
+                       (when boundary-fuse?
+                         (if (< il (dec layers)) (:norm (layer-w (inc il))) w-out-norm))))))
+    (emit-lm-head! pos (and (not batch?) (not prefill?) (not bp?)))))
 
 ;; --- stream mode: the program is FUNCTIONS (the ABI allows 5 parameters, the
 ;; module 64 KiB of string literals -- kotoba-sema max-parameters,
@@ -877,7 +902,8 @@
   (reset! lines [])
   (let [w (into {} (map-indexed (fn [i k] [k (hexpr (str "(+ w0 " i ")"))]) keys))]
     (emit-layer! (if rec? 0 3) w (hexpr "xin") (hexpr "xout") (when rec? (hexpr "ring")) (when rec? (hexpr "S")) (when-not rec? (hexpr "kc")) (when-not rec? (hexpr "vc")) m-ropeq-dyn m-ropek-dyn m-attn-dyn (if batch? m-copy-b m-copy-dyn) (cond batch? rowpos bp? rowsel :else posbuf)
-                 (when (and rec? prefill?) (hexpr (str "(+ S " (- (js/parseInt (first stepbufs)) (js/parseInt (first states))) ")")))))   ;; stepbuf handle = S + (SB0 - S0): both run one per recurrent layer
+                 (when (and rec? prefill?) (hexpr (str "(+ S " (- (js/parseInt (first stepbufs)) (js/parseInt (first states))) ")")))
+                 (when (and boundary-fuse? (not rec?)) :fused) (when (and boundary-fuse? (not rec?)) :none)))   ;; iteration 19: shared-function boundary fusion
   (let [params (concat ["w0" "xin" "xout"] (if rec? ["ring" "S"] ["kc" "vc"])) body @lines]
     ;; dense: the layer's type signature comes from its weight base (a 6th parameter exceeds the native ABI arity, tick 57)
     (str "(defn " fname " [" (str/join " " (map #(str % " :i64") params)) "] :string\n"
@@ -925,10 +951,19 @@
     (cond
       batch? (dispatch! embed-b 1 PF 1 m-embed-b w-embd tokbuf x rowpos)
       bp? (dispatch! embed-bp 1 PF 1 m-embed-b w-embd tokbuf x rowsel)
-      :else (dispatch! embed 1 PF 1 m-embed-dyn w-embd tokbuf (if bonsai? embed-raw x) posbuf))
+      ;; Iteration 19 seed: the embed lands in resid (the first fused head
+      ;; computes xin = resid + ffn(=0) and h itself); x unwritten is fine.
+      :else (dispatch! embed 1 PF 1 m-embed-dyn w-embd tokbuf (if bonsai? embed-raw (if boundary-fuse? resid x)) posbuf))
+    ;; Iteration 19 seed, EVERY step (in-recording): layer 0's fused head reads
+    ;; ffn = 0 — a 0+0 add over the zeroed zrow (ZERO is illegal while recording).
+    (when boundary-fuse? (dispatch! (ops "add") (quot (+ NE 255) 256) 1 1 m-add zrow zrow zeros16 ffn zeros16 zeros16))
     (when bonsai? (hdispatch! m-h-ne-inv NE embed-raw x))
     (step! (str "(" layers-name " 0 " layers ")"))
-    (dispatch! (ops "rmsnorm") PF 1 1 (if dense? m-dnorm m-norm) x-final w-out-norm zeros16 hN zeros16 zeros16)   ;; dense: rows of NE (iteration 59: with n = 2048 the norm of a 896-wide row diluted the rms by sqrt(2048/896) -- argmax-invariant, distribution-wrong, and rows >= 1 read the wrong offset)
+    (if boundary-fuse?
+      ;; Iteration 19 (fn tail): the last layer's skipped add + the final norm
+      ;; in one add_rmsnorm (x-final = resid + ffn materializes here).
+      (dispatch! (ops "add_rmsnorm") PF 1 1 m-daddn resid ffn w-out-norm x-final hN zeros16)
+      (dispatch! (ops "rmsnorm") PF 1 1 (if dense? m-dnorm m-norm) x-final w-out-norm zeros16 hN zeros16 zeros16))   ;; dense: rows of NE (iteration 59: with n = 2048 the norm of a 896-wide row diluted the rms by sqrt(2048/896) -- argmax-invariant, distribution-wrong, and rows >= 1 read the wrong offset)
     (when bonsai? (hdispatch! m-h-ne-fwd NE hN hrot))
     (if (and i8-lm (not (and batch? (:lm-once layouts))))   ;; :lm-once wins over int8 in the batch step (tick 55)
       (let [[xq xs] (quant! hN (* PF 2048) hN-i8)] (dispatch! i8-lm (wg-of (:lm-i8 layouts) NV) (if batch? PF 1) 1 m-lm w-lm xq logits zerosP xs))   ;; batch: B rows of int8 logits
@@ -937,6 +972,9 @@
         ;; nvgpu: bandwidth / issue bound on it); anv's x8r4 with the positions dispatch beats the f32 kernel even read B times
         (and batch? (:lm-once layouts)) (dispatch! kdot-p (pwg NV) 1 1 m-lm w-lm hN logits zerosP)
         batch? (dispatch! kdot-lm (wg-of (:lm layouts) NV) PF 1 m-lm w-lm hN logits zerosP)
+        ;; iterations 14/18 (decode): 4-8 lm rows per workgroup (the tail's main cost)
+        (and kdot-lm-r8 (not batch?) (not prefill?) (not bp?)) (dispatch! kdot-lm-r8 (wg-of (:lm-r8 layouts) NV) 1 1 m-lm w-lm (if bonsai? hrot hN) logits zeros16)
+        (and kdot-lm-r4 (not batch?) (not prefill?) (not bp?)) (dispatch! kdot-lm-r4 (wg-of (:lm-r4 layouts) NV) 1 1 m-lm w-lm (if bonsai? hrot hN) logits zeros16)
         :else (dispatch! kdot-lm (wg-of (:lm layouts) NV) 1 1 m-lm w-lm (if bonsai? hrot hN) logits zeros16)))
     (if (or sampling sampled?)
       ;; multi-workgroup sampler (iteration 19): 61-workgroup passes, 30 bisection rounds on tau, one final pass
