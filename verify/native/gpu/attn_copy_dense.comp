@@ -4,12 +4,18 @@
 // ONE dispatch — fusion iteration 13 (G1 kernel-count roadmap; the launch-
 // bound class where fusion pays: >= 2 launches removed + buffer round trips).
 //
-// Phase 1 (per workgroup = one query head): write THIS position's k and v
-// slice into the cache — the same addresses op_copy_at wrote (each workgroup
-// writes only its own kv-head slice, so the 14 workgroups never share a
-// location: no write races, and the union is exactly the old full-row copy).
-// Phase 2: op_attn_decode's decode math VERBATIM over the cache (which now
-// includes the just-written row, exactly as the copy-then-attn order gave).
+// Phase 1: write THIS position's k and v row into the cache for FUTURE
+// dispatches — ONLY the first query head of each kv group writes (one writer
+// per location: no write races under GQA where several query heads share an
+// hkv), and nothing in THIS dispatch reads the written locations.
+// Phase 2: op_attn_decode's decode math verbatim, except that the CURRENT
+// position's row is read directly from DK/DV instead of the cache — so the
+// attention has NO dependency on phase 1 (no intra-dispatch cross-workgroup
+// ordering is needed or implied; review findings on this PR: the first
+// version read the just-written cache row, which needed both a correct
+// barrier order and cross-workgroup visibility, and raced under GQA).
+// Cross-dispatch visibility is the dispatch chain's barrier, which is exactly
+// what the old copy-then-attn order relied on.
 //
 // Decode only, dense decoders only (p0 != 0: no output gate — the `s` slot
 // carries dv instead). T <= 256 positions per step, same as op_attn_decode's
@@ -45,20 +51,28 @@ void main() {
   uint hkv = h / (P.rows / P.aux2);
   uint qoff = row * P.rows * d;
 
-  // phase 1: this position's k and v slice into the cache (op_copy_at's write,
-  // per kv-head slice; off = dyn_pos() * aux2 as in op_copy_at's dynamic path)
-  uint coff = dyn_pos() * P.aux2 * d + hkv * d;
-  for (uint i = t; i < d; i += 256u) {
-    b[coff + i] = dk[hkv * d + i];
-    c[coff + i] = dv[hkv * d + i];
+  // phase 1: this position's k and v row into the cache for future dispatches
+  // (op_copy_at's addresses: dyn_pos() * aux2 row stride). ONE writer per
+  // location: the first query head of the kv group. No synchronization needed
+  // here — nothing in this dispatch reads these locations.
+  if (h % (P.rows / P.aux2) == 0u) {
+    uint coff = dyn_pos() * P.aux2 * d + hkv * d;
+    for (uint i = t; i < d; i += 256u) {
+      b[coff + i] = dk[hkv * d + i];
+      c[coff + i] = dv[hkv * d + i];
+    }
   }
-  barrier(); memoryBarrierBuffer();
 
-  // phase 2: op_attn_decode's decode math verbatim
+  // phase 2: op_attn_decode's decode math verbatim, with the current row read
+  // from DK/DV (identical values — the cache copy wrote exactly these bits)
+  uint pos = dyn_pos();
   float sc = -1e30;
   if (t < T) {
     float dt = 0.0;
-    for (uint i = 0u; i < d; i++) dt += a[qoff + h * d + i] * b[(t * P.aux2 + hkv) * d + i];
+    for (uint i = 0u; i < d; i++) {
+      float kv = (t == pos) ? dk[hkv * d + i] : b[(t * P.aux2 + hkv) * d + i];
+      dt += a[qoff + h * d + i] * kv;
+    }
     sc = dt * P.scale;
   }
   red[t] = sc; barrier();
@@ -70,7 +84,10 @@ void main() {
   red[t] = p; barrier();
   for (uint i = t; i < d; i += 256u) {
     float acc = 0.0;
-    for (uint tt = 0u; tt < T; tt++) acc += red[tt] * c[(tt * P.aux2 + hkv) * d + i];
+    for (uint tt = 0u; tt < T; tt++) {
+      float vv = (tt == pos) ? dv[hkv * d + i] : c[(tt * P.aux2 + hkv) * d + i];
+      acc += red[tt] * vv;
+    }
     o[qoff + h * d + i] = acc;   // P.p0 != 0: no output gate (dense decoders)
   }
 }
