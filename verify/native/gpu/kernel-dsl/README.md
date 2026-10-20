@@ -39,6 +39,19 @@ Single kernel source → GLSL/SPIR-V + MSL, replacing the hand-maintained twins
 4. Performance within ±10% of the hand GLSL (symmetric best-of), recorded —
    the DSL is not allowed to be a silent slowdown.
 
+## The migration series (JUN-139 items 2-4)
+
+| # | kernel | new vocabulary | blocks |
+|---|---|---|---|
+| 1 | kdot Q8_0 (done) | term8 / acc-chain / reduce | — |
+| 2 | qkvr (source written) | :bias-add, :rope (:neox + :identity) | the emitter's multi-binding + pair skeleton |
+| 3 | atncopy | the cache-write slice, the softmax attention reduce | the op's max/exp/sum reduce order |
+| 4 | nex ops (rmsnorm / add_rmsnorm / silu / add) | the wg_sum tree, elementwise chains | — |
+
+The migration rule: every kernel lands only with the same acceptance (compile
+x2, the CPU-reference gate, the mutual-in-budget check, symmetric perf within
++-10% of its hand baseline).
+
 ## Status
 
 - [x] milestone 1 design (this file + the DSL source)
