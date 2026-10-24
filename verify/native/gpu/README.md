@@ -12,11 +12,11 @@ this file are history: amu #1459 removed `kexe_loader.c`, and the owner chose
 GPU execution through Amu selfhost and Kotoba. That route is Amu's work (a
 Kotoba Vulkan loader, a native kernel driver, or browser WebGPU). Until it
 exists, nothing here runs on a GPU. The kernels stay inference's to choose, by
-name, in the layout table. Eleven kdot names now come from Amu's KIR v2
-modules instead of their glslang builds: ten of the layout table's, and
-`gen_kdot_guest`'s `x8r8`. They are pinned by SHA-256 in
-[`kir2/artifacts.edn`](kir2/artifacts.edn) and staged by a native Kotoba gate.
-See [`kir2/README.md`](kir2/README.md).
+name, in the layout table. 89 of the names now come from Amu's KIR v2 modules
+instead of their glslang builds: the kdot family, the nex ops and their batch
+twins, deltanet, embed, `attn_copy_dense` and `dot_rows`. They are pinned by
+SHA-256 in [`kir2/artifacts.edn`](kir2/artifacts.edn) and staged by a native
+Kotoba gate. See [`kir2/README.md`](kir2/README.md).
 
 | file | what |
 |---|---|
