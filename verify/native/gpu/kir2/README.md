@@ -66,10 +66,32 @@ them. To use them on a box, copy STAGE's files into the guests' SPIR-V
 directory (`gen_decode_tokens_guest`'s directory argument, or `KDOT_SPV_DIR`
 for `gen_kdot_guest`).
 
-## What the eleven modules replace
+## What the table covers
 
-Ten of the names are in the decode guest's layout table. `kdot_x8r8` is
-`gen_kdot_guest`'s `x8r8` layout.
+89 of Amu's 105 modules, under the names the guests load:
+
+| family | names | from |
+|---|---|---|
+| kdot | `kdot_f32_r1`, `kdot_f32_r4/r8/r16/r32`, `kdot_x8r4`, `kdot_x8r8`, `kdot_i8_x8r4`, `kdot_h2_r1`, `kdot_h2q6_r1`, `kdot_h2q8_r4/r8`, `kdot_h2_qkv_q8`, `kdot_h2_qkvr_q8` | the layout tables of `gen_decode_tokens_guest.cljk`, and `gen_kdot_guest`'s layouts |
+| nex ops | `nex_<op>` for the decode guest's 28 ops, `nex_quant_q8`, `nex_rope_neox_bias` | `nex_ops.comp -DOP=<op>` (and `-DBIAS`) |
+| batch twins | `nex_<op>_b` (13 ops) and `nex_<op>_bp` (5 ops) | `-DBATCH` / `-DBPREFILL` |
+| deltanet | `deltanet_step`, `deltanet_fused`, `deltanet_fused_b`, `deltanet_fused_bp` | `deltanet_step.comp`, `deltanet_fused.comp` |
+| embed | `embed_{iq4xs,q8,q40,q41,q50,q51,ptq1}` and their `_b`, `_bp` | `embed_iq4xs.comp` with `-DQ8`, `-DB32=2/3/6/7` or `-DPTQ1` |
+| other | `attn_copy_dense`, `dot_rows` | their own `.comp` |
+
+`embed_ptq1_b` and `embed_ptq1_bp` are in the table but unreachable today:
+the decode guest refuses batch and prefill for Prism Bonsai, the only PTQ1_0
+embedding.
+
+Amu's other 16 modules stay out:
+* **No guest loads them:** `nex-gate_decay`, `nex-sample_topp` and
+  `nex-rope_neox-batch-bias` (rope-bias is decode-only).
+* **No documented layout names them:** `kdot-x8r16` and `kdot-i8-x8r8/16`.
+  `gen_kdot_guest` does not validate its layout string, so `x8r16`, `i8x8r8`
+  and `i8x8r16` would load them, but its usage lists none of the three and
+  nothing in the repo invokes them.
+* **No GPU pair in the receipt:** `kdot-x8r32` and `kdot-i8-x8r32`.
+* **Amu's own `ewise` kernels:** eight modules.
 
 For every entry, three things hold:
 * **glslang of `:replaces` is `:ref`.** Inference's own source, built by
@@ -82,7 +104,9 @@ For every entry, three things hold:
 * **The table pins the receipt's module.**
 
 Those GPU runs are historical receipts, of a route amu main no longer builds.
-The record of this table is `verify/evidence/kir2-artifacts-20261024.json`.
+The records of this table are in `verify/evidence/`:
+* `kir2-artifacts-20261024.json`: the first 11 kdot modules;
+* `kir2-artifacts-slice2-20261024.json`: all 89.
 
 ## Not covered yet (JUN-375's remaining slices)
 
@@ -90,17 +114,13 @@ The record of this table is `verify/evidence/kir2-artifacts-20261024.json`.
   rel ≤1e-3, h2 rms ≤1e-2, the argmax pick equal to f64's) and the speed gate
   (≤1.25× glslang's) wait for Amu's executor routes: a Kotoba loader for the
   system Vulkan stack, a native kernel driver, or browser WebGPU.
-* **The other kernels Amu builds**:
-  * the nex ops and their batch twins, deltanet, embed, `attn_copy_dense`,
-    `dot_rows` and the rope-bias variant;
-  * the kdot row variants `gen_kdot_guest` can name: `kdot-f32-r8-rows4/16/32`,
-    `kdot-x8r16/32` and `kdot-i8-x8r8/16/32`.
-
-  They are the next entries for this table.
-* **Kernels Amu has no module for**, which still come from glslang: the
-  prefill `kdot_f32_p<P>[r<R>]`, `kdot_s*` (`nvgpu-exact`, Xavier's dense
-  path), `kdot_f32_r8_dual`, `kdot_ptq1_dual_r1`, `hadamard_signed`,
-  `kdot_h2_swiglu` and `kdot_h2_swres`.
+* **Kernels Amu has no module for**, which still come from glslang:
+  * the prefill `kdot_f32_p<P>[r<R>]`;
+  * `kdot_s*` (`nvgpu-exact`, Xavier's dense path);
+  * `kdot_i8_r8` (`gen_kdot_guest`'s `i8r8` layout);
+  * `kdot_f32_r8_dual`, `kdot_ptq1_dual_r1`, `hadamard_signed`;
+  * `kdot_h2_swiglu`, `kdot_h2_swres`;
+  * the `mem_probe` / `mem_probe_u32` probes.
 * **`emit-kernel.cljk`** (its MSL twins for Metal included), and the CLJK
   generators of the guests.
 * **Xavier** (aarch64, nvgpu) and **macOS** (Metal).
