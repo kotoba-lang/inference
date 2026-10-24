@@ -19,7 +19,9 @@
         "bytes": 3211776,
         "sha256": "bd0254759e442533ead3e190f361257725667ea252a83b3575a3fb0d65becb66"
       },
-      "gpu": "Radeon 8060S Graphics (RADV GFX1151)|1.4.318|1024|1"
+      "gpu": "Radeon 8060S Graphics (RADV GFX1151)|1.4.318|1024|1",
+      "int8": "ran",
+      "h2": "ran, and again with RADV_PERFTEST=cswave32"
     },
     "build": {
       "status": "PASS_GPU_KERNEL_SPIRV_BUILD_AND_ORACLE",
@@ -37,14 +39,14 @@
     }
   },
   "files": {
-    "artifacts.edn": "0b7845d86b05510e37d93a51bc2bd4da3a9f71c74eb742ab7ea1ffaa78b1c458",
-    "kir2_artifacts.kotoba": "ad2d8357ad30e8afa6721fd83ed7495a0d626328accaebffb6b4c0c3620d009e",
-    "fetch.sh": "f5ddb9e19f615011fbe0edf2342d576162cc6b71920220901bd9fe20ee0538e4"
+    "artifacts.edn": "337e07d9484d0bd2c427d1780354646d3aadc4a56587867db0071e4ac0f41297",
+    "kir2_artifacts.kotoba": "12abe1548af434a8345d870236b6a69f62d615bff5c406822375624671423d29",
+    "fetch.sh": "bd6cc4ddad5078d365fbc49c8373f285fa0f9c757725f32a00e2c26d29fe89f9"
   },
   "fetch": {
-    "summary": "{:fetch :kotoba-inference.kir2-fetch/v1 :root {:sha256 \"688324e0fdc7a93a664ae55fe0ad417e7a980ab844656f3f97889812363c9479\"} :gate {:source {:sha256 \"ad2d8357ad30e8afa6721fd83ed7495a0d626328accaebffb6b4c0c3620d009e\"} :image {:sha256 \"be04fc764ccb1ef115d6c7b762996e62451d4b017f5404c5d0a095aa2a273436\"}} :fetch-sh {:sha256 \"f5ddb9e19f615011fbe0edf2342d576162cc6b71920220901bd9fe20ee0538e4\"} :container \"docker.io/library/python@sha256:57f679a3910bed1eb16ad722b904a118bca8586ec8ad39d98dd13350e7062cb2\" :run :green :artifacts 11 :controls {:module-byte :red-by-name :pin-digit :red-by-name :receipt-digit :red-by-name :pair-swap :red-by-name}}",
-    "gateReceipt": "{:receipt :kotoba-inference.kir2-artifacts/v1 :table {:path \"/inference/verify/native/gpu/kir2/artifacts.edn\" :sha256 \"0b7845d86b05510e37d93a51bc2bd4da3a9f71c74eb742ab7ea1ffaa78b1c458\"} :amu-receipt {:path \"docs/evidence/gpu-kernel-kir2-h2-20261024/gad-radv.json\" :sha256 \"794359630825091c88c2964f0fe0b427ed878c7c490c2d6d4399d5050f6b7b6a\"} :stage \"/gate/stage\" :artifacts 11 :staged 11 :failed 0}",
-    "gateReport": "{:status :ok :result 0 :fuel {:initial 4000000000 :remaining 3986630851}}",
+    "summary": "{:fetch :kotoba-inference.kir2-fetch/v1 :root {:sha256 \"688324e0fdc7a93a664ae55fe0ad417e7a980ab844656f3f97889812363c9479\"} :gate {:source {:sha256 \"12abe1548af434a8345d870236b6a69f62d615bff5c406822375624671423d29\"} :image {:sha256 \"0cae4830239ffa70d386b01bdd5b5ff47ddd0e0604927b0a3bca3340de78e0f3\"}} :fetch-sh {:sha256 \"bd6cc4ddad5078d365fbc49c8373f285fa0f9c757725f32a00e2c26d29fe89f9\"} :container \"docker.io/library/python@sha256:57f679a3910bed1eb16ad722b904a118bca8586ec8ad39d98dd13350e7062cb2\" :run :green :artifacts 11 :controls {:module-byte :red-by-name :pin-digit :red-by-name :receipt-digit :red-by-name :pair-swap :red-by-name :ref-swap :red-by-name}}",
+    "gateReceipt": "{:receipt :kotoba-inference.kir2-artifacts/v1 :table {:path \"/inference/verify/native/gpu/kir2/artifacts.edn\" :sha256 \"337e07d9484d0bd2c427d1780354646d3aadc4a56587867db0071e4ac0f41297\"} :amu-receipt {:path \"docs/evidence/gpu-kernel-kir2-h2-20261024/gad-radv.json\" :sha256 \"794359630825091c88c2964f0fe0b427ed878c7c490c2d6d4399d5050f6b7b6a\"} :stage \"/gate/stage\" :artifacts 11 :staged 11 :failed 0}",
+    "gateReport": "{:status :ok :result 0 :fuel {:initial 4000000000 :remaining 3986504496}}",
     "oracle": [
       "ORACLE kdot_f32_r1.spv: glslang of resources/kotodama/inference/kernels/native/kdot_f32_r1.comp = Amu's ref-kdot-f32-r1.spv",
       "ORACLE kdot_f32_r8.spv: glslang of verify/native/gpu/kdot_f32_r8.comp = Amu's ref-kdot-f32-r8.spv",
@@ -58,27 +60,35 @@
       "ORACLE kdot_h2_qkv_q8.spv: glslang of verify/native/gpu/kdot_h2_qkv_q8.comp = Amu's ref-kdot-h2-qkv-q8.spv",
       "ORACLE kdot_h2_qkvr_q8.spv: glslang of verify/native/gpu/kdot_h2_qkvr_q8.comp = Amu's ref-kdot-h2-qkvr-q8.spv"
     ],
+    "oracleControl": [
+      "ORACLE-CONTROL verify/native/gpu/kdot_x8r8.comp without -DROWS=4 is not Amu's ref-kdot-x8r8-rows4.spv, as required"
+    ],
     "glslang": "Glslang Version: 11:16.6.0",
     "controls": {
       "ctl-module": [
         "FAIL sha256 kdot_f32_r1.spv: kir2-kdot-f32-r1.spv is 28976 5f146ece59dd5d1015c2d966ae740c0af8930cdcaa083729788ebf042fdb9321",
         "FAILED 1",
-        "{:status :ok :result 1 :fuel {:initial 4000000000 :remaining 3993910877}}"
+        "{:status :ok :result 1 :fuel {:initial 4000000000 :remaining 3993784478}}"
       ],
       "ctl-pin": [
         "FAIL receipt kdot_f32_r1.spv: the table pins 28976 0e3db7b3b41b644d2c464b06eb1c327a67b8506e5ecd1343d381256962e1e384, the receipt's build has 28976 ee3db7b3b41b644d2c464b06eb1c327a67b8506e5ecd1343d381256962e1e384",
         "FAILED 1",
-        "{:status :ok :result 1 :fuel {:initial 4000000000 :remaining 3994267646}}"
+        "{:status :ok :result 1 :fuel {:initial 4000000000 :remaining 3994141291}}"
       ],
       "ctl-receipt": [
         "FAIL receipt sha256 docs/evidence/gpu-kernel-kir2-h2-20261024/gad-radv.json is 794359630825091c88c2964f0fe0b427ed878c7c490c2d6d4399d5050f6b7b6a, the table pins 094359630825091c88c2964f0fe0b427ed878c7c490c2d6d4399d5050f6b7b6a",
         "FAILED 1",
-        "{:status :ok :result 1 :fuel {:initial 4000000000 :remaining 3993910958}}"
+        "{:status :ok :result 1 :fuel {:initial 4000000000 :remaining 3993784607}}"
       ],
       "ctl-pair": [
         "FAIL pair kdot_f32_r1.spv: the GPU pair v2-kdot is 28976 ee3db7b3b41b644d2c464b06eb1c327a67b8506e5ecd1343d381256962e1e384, not 25256 72bf25f32088ff0e083f7ddce8f00b607d5017cb5ffc207a71add1d38500dae0",
         "FAILED 1",
-        "{:status :ok :result 1 :fuel {:initial 4000000000 :remaining 3994267651}}"
+        "{:status :ok :result 1 :fuel {:initial 4000000000 :remaining 3994141296}}"
+      ],
+      "ctl-ref": [
+        "FAIL pair kdot_f32_r1.spv: the GPU pair ref-kdot is 41168 da479ae73eceecc55e37299693a7ec015a2ade1d6021c45a131a61422873e2ef, not ref-kdot-f32-r8.spv 34972 bcc12a3f38de8d70c919dc998fe762bb4cb77350269fa5663607b84f9e2ee4d2",
+        "FAILED 1",
+        "{:status :ok :result 1 :fuel {:initial 4000000000 :remaining 3994141297}}"
       ]
     }
   },
@@ -90,7 +100,9 @@
       "entry commented out with ;;": "FAIL a comment inside the table's artifacts",
       "entry discarded with #_": "FAIL a comment inside the table's artifacts",
       "duplicate :spv": "FAIL duplicate kdot_f32_r1.spv",
-      "wrong :ref (x8r4 -> ref-kdot-x8r8)": "FAIL pair kdot_x8r4.spv: the GPU pair ref-kdotx4 is ..., not ref-kdot-x8r8.spv ..."
+      "wrong :ref (x8r4 -> ref-kdot-x8r8)": "FAIL pair kdot_x8r4.spv: the GPU pair ref-kdotx4 is ..., not ref-kdot-x8r8.spv ...",
+      "receipt re-pinned with int8 skipped": "FAIL receipt docs/evidence/gpu-kernel-kir2-h2-20261024/gad-radv.json: its int8 or h2 kernels did not run",
+      "refs.json define of ref-kdot-f32-r8 changed": "FAIL ref kdot_f32_r8.spv: today's ref-kdot-f32-r8.spv is ... \"ROWS=8\", the receipt's ... null"
     }
   },
   "artifacts": [

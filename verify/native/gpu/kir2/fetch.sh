@@ -17,15 +17,18 @@
 # 2. build (arm64 Linux container): Amu selfhost writes the KIR v2 modules,
 #    using the pinned root seed/bootstrap/aarch64-linux-static-root.elf.
 # 3. oracle (this host): Amu's spirv-val and spirv-dis over every module.
-#    Then inference's oracle: glslang of each artifact's :replaces must be
-#    byte-identical to Amu's glslang module :ref. It ties the name the guests
-#    load to the kernel Amu ran (see the gate's GPU pair check).
+#    Then inference's oracle (glslangValidator): glslang of each artifact's
+#    :replaces must be byte-identical to Amu's glslang module :ref. It ties the
+#    name the guests load to the kernel Amu ran (see the gate's GPU pair and
+#    refs.json checks). Its control: the first artifact with a define, built
+#    without it, must differ from its :ref.
 # 4. gate (the same container): the same root compiles kir2_artifacts.kotoba
-#    to a static image. Four negative controls must each fail by name:
+#    to a static image. Five negative controls must each fail by name:
 #    * one byte of a module changed;
 #    * one hex digit of a module's pin changed;
 #    * one hex digit of the receipt's pin changed;
-#    * an artifact pointing at its neighbour's module, with that module's pin.
+#    * an artifact pointing at its neighbour's module, with that module's pin;
+#    * an artifact naming its neighbour's glslang reference.
 #    Then the gate checks every artifact and stages them, inside WORK.
 #
 # glslang and spirv-val run only as oracles. The staged modules are Amu's
@@ -64,22 +67,23 @@ if [ "${1:-}" = "--gate" ]; then
 
   # control 1: byte 100 of the first artifact's module, plus one. The gate's
   # digest of the changed file must be sha256sum's
-  mkdir /gate/ctl-spv
-  cp /out/spv/kir2-*.spv /gate/ctl-spv/
-  b=$(dd if="/gate/ctl-spv/$amu" bs=1 skip=100 count=1 2>/dev/null | od -An -tu1 | tr -d ' ')
-  printf "\\$(printf '%03o' $(( (b + 1) % 256 )))" | dd of="/gate/ctl-spv/$amu" bs=1 seek=100 conv=notrunc 2>/dev/null
-  gate "$TABLE" /amu /gate/ctl-spv - > /gate/ctl-module.out 2>&1 || true
-  red_as /gate/ctl-module.out "sha256 $spv: $amu is $(wc -c < "/gate/ctl-spv/$amu" | tr -d ' ') $(sha256sum "/gate/ctl-spv/$amu" | cut -d' ' -f1)\$" \
+  mkdir /gate/ctl-out
+  cp -R /out/spv /out/refs /gate/ctl-out/
+  m=/gate/ctl-out/spv/$amu
+  b=$(dd if="$m" bs=1 skip=100 count=1 2>/dev/null | od -An -tu1 | tr -d ' ')
+  printf "\\$(printf '%03o' $(( (b + 1) % 256 )))" | dd of="$m" bs=1 seek=100 conv=notrunc 2>/dev/null
+  gate "$TABLE" /amu /gate/ctl-out - > /gate/ctl-module.out 2>&1 || true
+  red_as /gate/ctl-module.out "sha256 $spv: $amu is $(wc -c < "$m" | tr -d ' ') $(sha256sum "$m" | cut -d' ' -f1)\$" \
     || { cat /gate/ctl-module.out; echo "RED: control 1 (a changed module) did not fail by name"; exit 1; }
 
   # control 2: the first hex digit of the first artifact's pin, changed
   flip ':sha256 "' > /gate/ctl-artifacts.edn
-  gate /gate/ctl-artifacts.edn /amu /out/spv - > /gate/ctl-pin.out 2>&1 || true
+  gate /gate/ctl-artifacts.edn /amu /out - > /gate/ctl-pin.out 2>&1 || true
   red_as /gate/ctl-pin.out "receipt $spv:" || { cat /gate/ctl-pin.out; echo "RED: control 2 (a changed pin) did not fail by name"; exit 1; }
 
   # control 3: the first hex digit of the receipt's pin, changed
   flip ':amu/receipt-sha256 "' > /gate/ctl-receipt.edn
-  gate /gate/ctl-receipt.edn /amu /out/spv - > /gate/ctl-receipt.out 2>&1 || true
+  gate /gate/ctl-receipt.edn /amu /out - > /gate/ctl-receipt.out 2>&1 || true
   red_as /gate/ctl-receipt.out "receipt sha256 " || { cat /gate/ctl-receipt.out; echo "RED: control 3 (a changed receipt pin) did not fail by name"; exit 1; }
 
   # control 4: the first artifact names the second's module, bytes and pin;
@@ -87,12 +91,18 @@ if [ "${1:-}" = "--gate" ]; then
   awk -v a="$(value ':amu' /gate/second.line)" -v n="$(value ':bytes' /gate/second.line)" -v h="$(value ':sha256' /gate/second.line)" \
     'd == 0 && index($0, "{:spv \"") { sub(/:amu "[^"]*"/, ":amu \"" a "\""); sub(/:bytes [0-9]+/, ":bytes " n); sub(/:sha256 "[0-9a-f]*"/, ":sha256 \"" h "\""); d = 1 } { print }' \
     "$TABLE" > /gate/ctl-pair.edn
-  gate /gate/ctl-pair.edn /amu /out/spv - > /gate/ctl-pair.out 2>&1 || true
-  red_as /gate/ctl-pair.out "pair $spv:" || { cat /gate/ctl-pair.out; echo "RED: control 4 (a module swapped in) did not fail by name"; exit 1; }
+  gate /gate/ctl-pair.edn /amu /out - > /gate/ctl-pair.out 2>&1 || true
+  red_as /gate/ctl-pair.out "pair $spv: the GPU pair v2-" || { cat /gate/ctl-pair.out; echo "RED: control 4 (a module swapped in) did not fail by name"; exit 1; }
+
+  # control 5: the first artifact names the second's glslang reference
+  awk -v r="$(value ':ref' /gate/second.line)" 'd == 0 && index($0, "{:spv \"") { sub(/:ref "[^"]*"/, ":ref \"" r "\""); d = 1 } { print }' \
+    "$TABLE" > /gate/ctl-ref.edn
+  gate /gate/ctl-ref.edn /amu /out - > /gate/ctl-ref.out 2>&1 || true
+  red_as /gate/ctl-ref.out "pair $spv: the GPU pair ref-" || { cat /gate/ctl-ref.out; echo "RED: control 5 (a reference swapped in) did not fail by name"; exit 1; }
 
   # the run: check, then stage inside WORK
   mkdir /gate/stage
-  gate "$TABLE" /amu /out/spv /gate/stage > /gate/run.out 2>&1 || true
+  gate "$TABLE" /amu /out /gate/stage > /gate/run.out 2>&1 || true
   cat /gate/run.out
   n=$(grep -c ':sha256 "' "$TABLE")
   if grep -q '^FAIL ' /gate/run.out || ! grep -q '^FAILED 0$' /gate/run.out || ! grep -q "^ARTIFACTS $n\$" /gate/run.out \
@@ -103,7 +113,7 @@ if [ "${1:-}" = "--gate" ]; then
   echo "{:fetch :kotoba-inference.kir2-fetch/v1 :root {:sha256 \"$(sha256sum "$ROOT" | cut -d' ' -f1)\"}" \
     ":gate {:source {:sha256 \"$(sha256sum /gate/kir2_artifacts.kotoba | cut -d' ' -f1)\"} :image {:sha256 \"$(sha256sum /gate/kir2_artifacts.elf | cut -d' ' -f1)\"}}" \
     ":fetch-sh {:sha256 \"$(sha256sum /inference/verify/native/gpu/kir2/fetch.sh | cut -d' ' -f1)\"} :container \"$IMAGE\"" \
-    ":run :green :artifacts $n :controls {:module-byte :red-by-name :pin-digit :red-by-name :receipt-digit :red-by-name :pair-swap :red-by-name}}"
+    ":run :green :artifacts $n :controls {:module-byte :red-by-name :pin-digit :red-by-name :receipt-digit :red-by-name :pair-swap :red-by-name :ref-swap :red-by-name}}"
   exit 0
 fi
 
@@ -142,6 +152,15 @@ while IFS= read -r line; do
   cmp -s "$WORK/oracle/$spv" "$WORK/out/refs/$ref" || { echo "RED: glslang of $rep is not Amu's $ref" >&2; exit 1; }
   echo "ORACLE $spv: glslang of $rep = Amu's $ref"
 done < "$WORK/oracle/artifacts.lines"
+# the oracle's control: without its defines, the first such artifact's source is not its :ref
+line=$(grep ' -D' "$WORK/oracle/artifacts.lines" | sed -n 1p)
+ref=$(printf '%s\n' "$line" | sed 's/^.* :ref "\([^"]*\)".*$/\1/')
+rep=$(printf '%s\n' "$line" | sed 's/^.* :replaces "\([^"]*\)".*$/\1/')
+glslangValidator -V --target-env vulkan1.1 "$INF/${rep%% *}" -o "$WORK/oracle/control.spv" > "$WORK/oracle/control.log" 2>&1
+if cmp -s "$WORK/oracle/control.spv" "$WORK/out/refs/$ref"; then
+  echo "RED: the oracle's control (${rep%% *} without its defines) matched $ref" >&2; exit 1
+fi
+echo "ORACLE-CONTROL ${rep%% *} without ${rep#* } is not Amu's $ref, as required"
 
 cp "$HERE/kir2_artifacts.kotoba" "$WORK/gate/"
 "$CONTAINER" run --rm --platform linux/arm64 -v "$WORK/amu:/amu:ro" -v "$INF:/inference:ro" -v "$WORK/out:/out:ro" \

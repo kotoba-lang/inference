@@ -24,7 +24,7 @@
 ;;            (fetch.sh checks it on every fetch)
 ;;
 ;; One artifact per line, keys in this order: kir2_artifacts.kotoba reads the
-;; table as text. ASCII only, and no comment inside :artifacts.
+;; table as text. ASCII only, and no comment from :artifacts to the end.
 {:amu/commit "372243efbf2826590d57207e92792f32f0722440"
  :amu/receipt "docs/evidence/gpu-kernel-kir2-h2-20261024/gad-radv.json"
  :amu/receipt-sha256 "794359630825091c88c2964f0fe0b427ed878c7c490c2d6d4399d5050f6b7b6a"
