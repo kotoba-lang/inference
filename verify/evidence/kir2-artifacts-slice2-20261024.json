@@ -175,11 +175,16 @@
     "noInferenceLoader": [
       "kir2-nex-gate_decay.spv",
       "kir2-nex-sample_topp.spv",
-      "kir2-nex-rope_neox-batch-bias.spv",
-      "kir2-kdot-x8r16.spv",
-      "kir2-kdot-i8-x8r8.spv",
-      "kir2-kdot-i8-x8r16.spv"
+      "kir2-nex-rope_neox-batch-bias.spv"
     ],
+    "noDocumentedLayout": {
+      "modules": [
+        "kir2-kdot-x8r16.spv",
+        "kir2-kdot-i8-x8r8.spv",
+        "kir2-kdot-i8-x8r16.spv"
+      ],
+      "note": "gen_kdot_guest would accept the undocumented layouts x8r16, i8x8r8 and i8x8r16; nothing in the repo invokes them"
+    },
     "noGpuPair": [
       "kir2-kdot-x8r32.spv",
       "kir2-kdot-i8-x8r32.spv"
@@ -2959,7 +2964,8 @@
   "gpuHistory": "gad-radv.json (RADV GFX1151) and b70-anv.json (ANV) are provider-era runs: each GPU pair ran v2-<gpu> and ref-<gpu> to identical output bytes. That route is not buildable on amu main; these are historical receipts, not this slice's execution.",
   "notCovered": [
     "executing the modules: numeric gates (f32 rel <=1e-3, h2 rms <=1e-2, argmax == f64) and speed (<=1.25x glslang) wait for Amu's executor routes",
-    "kernels with no Amu module: kdot_f32_p*, kdot_s*, kdot_f32_r8_dual, kdot_ptq1_dual_r1, hadamard_signed, kdot_h2_swiglu, kdot_h2_swres",
+    "kernels with no Amu module: kdot_f32_p*, kdot_s*, kdot_i8_r8, kdot_f32_r8_dual, kdot_ptq1_dual_r1, hadamard_signed, kdot_h2_swiglu, kdot_h2_swres, mem_probe, mem_probe_u32",
+    "embed_ptq1_b and embed_ptq1_bp are in the table but unreachable today: the decode guest refuses batch and prefill for Prism Bonsai, the only PTQ1_0 embedding",
     "emit-kernel.cljk and its MSL twins; the CLJK guest generators",
     "Xavier (nvgpu) and macOS (Metal)"
   ]

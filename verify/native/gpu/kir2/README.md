@@ -79,9 +79,17 @@ for `gen_kdot_guest`).
 | embed | `embed_{iq4xs,q8,q40,q41,q50,q51,ptq1}` and their `_b`, `_bp` | `embed_iq4xs.comp` with `-DQ8`, `-DB32=2/3/6/7` or `-DPTQ1` |
 | other | `attn_copy_dense`, `dot_rows` | their own `.comp` |
 
+`embed_ptq1_b` and `embed_ptq1_bp` are in the table but unreachable today:
+the decode guest refuses batch and prefill for Prism Bonsai, the only PTQ1_0
+embedding.
+
 Amu's other 16 modules stay out:
-* **No guest loads them:** `nex-gate_decay`, `nex-sample_topp`,
-  `nex-rope_neox-batch-bias`, `kdot-x8r16` and `kdot-i8-x8r8/16`.
+* **No guest loads them:** `nex-gate_decay`, `nex-sample_topp` and
+  `nex-rope_neox-batch-bias` (rope-bias is decode-only).
+* **No documented layout names them:** `kdot-x8r16` and `kdot-i8-x8r8/16`.
+  `gen_kdot_guest` does not validate its layout string, so `x8r16`, `i8x8r8`
+  and `i8x8r16` would load them, but its usage lists none of the three and
+  nothing in the repo invokes them.
 * **No GPU pair in the receipt:** `kdot-x8r32` and `kdot-i8-x8r32`.
 * **Amu's own `ewise` kernels:** eight modules.
 
@@ -106,10 +114,13 @@ The records of this table are in `verify/evidence/`:
   rel ≤1e-3, h2 rms ≤1e-2, the argmax pick equal to f64's) and the speed gate
   (≤1.25× glslang's) wait for Amu's executor routes: a Kotoba loader for the
   system Vulkan stack, a native kernel driver, or browser WebGPU.
-* **Kernels Amu has no module for**, which still come from glslang: the
-  prefill `kdot_f32_p<P>[r<R>]`, `kdot_s*` (`nvgpu-exact`, Xavier's dense
-  path), `kdot_f32_r8_dual`, `kdot_ptq1_dual_r1`, `hadamard_signed`,
-  `kdot_h2_swiglu` and `kdot_h2_swres`.
+* **Kernels Amu has no module for**, which still come from glslang:
+  * the prefill `kdot_f32_p<P>[r<R>]`;
+  * `kdot_s*` (`nvgpu-exact`, Xavier's dense path);
+  * `kdot_i8_r8` (`gen_kdot_guest`'s `i8r8` layout);
+  * `kdot_f32_r8_dual`, `kdot_ptq1_dual_r1`, `hadamard_signed`;
+  * `kdot_h2_swiglu`, `kdot_h2_swres`;
+  * the `mem_probe` / `mem_probe_u32` probes.
 * **`emit-kernel.cljk`** (its MSL twins for Metal included), and the CLJK
   generators of the guests.
 * **Xavier** (aarch64, nvgpu) and **macOS** (Metal).
