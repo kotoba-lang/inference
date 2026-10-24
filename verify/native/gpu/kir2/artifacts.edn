@@ -1,0 +1,37 @@
+;; The GPU kernel artifact table: which SPIR-V module the decode guests load
+;; under each name, pinned by SHA-256 (JUN-375; amu ADR 0374 option D, ADR 0371
+;; Decision 9). Amu selfhost builds the modules with KIR v2. Inference does not
+;; build them; it stages them by name, and its native gate checks each digest
+;; against this table and against Amu's receipt.
+;;
+;; :amu/commit           Amu's tree that builds the modules
+;; :amu/receipt,
+;; :amu/receipt-sha256   that tree's build receipt, which the pins equal, and
+;;                       the receipt file's own digest
+;;
+;; :spv     the name the guests load (PIPELINE <KDOT_SPV_DIR>/<spv>; the
+;;            layout table in gen_decode_tokens_guest.cljk is unchanged)
+;; :amu       the module's name in Amu's build (suite kir2)
+;; :bytes,
+;; :sha256    the module, equal to :amu/receipt's entry
+;; :replaces  the glslang build this module takes the place of. glslang of that
+;;            source (-V --target-env vulkan1.1) is byte-identical to Amu's
+;;            oracle reference of the same kernel (verify/evidence/kir2-artifacts-20261024.json)
+;;
+;; One artifact per line, keys in this order: kir2_artifacts.kotoba reads the
+;; table as text. ASCII only.
+{:amu/commit "372243efbf2826590d57207e92792f32f0722440"
+ :amu/receipt "docs/evidence/gpu-kernel-kir2-h2-20261024/aarch64-linux.json"
+ :amu/receipt-sha256 "86d036f546e1ed9c48538a91ccce6cce262e88f96bb376a36735ef3dff9172f3"
+ :artifacts
+ [{:spv "kdot_f32_r1.spv" :amu "kir2-kdot-f32-r1.spv" :kind :spirv :bytes 28976 :sha256 "ee3db7b3b41b644d2c464b06eb1c327a67b8506e5ecd1343d381256962e1e384" :replaces "resources/kotodama/inference/kernels/native/kdot_f32_r1.comp"}
+  {:spv "kdot_f32_r8.spv" :amu "kir2-kdot-f32-r8.spv" :kind :spirv :bytes 25256 :sha256 "72bf25f32088ff0e083f7ddce8f00b607d5017cb5ffc207a71add1d38500dae0" :replaces "verify/native/gpu/kdot_f32_r8.comp"}
+  {:spv "kdot_x8r4.spv" :amu "kir2-kdot-x8r4.spv" :kind :spirv :bytes 26228 :sha256 "d0da09f19b2694a5ab0f158252677b774bb5892cb1e2395f62df1d6eefaa328f" :replaces "verify/native/gpu/kdot_x8r8.comp -DROWS=4"}
+  {:spv "kdot_x8r8.spv" :amu "kir2-kdot-x8r8.spv" :kind :spirv :bytes 26228 :sha256 "b5cd8fa149fca9815d2700db2689a0d20afa53b771f801e09bd6e5a6033d9984" :replaces "verify/native/gpu/kdot_x8r8.comp"}
+  {:spv "kdot_i8_x8r4.spv" :amu "kir2-kdot-i8-x8r4.spv" :kind :spirv :bytes 23228 :sha256 "fe03241fda98dfddab967f47a6f4d0421d00a2953efd0529684e80bf3c274111" :replaces "verify/native/gpu/kdot_i8_x8r4.comp"}
+  {:spv "kdot_h2_r1.spv" :amu "kir2-kdot-h2-r1.spv" :kind :spirv :bytes 33448 :sha256 "213b49404d6afe59f5d085ea85fb03e6da906a12d9106a06c83e07c61b78aafd" :replaces "verify/native/gpu/kdot_h2_r1.comp"}
+  {:spv "kdot_h2q6_r1.spv" :amu "kir2-kdot-h2-r1-q6half.spv" :kind :spirv :bytes 33196 :sha256 "b08a089473b333821dd36ddb77717a96ae72fceeb9b5e04aa5944d3d9f48addc" :replaces "verify/native/gpu/kdot_h2_r1.comp -DQ6_HALF"}
+  {:spv "kdot_h2q8_r4.spv" :amu "kir2-kdot-h2-r4-q8.spv" :kind :spirv :bytes 10332 :sha256 "1b6bb9dc936329a33e4659e4f0a913b16d8f634a7be296411df31f9322e9bf44" :replaces "verify/native/gpu/kdot_h2_r4_q8.comp"}
+  {:spv "kdot_h2q8_r8.spv" :amu "kir2-kdot-h2-r8-q8.spv" :kind :spirv :bytes 10348 :sha256 "04fb8a369a79eb2c6482dc4166658ef9c8d8505a20c8c1167872a9c891042780" :replaces "verify/native/gpu/kdot_h2_r8_q8.comp"}
+  {:spv "kdot_h2_qkv_q8.spv" :amu "kir2-kdot-h2-qkv-q8.spv" :kind :spirv :bytes 12656 :sha256 "37659df26dd6cdc6f3f005b152963121372acf242db56d744982b1eefe833bfc" :replaces "verify/native/gpu/kdot_h2_qkv_q8.comp"}
+  {:spv "kdot_h2_qkvr_q8.spv" :amu "kir2-kdot-h2-qkvr-q8.spv" :kind :spirv :bytes 24256 :sha256 "c392a766f1192c1b0c548ad7752bf5cc9b7522a0474d75cb3164a8ceb6194778" :replaces "verify/native/gpu/kdot_h2_qkvr_q8.comp"}]}

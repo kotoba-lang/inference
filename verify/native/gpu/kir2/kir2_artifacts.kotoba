@@ -1,0 +1,297 @@
+(ns kir2-artifacts (:export [main]))
+
+;; The native gate of inference's GPU kernel artifact table (JUN-375; amu ADR
+;; 0374 option D, ADR 0371 Decision 9). Compiled by Amu's pinned root to a
+;; static image and run with a :fs/app-data scope (fetch.sh does both):
+;;
+;;   kir2_artifacts.elf TABLE AMU-ROOT SPV-DIR STAGE-DIR
+;;
+;; TABLE is artifacts.edn, AMU-ROOT the Amu tree at :amu/commit, SPV-DIR the
+;; kir2-*.spv files Amu's build wrote, and STAGE-DIR the directory the guests
+;; load from ("-" checks without staging). The receipt :amu/receipt must have
+;; the digest :amu/receipt-sha256. For every artifact, the gate checks three
+;; things:
+;; * the table's byte count and SHA-256 equal :amu/receipt's entry for the
+;;   module;
+;; * the module's bytes in SPV-DIR have that count and that SHA-256;
+;; * read back after staging under its :spv name, the file is the same.
+;;
+;; The SHA-256 of a module's bytes is computed here (FIPS 180-4). Wire 3
+;; (:hash/sha256) hashes only :string values, so it is this code's oracle:
+;; * every padding length from 0 to 129 bytes must agree with wire 3;
+;; * the table's bytes must hash to wire 3's digest of its text;
+;; * the three FIPS 180-4 example digests must come out exactly.
+;;
+;; main answers the number of failures and prints a FAIL line for each.
+
+(defn- say [s :string] :i64
+  (let [x (typed-cap-call :io/write :string :string (string-concat s "\n"))] 0))
+
+(defn- fail [what :string] :i64
+  (let [x (say (string-concat "FAIL " what))] 1))
+
+(defn- arg [i :i64] :string (typed-cap-call :cli/args :string :string (string-from-i64 i)))
+
+(defn- quoted [s :string] :string (string-concat "\"" (string-concat s "\"")))
+
+;; ---- SHA-256 over bytes (FIPS 180-4), a byte per vector item ----
+
+(defn- u32 [x :i64] :i64 (bit-and x 4294967295))
+
+(defn- rotr [x :i64 n :i64] :i64 (u32 (bit-or (u64-shift-right x n) (i64-shift-left x (- 32 n)))))
+
+(defn- sha-k [] :vector-i64
+  [1116352408 1899447441 3049323471 3921009573 961987163 1508970993 2453635748 2870763221
+   3624381080 310598401 607225278 1426881987 1925078388 2162078206 2614888103 3248222580
+   3835390401 4022224774 264347078 604807628 770255983 1249150122 1555081692 1996064986
+   2554220882 2821834349 2952996808 3210313671 3336571891 3584528711 113926993 338241895
+   666307205 773529912 1294757372 1396182291 1695183700 1986661051 2177026350 2456956037
+   2730485921 2820302411 3259730800 3345764771 3516065817 3600352804 4094571909 275423344
+   430227734 506948616 659060556 883997877 958139571 1322822218 1537002063 1747873779
+   1955562222 2024104815 2227730452 2361852424 2428436474 2756734187 3204031479 3329325298])
+
+;; the initial hash value, in a vector of its own (the compression updates it in place)
+(defn- sha-h0 [] :vector-i64
+  (let [L [1779033703 3144134277 1013904242 2773480762 1359893119 2600822924 528734635 1541459225]]
+    (loop [i 0 V (vector-alloc 8)] (if (= i 8) V (recur (inc i) (vector-assoc! V i (vector-at L i)))))))
+
+;; the big-endian word at P[at ..]
+(defn- be32 [P :vector-i64 at :i64] :i64
+  (bit-or (i64-shift-left (vector-at P at) 24)
+          (bit-or (i64-shift-left (vector-at P (+ at 1)) 16)
+                  (bit-or (i64-shift-left (vector-at P (+ at 2)) 8) (vector-at P (+ at 3))))))
+
+;; the message B padded to whole 64-byte blocks: B, 128, zeros, then its
+;; length in bits as 8 big-endian bytes
+(defn- sha-pad [B :vector-i64] :vector-i64
+  (let [n (vector-count B)
+        len (* 64 (quot (+ n 72) 64))
+        P0 (loop [i 0 V (vector-alloc len)] (if (>= i n) V (recur (inc i) (vector-assoc! V i (vector-at B i)))))
+        P1 (vector-assoc! P0 n 128)
+        bits (* n 8)]
+    (loop [k 0 V P1]
+      (if (= k 8) V
+        (recur (inc k) (vector-assoc! V (- len (+ 1 k)) (bit-and (u64-shift-right bits (* 8 k)) 255)))))))
+
+;; the 64-word schedule of the block at P[at ..], into W
+(defn- sha-schedule [W0 :vector-i64 P :vector-i64 at :i64] :vector-i64
+  (let [W1 (loop [t 0 W W0] (if (= t 16) W (recur (inc t) (vector-assoc! W t (be32 P (+ at (* 4 t)))))))]
+    (loop [t 16 W W1]
+      (if (= t 64) W
+        (let [a (vector-at W (- t 15)) b (vector-at W (- t 2))
+              s0 (bit-xor (rotr a 7) (bit-xor (rotr a 18) (u64-shift-right a 3)))
+              s1 (bit-xor (rotr b 17) (bit-xor (rotr b 19) (u64-shift-right b 10)))]
+          (recur (inc t) (vector-assoc! W t (u32 (+ (vector-at W (- t 16)) s0 (vector-at W (- t 7)) s1)))))))))
+
+;; one block's 64 rounds over the schedule W, added into H
+(defn- sha-compress [H :vector-i64 W :vector-i64 K :vector-i64] :vector-i64
+  (loop [t 0 a (vector-at H 0) b (vector-at H 1) c (vector-at H 2) d (vector-at H 3)
+         e (vector-at H 4) f (vector-at H 5) g (vector-at H 6) h (vector-at H 7)]
+    (if (= t 64)
+      (let [H1 (vector-assoc! H 0 (u32 (+ (vector-at H 0) a)))
+            H2 (vector-assoc! H1 1 (u32 (+ (vector-at H1 1) b)))
+            H3 (vector-assoc! H2 2 (u32 (+ (vector-at H2 2) c)))
+            H4 (vector-assoc! H3 3 (u32 (+ (vector-at H3 3) d)))
+            H5 (vector-assoc! H4 4 (u32 (+ (vector-at H4 4) e)))
+            H6 (vector-assoc! H5 5 (u32 (+ (vector-at H5 5) f)))
+            H7 (vector-assoc! H6 6 (u32 (+ (vector-at H6 6) g)))]
+        (vector-assoc! H7 7 (u32 (+ (vector-at H7 7) h))))
+      (let [t1 (u32 (+ h (bit-xor (rotr e 6) (bit-xor (rotr e 11) (rotr e 25)))
+                       (bit-xor (bit-and e f) (bit-and (u32 (bit-not e)) g))
+                       (vector-at K t) (vector-at W t)))
+            t2 (u32 (+ (bit-xor (rotr a 2) (bit-xor (rotr a 13) (rotr a 22)))
+                       (bit-xor (bit-and a b) (bit-xor (bit-and a c) (bit-and b c)))))]
+        (recur (inc t) (u32 (+ t1 t2)) a b c (u32 (+ d t1)) e f g)))))
+
+(defn- hexd [d :i64] :string (string-substring "0123456789abcdef" d (inc d)))
+
+(defn- hex8 [w :i64] :string
+  (loop [k 7 s ""] (if (< k 0) s (recur (dec k) (string-concat s (hexd (bit-and (u64-shift-right w (* 4 k)) 15)))))))
+
+;; the SHA-256 of the bytes in B, as 64 lowercase hex characters
+(defn- sha256-of [B :vector-i64 K :vector-i64] :string
+  (let [P (sha-pad B)
+        blocks (quot (vector-count P) 64)
+        H (loop [i 0 H (sha-h0) W (vector-alloc 64)]
+            (if (= i blocks) H
+              (let [W1 (sha-schedule W P (* 64 i))]
+                (recur (inc i) (sha-compress H W1 K) W1))))]
+    (loop [i 0 s ""] (if (= i 8) s (recur (inc i) (string-concat s (hex8 (vector-at H i))))))))
+
+;; ---- text, paths and files ----
+
+;; the bytes of s, one per item (ASCII: the table, paths and the self-test)
+(defn- text-bytes [s :string] :vector-i64
+  (let [n (string-length s)]
+    (loop [i 0 V (vector-alloc n)] (if (>= i n) V (recur (inc i) (vector-assoc! V i (string-code-point-at s i)))))))
+
+;; s repeated n times
+(defn- repeat-text [s :string n :i64] :string
+  (loop [i 0 acc ""] (if (>= i n) acc (recur (inc i) (string-concat acc s)))))
+
+;; the first offset of needle in s at or after from, or -1
+(defn- index-from [s :string needle :string from :i64] :i64
+  (if (> from (string-length s)) -1
+    (let [i (string-index-of (string-substring s from (string-length s)) needle)]
+      (if (< i 0) -1 (+ from i)))))
+
+;; the text between key and the next stop, both inside [from, end); "" when
+;; either is missing
+(defn- field [s :string key :string stop :string from :i64 end :i64] :string
+  (let [k (index-from s key from)]
+    (if (or (< k 0) (>= k end)) ""
+      (let [a (+ k (string-length key)) b (index-from s stop a)]
+        (if (or (< b 0) (> b end)) "" (string-substring s a b))))))
+
+;; the decimal value of 1..12 digits, else -1
+(defn- parse-dec [s :string] :i64
+  (let [n (string-length s)]
+    (if (or (= n 0) (> n 12)) -1
+      (loop [i 0 v 0]
+        (if (= i n) v
+          (let [c (string-code-point-at s i)]
+            (if (or (< c 48) (> c 57)) -1 (recur (inc i) (+ (* v 10) (- c 48))))))))))
+
+;; true for 64 lowercase hex characters
+(defn- digest? [s :string] :bool
+  (and (= (string-length s) 64)
+       (loop [i 0]
+         (cond (= i 64) true
+               (let [c (string-code-point-at s i)] (or (and (>= c 48) (<= c 57)) (and (>= c 97) (<= c 102)))) (recur (inc i))
+               :else false))))
+
+(defn- exists? [path :string] :bool
+  (string=? (string-substring (string-concat (typed-cap-call :fs/app-data :string :string (string-concat path "EXISTS_SEP")) "0") 0 1) "1"))
+
+(defn- read-bytes [path :string] :vector-i64
+  (vector-i64-from-bytes (typed-cap-call :fs/app-data-bytes :bytes :bytes (bytes-from-vector-i64 (text-bytes path)))))
+
+;; true when T[i ..] spells the request token tok
+(defn- token-at? [T :vector-i64 i :i64 end :i64 tok :string] :bool
+  (let [n (string-length tok)]
+    (if (> (+ i n) end) false
+      (loop [k 0]
+        (cond (>= k n) true
+              (= (vector-at T (+ i k)) (string-code-point-at tok k)) (recur (inc k))
+              :else false)))))
+
+;; true when T[start, end) spells neither write token: the runtime would read
+;; such content as a second request, so it is not written
+(defn- token-free? [T :vector-i64 start :i64 end :i64] :bool
+  (loop [i start]
+    (cond (>= i end) true
+          (token-at? T i end "WRITE_SEP") false
+          (token-at? T i end "APPEND_SEP") false
+          :else (recur (inc i)))))
+
+;; write B as the file at path; false when B spells a request token
+(defn- write-bytes [path :string B :vector-i64] :bool
+  (let [head (string-concat path "WRITE_SEP")
+        h (string-length head) n (vector-count B)
+        T0 (loop [i 0 V (vector-alloc (+ h n))] (if (>= i h) V (recur (inc i) (vector-assoc! V i (string-code-point-at head i)))))
+        T1 (loop [i 0 V T0] (if (>= i n) V (recur (inc i) (vector-assoc! V (+ h i) (vector-at B i)))))]
+    (if (not (token-free? T1 h (+ h n))) false
+      (let [r (typed-cap-call :fs/app-data-bytes :bytes :bytes (bytes-from-vector-i64 T1))] true))))
+
+;; ---- the self-test: this SHA-256 against FIPS 180-4's examples and wire 3 ----
+
+(defn- check-vector [K :vector-i64 msg :string want :string] :i64
+  (if (string=? (sha256-of (text-bytes msg) K) want) 0
+    (fail (string-concat "sha256 FIPS 180-4 example of " (string-concat (string-from-i64 (string-length msg)) " bytes")))))
+
+(defn- self-test [K :vector-i64] :i64
+  (let [v (+ (check-vector K "" "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+             (check-vector K "abc" "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+             (check-vector K "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+                           "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"))
+        ;; every padding length of one and two blocks and the third's start
+        w (loop [n 0 failed 0]
+            (if (= n 130) failed
+              (let [m (repeat-text "a" n)]
+                (recur (inc n) (if (string=? (sha256-of (text-bytes m) K) (typed-cap-call :hash/sha256 :string :string m)) failed
+                                 (+ failed (fail (string-concat "sha256 disagrees with wire 3 at " (string-concat (string-from-i64 n) " bytes")))))))))]
+    (+ v w)))
+
+;; ---- the artifacts ----
+
+;; the receipt's entry for module amu: "<bytes> <sha256>", or "" when absent
+(defn- receipt-entry [R :string amu :string] :string
+  (let [m (index-from R "\"modules\": {" 0)
+        at (if (< m 0) -1 (index-from R (string-concat (quoted amu) ": {") m))
+        end (if (< at 0) -1 (index-from R "}" at))]
+    (if (< end 0) ""
+      (string-concat (field R "\"bytes\": " "," at end) (string-concat " " (field R "\"sha256\": \"" "\"" at end))))))
+
+;; one artifact, the table's text in [at, end): the number of failures
+(defn- artifact [K :vector-i64 T :string at :i64 end :i64 R :string spv-dir :string stage :string] :i64
+  (let [spv (field T "{:spv \"" "\"" at end)
+        amu (field T " :amu \"" "\"" at end)
+        kind (field T " :kind " " " at end)
+        nbytes (parse-dec (field T " :bytes " " " at end))
+        sha (field T " :sha256 \"" "\"" at end)
+        pin (string-concat (string-from-i64 nbytes) (string-concat " " sha))]
+    (cond (or (= (string-length spv) 0) (= (string-length amu) 0) (not (string=? kind ":spirv")) (< nbytes 0) (not (digest? sha)))
+          (fail (string-concat "malformed artifact at offset " (string-from-i64 at)))
+          (>= (index-from T (string-concat "{:spv " (quoted spv)) end) 0)
+          (fail (string-concat "duplicate " spv))
+          (not (string=? (receipt-entry R amu) pin))
+          (fail (string-concat "receipt " (string-concat spv (string-concat ": the table pins " (string-concat pin (string-concat ", the receipt has " (receipt-entry R amu)))))))
+          (not (exists? (string-concat spv-dir (string-concat "/" amu))))
+          (fail (string-concat "missing " (string-concat spv-dir (string-concat "/" amu))))
+          :else
+          (let [B (read-bytes (string-concat spv-dir (string-concat "/" amu)))
+                got (string-concat (string-from-i64 (vector-count B)) (string-concat " " (sha256-of B K)))]
+            (cond (not (string=? got pin))
+                  (fail (string-concat "sha256 " (string-concat spv (string-concat ": " (string-concat amu (string-concat " is " got))))))
+                  (string=? stage "-")
+                  (say (string-concat "OK " (string-concat spv (string-concat " " (string-concat amu (string-concat " " pin))))))
+                  (not (write-bytes (string-concat stage (string-concat "/" spv)) B))
+                  (fail (string-concat "stage " (string-concat spv ": the module spells a request token")))
+                  (not (string=? (sha256-of (read-bytes (string-concat stage (string-concat "/" spv))) K) sha))
+                  (fail (string-concat "stage " (string-concat spv ": the staged file differs")))
+                  :else
+                  (say (string-concat "STAGED " (string-concat spv (string-concat " " (string-concat amu (string-concat " " pin)))))))))))
+
+;; every artifact in the table: [count failures]
+(defn- artifacts [K :vector-i64 T :string R :string spv-dir :string stage :string] :vector-i64
+  (loop [at (index-from T "{:spv \"" 0) seen 0 failed 0]
+    (if (< at 0)
+      (vector-assoc! (vector-assoc! (vector-alloc 2) 0 seen) 1 failed)
+      (let [nxt (index-from T "{:spv \"" (inc at))
+            end (if (< nxt 0) (string-length T) nxt)]
+        (recur nxt (inc seen) (+ failed (artifact K T at end R spv-dir stage)))))))
+
+(defn main [] :i64
+  (if (not (string=? (typed-cap-call :cli/args :string :string "") "4"))
+    (fail "usage: kir2_artifacts.elf TABLE AMU-ROOT SPV-DIR STAGE-DIR|-")
+    (let [table (arg 0) amu-root (arg 1) spv-dir (arg 2) stage (arg 3)
+          K (sha-k)
+          selfed (self-test K)
+          T (typed-cap-call :fs/app-data :string :string table)
+          tsha (typed-cap-call :hash/sha256 :string :string T)
+          tbytes (sha256-of (read-bytes table) K)
+          tfail (if (string=? tbytes tsha) 0 (fail (string-concat "sha256 of the table's bytes " (string-concat tbytes (string-concat " is not wire 3's " tsha)))))
+          rel (field T ":amu/receipt \"" "\"" 0 (string-length T))
+          rpath (string-concat amu-root (string-concat "/" rel))
+          rok (and (> (string-length rel) 0) (exists? rpath))
+          R (if rok (typed-cap-call :fs/app-data :string :string rpath) "")
+          rsha (typed-cap-call :hash/sha256 :string :string R)
+          rpin (field T ":amu/receipt-sha256 \"" "\"" 0 (string-length T))
+          rfail (cond (not rok) (fail (string-concat "no receipt at " rpath))
+                      (not (string=? rsha rpin))
+                      (fail (string-concat "receipt sha256 " (string-concat rel (string-concat " is " (string-concat rsha (string-concat ", the table pins " rpin))))))
+                      :else 0)
+          A (artifacts K T R spv-dir stage)
+          n (vector-at A 0)
+          nfail (if (> n 0) 0 (fail "the table names no artifact"))
+          failed (+ selfed tfail rfail nfail (vector-at A 1))
+          x (say (string-concat "ARTIFACTS " (string-from-i64 n)))
+          y (say (string-concat "FAILED " (string-from-i64 failed)))
+          z (say (string-concat "{:receipt :kotoba-inference.kir2-artifacts/v1 :table {:path " (string-concat (quoted table)
+                 (string-concat " :sha256 " (string-concat (quoted tsha)
+                 (string-concat "} :amu-receipt {:path " (string-concat (quoted rel)
+                 (string-concat " :sha256 " (string-concat (quoted rsha)
+                 (string-concat "} :stage " (string-concat (quoted stage)
+                 (string-concat " :artifacts " (string-concat (string-from-i64 n)
+                 (string-concat " :failed " (string-concat (string-from-i64 failed) "}")))))))))))))))]
+      failed)))
